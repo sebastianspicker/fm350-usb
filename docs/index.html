@@ -1,0 +1,546 @@
+<!doctype html>
+<!-- GitHub Pages demo for 5g-failover.
+     Served from main:/docs (Settings -> Pages -> Deploy from a branch ->
+     main -> /docs). Screenshots are real command output; run
+     `python3 tools/screenshots.py` to regenerate them. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>5g-failover — a Fibocom FM350-GL 5G modem as a backup WAN link</title>
+<meta name="description" content="Tools and notes for running a Fibocom FM350-GL 5G modem (including the Dell DW5931e) as a backup WAN link over USB: OpenWrt/mwan3 failover scripts, a user-space macOS driver, and a Dell DW5931e field guide.">
+<meta property="og:type" content="website">
+<meta property="og:title" content="5g-failover — a Fibocom FM350-GL 5G modem as a backup WAN link">
+<meta property="og:description" content="OpenWrt/mwan3 failover scripts, a user-space macOS driver, and a Dell DW5931e field guide for the Fibocom FM350-GL 5G modem.">
+<meta property="og:image" content="https://sebastianspicker.github.io/5g-failover/assets/screenshots/status.svg">
+<meta property="og:url" content="https://sebastianspicker.github.io/5g-failover/">
+<link rel="canonical" href="https://sebastianspicker.github.io/5g-failover/">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='5' fill='%230d1117'/%3E%3Cg fill='none' stroke='%2358a6ff' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M2 16.5 9 12l5 3 8-5'/%3E%3Cpath d='M14 4h6v6'/%3E%3C/g%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #0d1117;
+    --bg-soft: #161b22;
+    --border: #30363d;
+    --fg: #c9d1d9;
+    --muted: #8b949e;
+    --bright: #f0f6fc;
+    --green: #3fb950;
+    --blue: #58a6ff;
+    --amber: #d29922;
+    --red: #f85149;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; overflow-x: hidden; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    overflow-x: hidden;
+  }
+  a { color: var(--blue); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .wrap { max-width: 1000px; margin: 0 auto; padding: 0 24px; }
+
+  header.hero {
+    border-bottom: 1px solid var(--border);
+    background:
+      radial-gradient(1000px 300px at 50% -120px, rgba(88, 166, 255, .12), transparent),
+      var(--bg);
+    padding: 72px 0 56px;
+    text-align: center;
+  }
+  .kicker {
+    font: 600 13px/1 var(--mono);
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin: 0 0 18px;
+  }
+  h1 {
+    margin: 0;
+    font-size: clamp(28px, 5vw, 46px);
+    letter-spacing: -0.02em;
+    color: var(--bright);
+  }
+  .tagline {
+    max-width: 720px;
+    margin: 18px auto 0;
+    font-size: clamp(16px, 2.2vw, 19px);
+    color: var(--fg);
+  }
+  .status-line {
+    max-width: 720px;
+    margin: 14px auto 0;
+    font-size: 14.5px;
+    color: var(--amber);
+  }
+  .status-line code { background: var(--bg-soft); border: 1px solid var(--border); border-radius: 6px; padding: 1px 6px; }
+  .badges { margin: 26px 0 0; display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; }
+  .badges span {
+    font: 500 12.5px/1 var(--mono);
+    color: var(--muted);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 6px 12px;
+    background: var(--bg-soft);
+  }
+  .actions { margin-top: 30px; display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+  .btn {
+    display: inline-block;
+    padding: 10px 18px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    color: var(--fg);
+    font-weight: 600;
+    background: var(--bg-soft);
+  }
+  .btn:hover { border-color: var(--muted); text-decoration: none; }
+  .btn.primary { background: #238636; border-color: #2ea043; color: #fff; }
+  .btn.primary:hover { background: #2ea043; }
+
+  section { padding: 56px 0; border-bottom: 1px solid var(--border); }
+  section:last-of-type { border-bottom: 0; }
+  h2 { font-size: 24px; color: var(--bright); margin: 0 0 8px; letter-spacing: -0.01em; }
+  .lede { color: var(--muted); margin: 0 0 28px; max-width: 760px; }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; min-width: 0; }
+  .card {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--bg-soft);
+    padding: 18px 20px;
+    min-width: 0;
+  }
+  .card h3 { margin: 0 0 6px; font-size: 16px; color: var(--bright); }
+  .card p { margin: 0; color: var(--muted); font-size: 14.5px; }
+
+  /* min-width: 0 overrides the grid/flex default of min-width: auto, which
+     would otherwise size .shots (and the whole page) to the widest
+     screenshot's intrinsic pixel width instead of the viewport. */
+  .shots { display: grid; gap: 22px; min-width: 0; }
+  figure.shot { margin: 0; min-width: 0; max-width: 100%; }
+  figure.shot img {
+    display: block;
+    width: 100%;
+    max-width: 100%;
+    height: auto;
+    border-radius: 10px;
+  }
+  figure.shot figcaption { margin-top: 10px; color: var(--muted); font-size: 14px; }
+  figure.shot figcaption code { color: var(--fg); }
+
+  code { font-family: var(--mono); font-size: .92em; }
+  p code, li code, td code { background: var(--bg-soft); border: 1px solid var(--border); border-radius: 6px; padding: 1px 6px; }
+
+  .note {
+    border-left: 3px solid var(--amber);
+    background: rgba(210, 153, 34, .08);
+    border-radius: 0 8px 8px 0;
+    padding: 14px 18px;
+    color: var(--fg);
+    font-size: 14.5px;
+    margin: 20px 0 0;
+  }
+
+  /* --- demos -------------------------------------------------------- */
+  .demo {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--bg-soft);
+    padding: 20px;
+    margin-top: 20px;
+    max-width: 100%;
+    overflow: hidden;
+  }
+  .demo h3 { margin: 0 0 6px; font-size: 16px; color: var(--bright); }
+  .demo .sub { margin: 0 0 18px; color: var(--muted); font-size: 14px; }
+
+  .fo-diagram { display: flex; flex-direction: column; gap: 10px; margin-bottom: 14px; }
+  .fo-link {
+    display: flex; align-items: center; gap: 12px;
+    padding: 10px 14px; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--bg);
+    transition: border-color .2s, opacity .2s;
+  }
+  .fo-link .fo-name { font-family: var(--mono); font-size: 13px; width: 108px; flex: none; color: var(--muted); }
+  .fo-link .fo-flow {
+    flex: 1; height: 6px; border-radius: 3px; min-width: 40px;
+    background: repeating-linear-gradient(90deg, var(--border) 0 10px, transparent 10px 20px);
+  }
+  .fo-link .fo-state { font-family: var(--mono); font-size: 12.5px; width: 96px; flex: none; text-align: right; color: var(--muted); }
+  .fo-link.active { border-color: var(--green); }
+  .fo-link.active .fo-name, .fo-link.active .fo-state { color: var(--green); }
+  .fo-link.active .fo-flow {
+    background: repeating-linear-gradient(90deg, var(--green) 0 10px, transparent 10px 20px);
+    background-size: 20px 100%;
+    animation: fo-scroll 0.6s linear infinite;
+  }
+  .fo-link.down { opacity: .5; }
+  .fo-link.down .fo-name, .fo-link.down .fo-state { color: var(--red); }
+  .fo-link.down .fo-flow { background: repeating-linear-gradient(90deg, var(--red) 0 6px, transparent 6px 12px); opacity: .6; }
+  @keyframes fo-scroll { from { background-position: 0 0; } to { background-position: -20px 0; } }
+  @media (prefers-reduced-motion: reduce) {
+    .fo-link.active .fo-flow { animation: none; }
+  }
+
+  .fo-progress { height: 4px; border-radius: 2px; background: var(--border); overflow: hidden; margin: 4px 0 14px; }
+  .fo-progress > span { display: block; height: 100%; width: 0%; background: var(--amber); transition: width 120ms linear; }
+  @media (prefers-reduced-motion: reduce) {
+    .fo-progress > span { transition: none; }
+  }
+
+  .fo-status, .dipc-status { font: 600 14px/1.5 var(--mono); color: var(--bright); min-height: 1.5em; margin: 0 0 14px; }
+
+  .controls { display: flex; gap: 10px; flex-wrap: wrap; }
+  .controls button {
+    font: 600 13.5px/1 var(--mono);
+    padding: 9px 14px; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--bg);
+    color: var(--fg); cursor: pointer;
+  }
+  .controls button:hover:not(:disabled) { border-color: var(--muted); }
+  .controls button:disabled { opacity: .4; cursor: not-allowed; }
+  .controls button.warn { border-color: var(--amber); color: var(--amber); }
+  .controls button.danger { border-color: var(--red); color: var(--red); }
+  .controls button.ok { border-color: var(--green); color: var(--green); }
+
+  .dipc-controls { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 16px; }
+  .dipc-controls label { display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: var(--muted); }
+  .dipc-controls select {
+    font: 500 13.5px/1 var(--mono);
+    padding: 8px 10px; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--bg); color: var(--fg);
+  }
+  .dipc-badge {
+    display: inline-block; font: 700 15px/1 var(--mono);
+    padding: 8px 14px; border-radius: 8px; margin-right: 10px;
+  }
+  .dipc-badge.on { background: rgba(63,185,80,.12); color: var(--green); border: 1px solid var(--green); }
+  .dipc-badge.off { background: rgba(248,81,73,.12); color: var(--red); border: 1px solid var(--red); }
+  .dipc-reason { color: var(--muted); font: 14px/1.5 -apple-system, sans-serif; }
+
+  footer { padding: 40px 0 56px; color: var(--muted); font-size: 14px; }
+  footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+
+  @media (max-width: 480px) {
+    .fo-link .fo-name { width: 72px; font-size: 11.5px; }
+    .fo-link .fo-state { width: 74px; font-size: 11px; }
+    .controls button { flex: 1 1 auto; }
+  }
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="wrap">
+    <p class="kicker">Fibocom FM350-GL · Dell DW5931e · OpenWrt · macOS</p>
+    <h1>5g-failover</h1>
+    <p class="tagline">
+      Tools and notes for running a Fibocom FM350-GL 5G modem — including the
+      Dell DW5931e that ships in Latitude laptops — as a backup WAN link over
+      USB. Router-side failover with mwan3, a user-space macOS driver for
+      bench testing, and a field guide for the Dell OEM firmware.
+    </p>
+    <p class="status-line">
+      Status: LTE registration verified on hardware (<code>AT+CEREG?</code>);
+      a cellular data session is pending a data SIM.
+    </p>
+    <div class="badges">
+      <span>MIT</span>
+      <span>OpenWrt 24.10+</span>
+      <span>macOS</span>
+      <span>no data SIM yet</span>
+    </div>
+    <div class="actions">
+      <a class="btn primary" href="#tour">Screenshot tour</a>
+      <a class="btn" href="#demos">Interactive demos</a>
+      <a class="btn" href="https://github.com/sebastianspicker/5g-failover">GitHub</a>
+    </div>
+  </div>
+</header>
+
+<main>
+
+<section id="parts">
+  <div class="wrap">
+    <h2>What's in the repo</h2>
+    <p class="lede">Three parts, each usable on its own.</p>
+    <div class="cards">
+      <div class="card">
+        <h3><a href="https://github.com/sebastianspicker/5g-failover/blob/main/openwrt/README.md">OpenWrt failover</a></h3>
+        <p>Scripts that add the FM350-GL as a second WAN on an OpenWrt router and switch traffic to it with <code>mwan3</code> when the wired line goes down. Verified in Docker, an AT-command modem emulator, and OpenWrt 24.10.8 under QEMU.</p>
+      </div>
+      <div class="card">
+        <h3><a href="https://github.com/sebastianspicker/5g-failover/blob/main/fm350mac/README.md">fm350mac</a></h3>
+        <p>A user-space macOS driver: macOS has no driver for the modem's RNDIS network interface, so this talks to it over libusb and hands packets to a <code>utun</code> interface. No kernel extensions or SIP changes.</p>
+      </div>
+      <div class="card">
+        <h3><a href="https://github.com/sebastianspicker/5g-failover/blob/main/docs/dell-dw5931e-usb.md">Dell DW5931e field guide</a></h3>
+        <p>What the Dell OEM firmware changes, how to reach the module's internal root shell, and how to switch it out of "PCIe Advance Mode", which AT commands refuse to do.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="tour">
+  <div class="wrap">
+    <h2>Screenshot tour</h2>
+    <p class="lede">
+      Every image below is real command output, redacted (IMEI/IMSI/ICCID/serial
+      numbers, the serving cell's TAC and cell ID, and any MAC address that
+      isn't the FM350-GL's well-known placeholder) and rendered to SVG by
+      <a href="https://github.com/sebastianspicker/5g-failover/blob/main/tools/screenshots.py">tools/screenshots.py</a>.
+      The three modem shots only regenerate when the modem is actually
+      plugged in; the others need Docker or QEMU. Regenerate any time with
+      <code>python3 tools/screenshots.py</code>.
+    </p>
+    <div class="shots">
+      <figure class="shot">
+        <img src="assets/screenshots/help.svg" alt="fm350mac --help listing the probe, at, status, connect, disconnect, up, async-selftest, and helper subcommands" loading="lazy">
+        <figcaption><code>fm350mac --help</code> — every subcommand on one screen.</figcaption>
+      </figure>
+      <figure class="shot">
+        <img src="assets/screenshots/identity.svg" alt="fm350mac at output showing firmware package version, dual IPC mode, FCC lock status, and SIM ready" loading="lazy">
+        <figcaption><code>fm350mac at 'AT+GTPKGVER?' 'AT+GTDIPCMODE?' 'AT+GTFCCEFFSTATUS?' 'AT+CPIN?'</code> — a quick identity check: firmware, dual-IPC mode, FCC-lock state, SIM readiness.</figcaption>
+      </figure>
+      <figure class="shot">
+        <img src="assets/screenshots/status.svg" alt="fm350mac status --redact output with SIM, registration, operator, serving and neighbour cell info, and temperature, with TAC and cell_id shown as REDACTED" loading="lazy">
+        <figcaption><code>fm350mac status --redact</code> — SIM, registration, operator, serving cell, NR signal, neighbour cells and temperature. <code>--redact</code> masks cell IDs and TACs.</figcaption>
+      </figure>
+      <figure class="shot">
+        <img src="assets/screenshots/doctor.svg" alt="fm350mac doctor output: one OK or INFO line per check, including the Dell firmware image, DIPC mode, FCC lock, antenna tuner, SIM and serving cell" loading="lazy">
+        <figcaption><code>fm350mac doctor</code> — the Dell DW5931e checks in one read-only run.</figcaption>
+      </figure>
+      <figure class="shot">
+        <img src="assets/screenshots/probe.svg" alt="fm350mac probe output showing RNDIS initialization and OID query results" loading="lazy">
+        <figcaption><code>fm350mac probe</code> — RNDIS init and OID queries, no root needed.</figcaption>
+      </figure>
+      <figure class="shot">
+        <img src="assets/screenshots/install-dry-run.svg" alt="openwrt install.sh dry run showing the uci commands it would apply, run inside the OpenWrt Docker test image" loading="lazy">
+        <figcaption><code>openwrt/install.sh --apn internet.example --dry-run</code> — every <code>uci</code> command it would run, changing nothing (captured inside the OpenWrt Docker test image).</figcaption>
+      </figure>
+      <figure class="shot">
+        <img src="assets/screenshots/qemu-failover-summary.svg" alt="qemu-failover-test.sh summary showing baseline, failover, failback, and both-down assertions all passing" loading="lazy">
+        <figcaption><code>openwrt/tests/qemu-failover-test.sh</code> — the end-to-end failover test in QEMU: baseline, failover, failback, and both-uplinks-down, all passing.</figcaption>
+      </figure>
+    </div>
+  </div>
+</section>
+
+<section id="demos">
+  <div class="wrap">
+    <h2>Interactive demos</h2>
+    <p class="lede">Two small, self-contained explainers. No backend, no tracking — just the logic from this repo, in the browser.</p>
+
+    <div class="demo">
+      <h3>Failover timeline</h3>
+      <p class="sub">What mwan3 does when the wired link fails, using the timings actually measured in the QEMU test.</p>
+      <div class="fo-diagram">
+        <div class="fo-link" id="foWan">
+          <span class="fo-name">wan (fibre)</span>
+          <span class="fo-flow"></span>
+          <span class="fo-state" id="foWanState">active</span>
+        </div>
+        <div class="fo-link" id="foWwan">
+          <span class="fo-name">wwan (5G)</span>
+          <span class="fo-flow"></span>
+          <span class="fo-state" id="foWwanState">standby</span>
+        </div>
+      </div>
+      <div class="fo-progress"><span id="foProgressBar"></span></div>
+      <p class="fo-status" id="foStatus" role="status">wan active. LAN traffic egresses via the fibre link.</p>
+      <div class="controls">
+        <button id="foBtnLink" class="warn">Cut the fibre link</button>
+        <button id="foBtnUpstream" class="warn">Upstream dead (link up)</button>
+        <button id="foBtnRestore" class="ok" disabled>Restore</button>
+      </div>
+      <p class="note">Simulation using timings measured in the QEMU test (<code>openwrt/tests/qemu-failover-test.sh</code>), not a live router: link-down failover 5 s / failback 4 s, upstream-dead failover 13 s / failback 16 s. Cutting the second uplink while already on backup shows the "both down" case mwan3 calls <code>unreachable</code>.</p>
+    </div>
+
+    <div class="demo">
+      <h3>Will USB come up?</h3>
+      <p class="sub">The FM350-GL's <code>dual_ipc_mode</code> and PCIe link state decide whether its USB interfaces are enabled, per the module's own <code>/etc/init.d/usb.init</code>.</p>
+      <div class="dipc-controls">
+        <label>dual_ipc_mode (first field of <code>AT+GTDIPCMODE?</code>)
+          <select id="dipcMode">
+            <option value="1">1 — PCIe Advance Mode</option>
+            <option value="3" selected>3 — stock dual mode</option>
+            <option value="other">other (0, 2, 4, ...)</option>
+          </select>
+        </label>
+        <label>PCIe link
+          <select id="pcieLink">
+            <option value="up">up (M.2 slot, wired to PCIe)</option>
+            <option value="down" selected>down (USB-to-M.2 adapter)</option>
+          </select>
+        </label>
+      </div>
+      <p class="dipc-status"><span id="dipcBadge" class="dipc-badge on">USB ON</span><span id="dipcReason" class="dipc-reason"></span></p>
+      <p class="note">Exactly the module's logic: mode not in {1, 3} → USB off. Mode 1 with the PCIe link up → USB off. Otherwise → USB on. This is why a Dell DW5931e in PCIe Advance Mode (mode 1) still enumerates over USB in an M.2-to-USB adapter — there's no PCIe link to prefer — but goes USB-silent once it's back in a laptop's M.2 slot.</p>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>
+      <a href="https://github.com/sebastianspicker/5g-failover">GitHub</a> ·
+      <a href="https://github.com/sebastianspicker/5g-failover#readme">README</a> ·
+      <a href="https://github.com/sebastianspicker/5g-failover/blob/main/LICENSE">MIT license</a>
+    </span>
+    <span>Independent project, not affiliated with Fibocom, Dell, or GL.iNet. Screenshots: <code>python3 tools/screenshots.py</code></span>
+  </div>
+</footer>
+
+<script>
+(function () {
+  "use strict";
+
+  /* --- Failover timeline demo ----------------------------------------- */
+  var TIMINGS = { link: { fail: 5, back: 4 }, upstream: { fail: 13, back: 16 } };
+
+  var foWan = document.getElementById("foWan");
+  var foWwan = document.getElementById("foWwan");
+  var foWanState = document.getElementById("foWanState");
+  var foWwanState = document.getElementById("foWwanState");
+  var foStatus = document.getElementById("foStatus");
+  var foProgressBar = document.getElementById("foProgressBar");
+  var foBtnLink = document.getElementById("foBtnLink");
+  var foBtnUpstream = document.getElementById("foBtnUpstream");
+  var foBtnRestore = document.getElementById("foBtnRestore");
+
+  // path: "wan" | "wwan" | "unreachable"; cause: null | "link" | "upstream"
+  // (cause records why wan failed, so restore uses the matching failback time)
+  var fo = { path: "wan", cause: null, transitioning: false };
+
+  function setLinkClasses(el, cls) {
+    el.className = "fo-link" + (cls ? " " + cls : "");
+  }
+
+  function renderFo() {
+    if (fo.path === "wan") {
+      setLinkClasses(foWan, "active");
+      setLinkClasses(foWwan, "");
+      foWanState.textContent = "active";
+      foWwanState.textContent = "standby";
+    } else if (fo.path === "wwan") {
+      setLinkClasses(foWan, "down");
+      setLinkClasses(foWwan, "active");
+      foWanState.textContent = fo.cause === "link" ? "link down" : "dead (link up)";
+      foWwanState.textContent = "active";
+    } else {
+      setLinkClasses(foWan, "down");
+      setLinkClasses(foWwan, "down");
+      foWanState.textContent = "down";
+      foWwanState.textContent = "down";
+    }
+    foBtnLink.disabled = fo.transitioning || fo.path === "unreachable";
+    foBtnUpstream.disabled = fo.transitioning || fo.path === "unreachable";
+    foBtnRestore.disabled = fo.transitioning || fo.path === "wan";
+  }
+
+  function runCountdown(seconds, onDone, label) {
+    fo.transitioning = true;
+    renderFo();
+    var start = Date.now();
+    var totalMs = seconds * 1000;
+    function tick() {
+      var elapsed = Date.now() - start;
+      var remaining = Math.max(0, seconds - elapsed / 1000);
+      foProgressBar.style.width = Math.min(100, (elapsed / totalMs) * 100) + "%";
+      foStatus.textContent = label + " (" + remaining.toFixed(1) + "s)";
+      if (elapsed < totalMs) {
+        requestAnimationFrame(tick);
+      } else {
+        foProgressBar.style.width = "0%";
+        fo.transitioning = false;
+        onDone();
+      }
+    }
+    tick();
+  }
+
+  function cutLink(cause, seconds) {
+    if (fo.transitioning) return;
+    if (fo.path === "wwan") {
+      // The remaining uplink just went down too: nothing left to fail over to.
+      fo.path = "unreachable";
+      fo.cause = null;
+      foStatus.textContent = "both wan and wwan are down: unreachable (mwan3's last_resort policy).";
+      renderFo();
+      return;
+    }
+    if (fo.path !== "wan") return;
+    var reason = cause === "link" ? "wan link down" : "wan link up, upstream dead";
+    runCountdown(seconds, function () {
+      fo.path = "wwan";
+      fo.cause = cause;
+      foStatus.textContent = "failed over to wwan (5G). LAN traffic now egresses via the modem.";
+      renderFo();
+    }, "failing over to wwan: " + reason);
+  }
+
+  foBtnLink.addEventListener("click", function () { cutLink("link", TIMINGS.link.fail); });
+  foBtnUpstream.addEventListener("click", function () { cutLink("upstream", TIMINGS.upstream.fail); });
+
+  foBtnRestore.addEventListener("click", function () {
+    if (fo.transitioning) return;
+    if (fo.path === "unreachable") {
+      fo.path = "wan";
+      fo.cause = null;
+      foStatus.textContent = "both uplinks restored. wan active again.";
+      renderFo();
+      return;
+    }
+    if (fo.path !== "wwan") return;
+    var seconds = fo.cause === "link" ? TIMINGS.link.back : TIMINGS.upstream.back;
+    runCountdown(seconds, function () {
+      fo.path = "wan";
+      fo.cause = null;
+      foStatus.textContent = "wan active. LAN traffic egresses via the fibre link.";
+      renderFo();
+    }, "failing back to wan");
+  });
+
+  renderFo();
+
+  /* --- DIPC / USB demo -------------------------------------------------- */
+  var dipcMode = document.getElementById("dipcMode");
+  var pcieLink = document.getElementById("pcieLink");
+  var dipcBadge = document.getElementById("dipcBadge");
+  var dipcReason = document.getElementById("dipcReason");
+
+  function updateDipc() {
+    var mode = dipcMode.value;
+    var link = pcieLink.value;
+    var usbOn, reason;
+    if (mode !== "1" && mode !== "3") {
+      usbOn = false;
+      reason = "dual_ipc_mode is " + mode + ", not 1 or 3.";
+    } else if (mode === "1" && link === "up") {
+      usbOn = false;
+      reason = "mode 1 (PCIe Advance Mode) with the PCIe link up: the module prefers PCIe and turns USB off.";
+    } else if (mode === "1") {
+      usbOn = true;
+      reason = "mode 1, but there's no PCIe link to prefer (e.g. a USB-to-M.2 adapter), so USB stays on.";
+    } else {
+      usbOn = true;
+      reason = "mode 3 (stock dual mode): USB is always on regardless of the PCIe link.";
+    }
+    dipcBadge.textContent = usbOn ? "USB ON" : "USB OFF";
+    dipcBadge.className = "dipc-badge " + (usbOn ? "on" : "off");
+    dipcReason.textContent = " " + reason;
+  }
+
+  dipcMode.addEventListener("change", updateDipc);
+  pcieLink.addEventListener("change", updateDipc);
+  updateDipc();
+})();
+</script>
+
+</body>
+</html>

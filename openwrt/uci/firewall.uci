@@ -1,0 +1,27 @@
+# Idempotent uci batch snippet: put "wwan" in the wan firewall zone's network
+# list, and add the "Allow modem RA" rule from the mrhaav atc-fib-fm350_gl
+# README (lets the FM350 hand out IPv6 DNS servers via Router Advertisement).
+# Applied by install.sh with `uci -q batch`.
+#
+# Placeholder substituted by install.sh before piping to `uci -q batch`:
+#   @WAN_ZONE@ - uci reference of the existing zone with option name='wan'
+#                (e.g. @zone[1] or a named section), resolved by install.sh
+#                since firewall zones are anonymous by default and cannot be
+#                addressed by name directly.
+#
+# del_list before add_list keeps this idempotent: uci silently no-ops a
+# del_list for a value that isn't present, so running this twice never
+# produces a duplicate "wwan" entry.
+del_list @WAN_ZONE@.network='wwan'
+add_list @WAN_ZONE@.network='wwan'
+
+delete firewall.wwan_allow_ra
+set firewall.wwan_allow_ra=rule
+set firewall.wwan_allow_ra.name='Allow modem RA'
+set firewall.wwan_allow_ra.family='ipv6'
+set firewall.wwan_allow_ra.proto='icmp'
+set firewall.wwan_allow_ra.src='wan'
+set firewall.wwan_allow_ra.src_ip='fe80::1'
+set firewall.wwan_allow_ra.target='ACCEPT'
+
+commit firewall
