@@ -1,0 +1,24 @@
+# Idempotent uci batch snippet: wwan interface using the modemfeed xmm-modem
+# protocol handler (proto "xmm"), see docs/setup-guide.md step 6a. Applied by
+# install.sh with `uci -q batch`. install.sh does not install xmm-modem itself
+# (not in the official feeds); it only prints the modemfeed instructions and,
+# if the user proceeds, applies this network config so mwan3/firewall have a
+# consistent "wwan" interface to reference either way.
+#
+# Placeholders substituted by install.sh before piping to `uci -q batch`:
+#   @DEVICE@ - AT command tty, e.g. /dev/ttyUSB4
+#   @APN@    - carrier APN
+delete network.wwan
+set network.wwan=interface
+set network.wwan.proto='xmm'
+set network.wwan.device='@DEVICE@'
+set network.wwan.apn='@APN@'
+set network.wwan.pdp='ip'
+set network.wwan.profile='1'
+set network.wwan.auth='auto'
+set network.wwan.delay='10'
+set network.wwan.metric='20'
+
+set network.wan.metric='10'
+
+commit network

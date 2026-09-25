@@ -1,0 +1,44 @@
+#!/bin/sh
+# Hotplug helper: bind the in-kernel `option` serial driver to the Fibocom
+# FM350-GL's vendor-specific USB interfaces (0e8d:7126 mode 40, 0e8d:7127
+# mode 41).
+#
+# Only needed on kernel < 6.6 (e.g. GL.iNet stock firmware, kernel 5.4): the
+# FM350 USB IDs were added to the mainline `option` driver in June 2024
+# (kernel 6.6+, backported to 5.10.222+). Vanilla OpenWrt 24.10 (kernel 6.6)
+# binds the ttyUSB nodes automatically and does not need this file; install.sh
+# only copies it onto the router when `uname -r` reports an older kernel.
+#
+# Does nothing if the option1 driver isn't present, or if a ttyUSB device for
+# the modem's AT interface is already bound (avoids rebinding on every
+# hotplug event for an unrelated interface of the same device).
+
+[ "$ACTION" = add ] || exit 0
+
+case "$PRODUCT" in
+	e8d/7126/*)
+		usb_id="0e8d 7126"
+		iface_suffix=":1.4"
+		;;
+	e8d/7127/*)
+		usb_id="0e8d 7127"
+		iface_suffix=":1.6"
+		;;
+	*)
+		exit 0
+		;;
+esac
+
+driver_dir=/sys/bus/usb-serial/drivers/option1
+[ -d "$driver_dir" ] || exit 0
+
+# Already bound: an AT-capable ttyUSB exists under the vendor interface.
+for dev in /sys/bus/usb/devices/*"$iface_suffix"; do
+	[ -d "$dev" ] || continue
+	for tty in "$dev"/ttyUSB*; do
+		[ -e "$tty" ] && exit 0
+	done
+done
+
+echo "$usb_id" > "$driver_dir/new_id" 2>/dev/null
+logger -t fm350-driver "bound option1 driver for $usb_id"

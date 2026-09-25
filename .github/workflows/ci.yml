@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  fm350mac:
+    name: fm350mac (macos-latest)
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: fm350mac
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: pytest
+        run: uv run pytest -q
+
+      - name: ruff
+        run: uvx ruff check .
+
+      - name: helper tests under system /usr/bin/python3
+        run: ./tests/run_helper_tests_py39.sh
+
+  shellcheck:
+    name: shellcheck (ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck
+        run: |
+          shopt -s globstar
+          shellcheck openwrt/*.sh openwrt/tests/**/*.sh openwrt/files/etc/hotplug.d/usb/50-fm350_driver openwrt/files/usr/sbin/fm350-watchdog openwrt/files/etc/init.d/fm350-watchdog tools/bench-throughput.sh
+
+      - name: status decoder test
+        run: openwrt/tests/fm350-decode-test.sh

@@ -1,0 +1,22 @@
+# Idempotent uci batch snippet: fm350-watchdog settings. Applied by
+# install.sh with `uci -q batch` unless --no-watchdog is given.
+#
+# Own config file (/etc/config/fm350_watchdog), single section
+# "fm350_watchdog.main" - see files/usr/sbin/fm350-watchdog's header comment
+# for what each option does and for the other, uci-independent things the
+# watchdog also respects (network.wwan.disabled/auto,
+# /tmp/fm350-watchdog.pause, network.wwan.device presence).
+#
+# The section is deleted first so re-running the installer never leaves
+# stale options behind.
+delete fm350_watchdog.main
+set fm350_watchdog.main=fm350_watchdog
+set fm350_watchdog.main.enabled='1'
+set fm350_watchdog.main.interface='wwan'
+set fm350_watchdog.main.check_interval='30'
+set fm350_watchdog.main.pending_threshold='180'
+set fm350_watchdog.main.backoff_max='1800'
+set fm350_watchdog.main.backoff_reset_after='300'
+set fm350_watchdog.main.boot_grace='300'
+
+commit fm350_watchdog

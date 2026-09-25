@@ -1,0 +1,36 @@
+# Modem backups hold the IMEI and RF calibration of one physical unit. Never commit them.
+/backups/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+/dist/
+/build/
+
+# Downloaded OpenWrt images and packages for the router tests (hundreds of MB)
+/openwrt/tests/.cache/
+
+# Captured modem logs (may contain IMEI, ICCID, cell IDs)
+*.nma
+*.log
+
+# OS and editor debris
+.DS_Store
+._*
+*.swp
+*~
+.idea/
+.vscode/
+
+# Local agent workspace (kept out of the published repo)
+/.agents/
+/.claude/
+/AGENTS.md
+/CLAUDE.md
+
+# Benchmark run output (tools/bench-throughput.sh)
+/tools/bench-results/

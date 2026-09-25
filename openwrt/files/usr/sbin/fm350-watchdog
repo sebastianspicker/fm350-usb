@@ -1,0 +1,223 @@
+#!/bin/sh
+# fm350-watchdog - recovers the "wwan" mobile interface (mrhaav's atc-fib-
+# fm350_gl netifd proto handler) when it gets stuck "pending"/"connecting"
+# forever instead of coming up or failing cleanly.
+#
+# Why this exists: atc.sh treats only a final "+CME ERROR: ... (#33)" from
+# AT+CGACT as fatal (proto_notify_error SESSION_FAILED + proto_block_restart
+# + return). Any other +CME ERROR seen during activation is only logged
+# (atc_debug>=1) and otherwise silently ignored, so proto_atc_setup is left
+# blocked reading URCs off the tty that will never arrive - see
+# docs/compatibility-and-risks.md and tests/atc-test.sh's "cgact_error"
+# scenario comment for the traced detail. netifd then reports the interface
+# as "pending"/"connecting" indefinitely, mwan3 never marks it up, and
+# failover to 5G silently never becomes available. On the bench, `ifup
+# wwan` (after an `ifdown`) unsticks it; this script automates exactly that.
+#
+# Config mechanism: uci, own config file /etc/config/fm350_watchdog, a
+# single section "fm350_watchdog.main" (see uci/fm350-watchdog.uci, applied
+# by install.sh unless --no-watchdog is given):
+#   option enabled             '1'    0 disables the watchdog entirely
+#   option interface           'wwan' the netifd interface to watch/restart
+#   option check_interval      '30'   seconds between ifstatus polls
+#   option pending_threshold   '180'  seconds the interface must be
+#                                     continuously non-"up" before the first
+#                                     restart of a given episode
+#   option backoff_max         '1800' cap, in seconds, on the exponential
+#                                     backoff between repeated restarts
+#   option backoff_reset_after '300'  seconds the interface must stay
+#                                     continuously "up" before the backoff
+#                                     resets, so a single brief flap doesn't
+#                                     throw away the accumulated backoff
+#   option boot_grace          '300'  no restarts until the system has been
+#                                     up this many seconds, so a slow first
+#                                     bring-up (modem boot, cell search) isn't
+#                                     mistaken for a hang
+#
+# Numeric options that aren't plain non-negative integers (e.g. '180s')
+# fall back to their default with a log line, rather than crashing the
+# daemon on the first arithmetic test.
+#
+# Also respected every tick, with no uci option of their own:
+#   - network.<interface>.disabled='1' or network.<interface>.auto='0': the
+#     admin deliberately doesn't want this interface up (or brought up
+#     automatically); the watchdog never touches it while either is set.
+#   - $FM350_WATCHDOG_PAUSE_FILE (default /tmp/fm350-watchdog.pause): touch
+#     this file to pause the watchdog by hand (e.g. while debugging on the
+#     bench with `ifdown wwan` yourself); remove it to resume. Lives on
+#     tmpfs, so a pause does not survive a reboot.
+#   - network.<interface>.device, if it looks like a /dev/ path: while that
+#     path doesn't exist (modem USB device absent/still enumerating), the
+#     watchdog neither restarts nor advances its pending-since clock, so
+#     unplugging the modem doesn't burn down the backoff for nothing.
+#
+# Runs as a procd-supervised daemon (/etc/init.d/fm350-watchdog); main()'s
+# own loop sleeps check_interval seconds between ticks. All state (the
+# pending-since/up-since timestamps and the current backoff) lives in plain
+# shell variables for the life of the process, not on disk: a crash-respawn
+# by procd starts the state machine over, which just means pending_threshold
+# has to elapse again before the next restart - harmless.
+#
+# Decision logic lives in tick() and the small helpers it calls, which only
+# touch their arguments/globals plus interface_up()/restart_interface()/
+# should_manage()/device_missing()/paused()/now()/log() - each a thin,
+# one-line wrapper around a single external command (ifstatus/ifup+ifdown/
+# uci/date/logger respectively). tests/watchdog-test.sh sources this file
+# (FM350_WATCHDOG_TEST=1 skips the "$@"-driven main() call at the bottom)
+# and overrides those wrapper functions with fakes before calling tick()
+# directly, so the whole decision state machine runs without procd, netifd,
+# or a real modem. POSIX sh/ash (busybox) compatible.
+set -e
+
+PAUSE_FILE=${FM350_WATCHDOG_PAUSE_FILE:-/tmp/fm350-watchdog.pause}
+
+log() {
+	logger -t fm350-watchdog "$*"
+}
+
+now() {
+	date +%s
+}
+
+uci_get() {
+	uci -q get "$1" 2>/dev/null
+}
+
+cfg() {
+	# $1: fm350_watchdog.main option name  $2: default if unset/empty
+	val=$(uci_get "fm350_watchdog.main.$1")
+	[ -n "$val" ] && echo "$val" || echo "$2"
+}
+
+cfg_num() {
+	# Like cfg, but only accepts a plain non-negative integer.
+	val=$(cfg "$1" "$2")
+	case "$val" in
+	'' | *[!0-9]*)
+		log "ignoring non-numeric fm350_watchdog.main.$1='$val', using $2"
+		echo "$2"
+		;;
+	*) echo "$val" ;;
+	esac
+}
+
+load_config() {
+	enabled=$(cfg enabled 1)
+	interface=$(cfg interface wwan)
+	check_interval=$(cfg_num check_interval 30)
+	[ "$check_interval" -gt 0 ] || check_interval=30
+	pending_threshold=$(cfg_num pending_threshold 180)
+	backoff_max=$(cfg_num backoff_max 1800)
+	backoff_reset_after=$(cfg_num backoff_reset_after 300)
+	boot_grace=$(cfg_num boot_grace 300)
+}
+
+# Seconds since boot (integer part of /proc/uptime).
+uptime_s() {
+	read -r up _ </proc/uptime
+	echo "${up%%.*}"
+}
+
+paused() {
+	[ -e "$PAUSE_FILE" ]
+}
+
+# Deliberately disabled/non-auto interface: the admin's call, never ours.
+should_manage() {
+	[ "$(uci_get "network.$interface.disabled")" = "1" ] && return 1
+	[ "$(uci_get "network.$interface.auto")" = "0" ] && return 1
+	return 0
+}
+
+# True (0) only when network.<interface>.device is a /dev/ path that
+# currently doesn't exist (modem unplugged/still enumerating). Anything else
+# (unset, or a non-/dev/ value like the atc proto's sysfs-derived ifname) is
+# "not missing" as far as this check is concerned.
+device_missing() {
+	dev=$(uci_get "network.$interface.device")
+	case "$dev" in
+	/dev/*) [ -e "$dev" ] || return 0 ;;
+	esac
+	return 1
+}
+
+# Echoes "true"/"false", or "" if ifstatus/jsonfilter failed (interface
+# unknown to netifd yet, ubus not up, etc.) - tick() treats "" like "false".
+interface_up() {
+	ifstatus "$interface" 2>/dev/null | jsonfilter -e '@.up' 2>/dev/null
+}
+
+restart_interface() {
+	log "$interface pending for ${elapsed}s, restarting it (backoff was ${backoff}s)"
+	ifdown "$interface" 2>/dev/null
+	ifup "$interface" 2>/dev/null
+}
+
+# tick() - one decision-and-maybe-act cycle. Reads/writes the globals
+# pending_since, up_since, backoff and next_allowed_restart, all seconds
+# since the epoch (0 meaning "not currently tracked/no backoff yet").
+tick() {
+	n=$(now)
+
+	if [ "$enabled" = "0" ] || paused || ! should_manage; then
+		pending_since=0
+		up_since=0
+		backoff=0
+		next_allowed_restart=0
+		return 0
+	fi
+
+	if device_missing; then
+		# Modem physically absent: freeze the state machine rather than
+		# advancing (or resetting) any clock.
+		return 0
+	fi
+
+	up=$(interface_up)
+
+	if [ "$up" = "true" ]; then
+		pending_since=0
+		[ "$up_since" -eq 0 ] && up_since=$n
+		if [ "$backoff" -gt 0 ] && [ $((n - up_since)) -ge "$backoff_reset_after" ]; then
+			backoff=0
+			next_allowed_restart=0
+		fi
+		return 0
+	fi
+
+	up_since=0
+	if [ "$pending_since" -eq 0 ]; then
+		pending_since=$n
+		return 0
+	fi
+
+	elapsed=$((n - pending_since))
+	[ "$elapsed" -lt "$pending_threshold" ] && return 0
+	[ "$n" -lt "$next_allowed_restart" ] && return 0
+	[ "$(uptime_s)" -lt "$boot_grace" ] && return 0
+
+	restart_interface
+
+	if [ "$backoff" -eq 0 ]; then
+		backoff=$pending_threshold
+	else
+		backoff=$((backoff * 2))
+	fi
+	[ "$backoff" -gt "$backoff_max" ] && backoff=$backoff_max
+	next_allowed_restart=$((n + backoff))
+}
+
+main() {
+	load_config
+	pending_since=0
+	up_since=0
+	backoff=0
+	next_allowed_restart=0
+	log "starting: interface=$interface check_interval=${check_interval}s pending_threshold=${pending_threshold}s backoff_max=${backoff_max}s backoff_reset_after=${backoff_reset_after}s boot_grace=${boot_grace}s"
+	while true; do
+		tick
+		sleep "$check_interval"
+	done
+}
+
+[ -n "$FM350_WATCHDOG_TEST" ] || main "$@"

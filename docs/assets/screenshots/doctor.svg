@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="808" height="305" viewBox="0 0 808 305" role="img" aria-label="fm350mac doctor">
+<title>fm350mac doctor</title>
+<defs><clipPath id="win"><rect x="0.5" y="0.5" width="807" height="304" rx="10"/></clipPath></defs>
+<g clip-path="url(#win)">
+<rect x="0.5" y="0.5" width="807" height="304" rx="10" fill="#0d1117" stroke="#30363d"/>
+<rect x="0.5" y="0.5" width="807" height="36" fill="#161b22"/>
+<line x1="0.5" y1="36.5" x2="807.5" y2="36.5" stroke="#30363d"/>
+<circle cx="20.0" cy="18.5" r="6" fill="#ff5f56"/>
+<circle cx="40.0" cy="18.5" r="6" fill="#ffbd2e"/>
+<circle cx="60.0" cy="18.5" r="6" fill="#27c93f"/>
+<text x="404.0" y="23" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="12.5" fill="#8b949e">fm350mac doctor</text>
+<text x="22.0" y="66.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#3fb950" font-weight="600" xml:space="preserve">$ </text>
+<text x="39.4" y="66.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#f0f6fc" font-weight="600" xml:space="preserve">fm350mac doctor</text>
+<text x="22.0" y="87.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">[INFO] firmware package: 81600.0000.00.29.20.22_5025.0000.040.000.038_C69 (Dell DW5931e)</text>
+<text x="22.0" y="108.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">[OK] DIPC mode 3 (dual: USB always on)</text>
+<text x="22.0" y="129.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">[OK] FCC lock: unlocked (mode=0, status=1)</text>
+<text x="22.0" y="150.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">[INFO] GTFMODE 1,0 (radio hw-pin control enabled, GNSS hw-pin control disabled)</text>
+<text x="22.0" y="171.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">[INFO] USB mode 41 (RNDIS + serial + ADB)</text>
+<text x="22.0" y="192.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">[INFO] RAT mode: UMTS+LTE+NR (ERAT mode 21)</text>
+<text x="22.0" y="213.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">[OK] antenna tuner enabled (GTANTTUNINGEN=1)</text>
+<text x="22.0" y="234.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">[OK] radio functionality: on (CFUN=1)</text>
+<text x="22.0" y="255.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">[OK] SIM: ready</text>
+<text x="22.0" y="276.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">[OK] serving cell: LTE B1, 9 neighbour(s)</text>
+</g></svg>
