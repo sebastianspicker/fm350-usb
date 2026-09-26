@@ -5,6 +5,13 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   fm350mac:
     name: fm350mac (macos-latest)
@@ -21,8 +28,11 @@ jobs:
       - name: pytest
         run: uv run pytest -q
 
+      - name: pytest (tools/fm350_diag.py)
+        run: uv run pytest -q ../tools/tests
+
       - name: ruff
-        run: uvx ruff check .
+        run: uvx ruff check . ../tools/fm350_diag.py ../tools/tests
 
       - name: helper tests under system /usr/bin/python3
         run: ./tests/run_helper_tests_py39.sh

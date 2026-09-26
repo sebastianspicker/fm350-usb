@@ -34,3 +34,6 @@ __pycache__/
 
 # Benchmark run output (tools/bench-throughput.sh)
 /tools/bench-results/
+
+# fm350_diag.py run output (reports/transcripts/journals may hold operator or cell data)
+/fm350-diag-*/

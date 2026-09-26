@@ -5,9 +5,34 @@ FM350-GL 5G modem: the architecture, the alternatives we rejected, and why.
 For the package itself (install, commands, tests), see
 [fm350mac/README.md](../fm350mac/README.md).
 
-Status: scaffold implemented and reviewed (2026-09-25). 101 unit tests pass and `fm350mac probe` works on real hardware. The data path (`up`) has not run live yet (needs a SIM and root). Goal: get IP connectivity from the FM350-GL on macOS (Apple Silicon, macOS 27) without third-party drivers, kernel extensions or SIP changes, using only code in this repo.
+This is a design record, written for the technically curious and for anyone
+contributing to `fm350mac`. It keeps full technical depth; if you only want
+to run the tool, the [fm350mac README](../fm350mac/README.md) is the shorter,
+task-focused door in.
 
-Main use: bench-testing SIM, registration and throughput before the dongle goes on the Flint 2, and as an ad-hoc Mac uplink. The production failover path is still the router (see [setup-guide.md](setup-guide.md)).
+## In short
+
+- macOS ships no driver for RNDIS, the only USB data mode the FM350-GL
+  offers. Something has to speak RNDIS to the modem and hand the resulting
+  IP packets to macOS — that something is `fm350mac`.
+- **Chosen approach (option 5 below):** talk to the modem directly over USB
+  with libusb, and exchange IP packets with macOS through a `utun` interface
+  (the same kind of virtual network device VPNs use), doing the
+  Ethernet‑framing and ARP work ourselves in user space. No kernel
+  extension, no DriverKit entitlement, no SIP changes.
+- Goal: IP connectivity from the FM350-GL on macOS (Apple Silicon, macOS 27)
+  without third-party drivers, kernel extensions or SIP changes, using only
+  code in this repo. Main use: bench-testing SIM, registration and
+  throughput before the dongle goes on the Flint 2, and as an ad-hoc Mac
+  uplink. The production failover path is still the router (see
+  [setup-guide.md](setup-guide.md)).
+- Status (2026-09-25): the scaffold is implemented and reviewed. 101 unit
+  tests pass (327 by 2026-09-26) and `fm350mac probe` (USB enumeration + RNDIS init) works
+  against real hardware. The actual data path (`up`) has **not run live
+  yet** — it needs a SIM and root (or the root helper described below).
+- Biggest caveat: everything about live throughput, including the ~150 Mbps
+  figure used below as a design threshold, is an estimate, not a
+  measurement.
 
 ## Facts measured on this Mac
 
@@ -24,7 +49,15 @@ Main use: bench-testing SIM, registration and throughput before the dongle goes 
 | Max frame size / link speed / media | 1500 / 1 Gbps / connected (even without SIM) | probe |
 | AT port | iface 6, bulk OUT `0x06` / IN `0x87` | `tools/fm350_at.py` |
 
-The data plane is Ethernet framing around what is really an IP pipe. The network assigns the IP (`AT+CGPADDR`) and DNS (`AT+GTDNS`). DHCP on the FM350's RNDIS is unreliable.
+In plain terms: the modem only offers RNDIS (Microsoft's USB networking
+protocol) over USB, macOS only ships drivers for the other two USB
+networking types (ECM/NCM), and a normal program can already talk to the
+RNDIS interfaces over USB without needing root — only the last step, handing
+packets to macOS's own network stack, needs anything privileged.
+
+The data plane is Ethernet framing around what is really an IP pipe. The
+network assigns the IP (`AT+CGPADDR`) and DNS (`AT+GTDNS`). DHCP on the
+FM350's RNDIS is unreliable.
 
 ## Options considered
 
@@ -36,6 +69,12 @@ The data plane is Ethernet framing around what is really an IP pipe. The network
 | 4 | libusb + `feth` pair + BPF (L2, TetherKit's approach) | Partial fit. Works without entitlements, but needs `feth` ioctls that aren't in the public SDK, plus BPF and MAC juggling. More moving parts than we need |
 | 5 | libusb + `utun` (L3) + userspace ARP/Ethernet shim | **Chosen.** Public, stable API (`PF_SYSTEM`/`utun_control`, what every VPN uses). No entitlements. Root is needed only to create `utun` and set routes. A cellular link is L3 anyway, so we strip or add Ethernet headers ourselves and answer ARP in user space |
 | 6 | Only use the router | Still the production plan, but it doesn't give a Mac bench path |
+
+In short: options 1–3 all need something Apple has to grant (a kernel
+extension exemption, DriverKit entitlements, or a VPN-style entitlement);
+option 4 works but pulls in unsupported APIs for no real benefit here.
+Option 5 uses only public, stable APIs and needs root for the smallest
+possible piece of the job.
 
 ## Architecture (option 5)
 
@@ -62,6 +101,14 @@ The data plane is Ethernet framing around what is really an IP pipe. The network
                FM350  ◄────────────── CGDCONT / CGACT / CGPADDR / GTDNS
 ```
 
+> **Note (stale text, C2):** the bottom box above still reads "USB (libusb
+> via pyusb)". That reflects the original scaffold. pyusb has since been
+> replaced everywhere by our own ctypes binding to libusb, `usb_async.py`
+> (see "Async USB I/O" below) — the [fm350mac README](../fm350mac/README.md)
+> is explicit that the current code uses "our own ctypes binding
+> (`usb_async.py`) -- no pyusb". The rest of the diagram (RNDIS, the L2 shim,
+> utun) is unchanged by that rewrite.
+
 ### Session flow (`sudo fm350mac up --apn <apn>`)
 
 1. **AT (iface 6):** `AT+CPIN?` = READY → `AT+CGDCONT=1,"IP","<apn>"` → `AT+CGACT=1,1` → `AT+CGPADDR=1` → our IPv4 → `AT+GTDNS=1` → DNS servers.
@@ -73,9 +120,22 @@ The data plane is Ethernet framing around what is really an IP pipe. The network
 7. **Keepalive:** answer device `KEEPALIVE_MSG` with `KEEPALIVE_CMPLT`, and send our own every 5 s on the control channel.
 8. **Teardown (SIGINT/SIGTERM):** restore routes, remove DNS key, close utun, RNDIS HALT, `AT+CGACT=0,1`, release interfaces.
 
+> **Note (stale text, C3):** the heading above still shows `sudo fm350mac
+> up`. That was accurate before privilege separation existed. With the root
+> helper installed (see "Privilege separation" below), `up` needs no `sudo`
+> at all — the helper does only the utun/route/DNS steps, as root, on
+> request [fm350mac README]. `--no-helper` keeps the original `sudo`
+> behaviour shown here as a fallback. The AT/RNDIS/pump steps themselves
+> never needed root.
+
 ### Throughput expectation
 
-The device takes 1 packet per transfer, so throughput is bound by packets per second. Python with two threads is enough for bench tests; libusb calls release the GIL through ctypes. The first milestone is correctness, then we measure with `iperf3`. If the result is well under about 150 Mbps and that matters, port only `bridge.py` and the USB hot path to Swift or Rust behind the same interfaces. The control plane stays in Python.
+The device takes 1 packet per transfer, so throughput is bound by packets
+per second. Python with two threads is enough for bench tests; libusb calls
+release the GIL through ctypes. The first milestone is correctness, then we
+measure with `iperf3`. If the result is well under about 150 Mbps and that
+matters, port only `bridge.py` and the USB hot path to Swift or Rust behind
+the same interfaces. The control plane stays in Python.
 
 ## Package layout
 
@@ -96,6 +156,15 @@ fm350mac/                 Python ≥3.11 project, uv-managed (pyproject.toml)
 
 `probe`, `at` and `status` need no root. `up` needs root (utun + routes).
 
+> **Note (stale text, C2):** this layout describes the original scaffold,
+> built directly on pyusb. `usb_transport.py`'s pyusb backend and the rest of
+> that USB layer were superseded by the async ctypes binding in
+> `usb_async.py`, covered in full in "Async USB I/O" below — see the
+> [fm350mac README](../fm350mac/README.md), which confirms the shipped code
+> has "no pyusb". The module boundaries above (RNDIS/ethernet/utun/netconfig
+> as separate, independently testable pieces) are still how the code is
+> organised.
+
 ## Milestones
 
 1. Done: `probe`, RNDIS init + OID queries (done manually; now in the package).
@@ -107,9 +176,18 @@ fm350mac/                 Python ≥3.11 project, uv-managed (pyproject.toml)
 
 ## Async USB I/O: our own ctypes binding to libusb (decided 2026-09-25)
 
-**Why:** synchronous pyusb transfers cost ~106 µs each (measured), which caps a single-transfer-per-packet path at ~9 k pkt/s (≈100 Mbps at 1400 B). Linux `usbnet` keeps many URBs in flight per direction. Libusb's async API does the same.
+This is the current, canonical design for the USB layer — it replaced the
+pyusb-based scaffold shown above.
 
-**Why our own binding:** we chose it over the alternatives because it needs no new dependency and gives us full control. Rejected alternatives: `python-libusb1` (mature, but an extra dependency) and several threads running sync pyusb (packets can be reordered on RX).
+**Why:** synchronous pyusb transfers cost ~106 µs each (measured), which caps
+a single-transfer-per-packet path at ~9 k pkt/s (≈100 Mbps at 1400 B). Linux
+`usbnet` keeps many URBs (USB Request Blocks — the unit of one in-flight USB
+transfer) in flight per direction. Libusb's async API does the same.
+
+**Why our own binding:** we chose it over the alternatives because it needs
+no new dependency and gives us full control. Rejected alternatives:
+`python-libusb1` (mature, but an extra dependency) and several threads
+running sync pyusb (packets can be reordered on RX).
 
 ### Module `usb_async.py` (replaces pyusb everywhere)
 
@@ -168,3 +246,31 @@ fm350mac/                 Python ≥3.11 project, uv-managed (pyproject.toml)
 - **Main process:** `HelperClient` implements the existing `Utun` + `NetConfig` interfaces over the socket, so cli/bridge/supervisor don't change. `up` no longer needs root when the helper is installed. `--no-helper` keeps the current sudo mode as a fallback.
 - **Install/uninstall** (run these with sudo; they print every step first and have `--dry-run`): `fm350mac helper install` copies the helper file, writes `/Library/LaunchDaemons/de.fm350mac.helper.plist` (root:wheel 0644, `ProgramArguments = [/usr/bin/python3, -I, -S, /usr/local/libexec/fm350mac-helper, --allowed-uid, <uid>]`), then `launchctl bootstrap system …`. `helper uninstall` reverses it. `helper status` shows whether it's loaded and reachable.
 - **Tests:** the helper's request validation and state machine are unit-tested with a fake command runner, **also executed under `/usr/bin/python3` (3.9)**. The fd passing is tested with a socketpair and a pipe fd. Client/helper end to end runs in-process with the fake runner. The only live root step is running `helper install` and then `up --loopback` without sudo.
+
+This design has since run live end to end — see the [bench log's privilege
+separation entry](bench-log.md), which found no gaps beyond what's listed
+under "What's not proven yet". For everyday setup commands (`helper
+install`, `helper status`, cleaning up after `kill -9`), see the
+[fm350mac README](../fm350mac/README.md), which documents the same design
+from a user's point of view.
+
+## What's not proven yet
+
+- The real data path (`up` against the actual FM350-GL) has not run live —
+  it needs a SIM. Everything about it so far is either unit-tested or
+  exercised through `up --loopback` against the in-process fake modem, not
+  the real device [fm350mac README, Limitations].
+- The async I/O rewrite's whole point — higher throughput than the ~9 k
+  pkt/s / ~100 Mbps synchronous ceiling — has not been measured; only the
+  synchronous figure above comes from a real measurement. The "~150 Mbps"
+  threshold used above to decide whether to port the hot path is a design
+  estimate, not a result [fm350mac README, Limitations].
+- IPv6 (`IPV4V6` PDP context, router advertisements from the modem) is
+  still just a milestone on the list above, not implemented.
+- The design is macOS/Apple Silicon only, by choice: none of the rejected
+  options (kernel extension, DriverKit, Network Extension, Linux/Windows
+  parity) are being pursued.
+
+## Glossary
+
+Terms used on this page, defined in the [shared glossary](glossary.md): [AT command](glossary.md#at-command), [AT port](glossary.md#at-port), [APN](glossary.md#apn), [PDP context / data session](glossary.md#pdp-context--data-session), [RNDIS](glossary.md#rndis), [libusb](glossary.md#libusb), [utun](glossary.md#utun), [LaunchDaemon](glossary.md#launchdaemon), [Failover / failback](glossary.md#failover--failback), [ARP](glossary.md#arp), [GIL](glossary.md#gil), [URB](glossary.md#urb), [kext / kernel extension](glossary.md#kext--kernel-extension), [SIP](glossary.md#sip).

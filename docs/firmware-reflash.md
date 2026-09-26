@@ -2,20 +2,26 @@
 
 A hobbyist-assembled procedure for reflashing an FM350-GL/DW5931e from its
 OEM laptop firmware to generic Fibocom firmware, over USB, with MediaTek SP
-Flash Tool on Windows. It's for anyone whose module genuinely won't register
-on any network after ruling out the hardware causes in
+Flash Tool (SP Flash Tool: MediaTek's Windows program for writing firmware
+to the chip) on Windows. It's for anyone whose module genuinely won't
+register on any network after ruling out the hardware causes in
 [dell-dw5931e-usb.md](dell-dw5931e-usb.md#no-cells-at-all-cesq-all-99255-gtccinfo-empty).
 
-**Not needed for our unit, and never run.** We wrote this procedure while
-DIPC mode (see below) looked like the likely cause of our module registering
-no cell. It turned out to be a pair of defective antenna pigtails instead
-(see [bench-log.md](bench-log.md) and [dell-dw5931e-usb.md](dell-dw5931e-usb.md));
-once we replaced them, the module registered fine on its original OEM
-firmware. We're keeping the procedure here, untested, as reference for OEM
-FM350-GL/DW5931e units that still won't register after the hardware is
-confirmed good. Read [Known failure modes](#known-failure-modes-from-sources)
-and [Sources](#sources) before starting, and re-check the Microsoft Update
-Catalog listing yourself — see [Open questions on the firmware package](#open-questions-on-the-firmware-package).
+## Status: never run, and not needed on our unit
+
+- **We have not run this procedure.** It is untested, end to end, on any module in this project.
+- **Not needed for our unit.** We wrote it while DIPC mode (the module setting that decides whether the host talks to it over PCIe, USB or both) looked like the likely cause of our module registering no cell. It turned out to be a pair of defective antenna pigtails instead (see [bench-log.md](bench-log.md) and [dell-dw5931e-usb.md](dell-dw5931e-usb.md)); once we replaced them, the module registered fine on its original OEM firmware.
+- **Brick risk, with no documented recovery.** No source found for this document describes a confirmed way to recover a module left with no working firmware after a failed or interrupted flash — see [Known failure modes](#known-failure-modes-from-sources) and [Rollback/recovery](#rollbackrecovery).
+- **Who should even consider this:** only someone with an OEM FM350-GL/DW5931e that still won't register *after* the hardware is confirmed good — antenna cables and connectors first, per the [Dell guide's troubleshooting](dell-dw5931e-usb.md#no-cells-at-all-cesq-all-99255-gtccinfo-empty).
+- We're keeping the procedure here, untested, as reference for OEM FM350-GL/DW5931e units that still won't register after the hardware is confirmed good. Read [Known failure modes](#known-failure-modes-from-sources) and [Sources](#sources) before starting, and re-check the Microsoft Update Catalog listing yourself — see [Open questions on the firmware package](#open-questions-on-the-firmware-package).
+
+## In short
+
+- **Decision: probably don't.** This is untested end to end, assembled from hobbyist guides and a Microsoft driver package never intended for standalone use, on a module class with no vendor recovery path.
+- **If you must, flash a second FM350-GL unit first**, if one is available — don't experiment on your only sample.
+- **Only ever use `Download Only` mode** in SP Flash Tool. `Format All + Download` erases the IMEI; `Firmware Upgrade`'s partition handling is undocumented and risky (see [Flashing](#flashing)).
+- **Back up first.** NV partitions (module storage holding the IMEI and factory radio calibration) can't be recreated if lost.
+- **What's untested:** the whole procedure, whether `Download Only` actually resets DIPC mode (the thing this flash is meant to prove), and any recovery path if something goes wrong.
 
 ## Why this procedure exists
 
@@ -48,15 +54,19 @@ variant matching](#hardwarepreloader-variant-matching).
 
 We then ruled out in software: the Dell FCC unlock (accepted, challenge
 `0x00000000`, no effect), thermal throttling, SIM files, IMEI, tunable
-antenna off, LTE-only, and the attach APN. The module's own log showed the
-radio on (`hw=1 sw=1`) and the modem core searching without finding a
-cell — which is when we started drafting this procedure. The actual cause,
-found afterwards, is the pigtails (see the note at the top of this page).
+antenna off, LTE-only, and the attach APN — the same checks, with their
+results, are logged in full in the [bench log](bench-log.md). The module's
+own log showed the radio on (`hw=1 sw=1`) and the modem core searching
+without finding a cell — which is when we started drafting this procedure.
+The actual cause, found afterwards, is the pigtails (see the note at the
+top of this page).
 
 **This is a firmware flash on a module that is not on any vendor's supported
 list for this use case, using files, tools and steps assembled by hobbyists
 from a Microsoft driver package never intended for standalone use.** Risks,
 in descending order of severity:
+
+## Risks
 
 - **Brick.** No source in this document's research describes a confirmed
   recovery path for a module left with no working firmware after a failed
@@ -89,8 +99,8 @@ available, flash that one first.
 | Windows PC | Windows 10/11 x64. All sources tested on Windows only; SP Flash Tool has no macOS/Linux build (an unofficial Linux mtkclient exists but is not what these sources used and is not covered here). |
 | USB connection | The Waveshare "USB TO M.2 B KEY" adapter, module installed, connected directly to a PC USB port (avoid hubs during flashing — a drop-out mid-write is exactly the failure mode to avoid). |
 | SP Flash Tool | **v6.2124** exactly. Sources are explicit that v5 does not work (older download-agent protocol) and versions newer than v6.2124 use an incompatible protocol with this module. Download: https://spflashtools.com/windows/sp-flash-tool-v6-2124 (third-party mirror; SP Flash Tool is not distributed by MediaTek to the public — this is the same download link all three sources point to). |
-| MediaTek USB drivers | "MediaTek USB VCOM" / preloader drivers, needed so Windows recognises the module in BROM/preloader download mode. One source (the Chinese WLGH01 guide) links `https://mtkdriver.com/mtk-driver-v5-2307`. Not independently verified against this exact module; generic MediaTek VCOM driver packages are widely mirrored (e.g. from XDA/thecustomdroid) if that link is unavailable. Install before connecting the module in flash mode. Expect a Windows "driver not signed" warning (Code 10) on first install on some Windows versions — sources don't document a fix beyond reinstalling/enabling test-signing; not verified here. |
-| ADB (optional, for backup) | Android Platform-Tools (`adb.exe`) if you attempt the ADB-based backup below. The FM350 exposes an ADB interface in USB mode 41 (confirmed in [bench-log.md](bench-log.md): "5 ADB"; also documented in the FM350 AT Commands manual's `AT+GTUSBMODE` mode list, which spells out mode 41 as "RNDIS+AT+AP(GNSS)+META+DEBUG+NPT+ADB+AP(LOG)+AP(META)"). Whether Windows will attach a normal ADB driver to it, and whether the modem's ADB shell is unlocked, is **not verified**. |
+| MediaTek USB drivers | "MediaTek USB VCOM" / preloader drivers, needed so Windows recognises the module in BROM/preloader (the first boot stages of a MediaTek chip, used by SP Flash Tool to write firmware) download mode. One source (the Chinese WLGH01 guide) links `https://mtkdriver.com/mtk-driver-v5-2307`. Not independently verified against this exact module; generic MediaTek VCOM driver packages are widely mirrored (e.g. from XDA/thecustomdroid) if that link is unavailable. Install before connecting the module in flash mode. Expect a Windows "driver not signed" warning (Code 10) on first install on some Windows versions — sources don't document a fix beyond reinstalling/enabling test-signing; not verified here. |
+| ADB (optional, for backup) | Android Platform-Tools (`adb.exe`) if you attempt the ADB-based backup below. The FM350 exposes an ADB (Android Debug Bridge; here it gives a root shell on the modem's internal Linux system, with no password) interface in USB mode 41 (confirmed in [bench-log.md](bench-log.md): "5 ADB"; also documented in the FM350 AT Commands manual's `AT+GTUSBMODE` mode list, which spells out mode 41 as "RNDIS+AT+AP(GNSS)+META+DEBUG+NPT+ADB+AP(LOG)+AP(META)"). **ADB root access itself is verified** — on macOS, this module gives an unauthenticated root ADB shell over USB [Dell guide, Step 3]. What's **not verified** is whether Windows will attach a normal ADB driver to that same interface, and whether that holds for OEM images other than this Dell unit. |
 | Firmware package | See [Preparing the firmware folder](#preparing-the-firmware-folder) — downloaded from the Microsoft Update Catalog, not from Fibocom directly. |
 | A hex editor | For the preloader hardware-ID check (e.g. https://hexed.it/, used by one source; any offline hex editor works). |
 | Windows `certutil` | Built in, used for the checksum step below. |
@@ -115,8 +125,8 @@ fm350mac/.venv/bin/fm350mac at 'ATI' 'AT+CGMR' 'AT+GTPKGVER?' 'AT+GTCUSTPACKVER?
 |---|---|---|
 | `ATI` | Manufacturer/model/revision block | Baseline identity string |
 | `AT+CGMR` | Firmware revision (e.g. `81600.0000.00.29.20.22`, SVN) | Confirms the flash actually changed the firmware version |
-| `AT+GTPKGVER?` | Full package version incl. OEM custom image/data tags | Confirms OEM customization is gone (or not) post-flash |
-| `AT+GTCUSTPACKVER?` | OEM customization pack version | Same |
+| `AT+GTPKGVER?` | Full package version incl. OEM custom image/data tags | Confirms OEM customisation is gone (or not) post-flash |
+| `AT+GTCUSTPACKVER?` | OEM customisation pack version | Same |
 | `AT+GTCFGELEMVER?` | Config element version | Same |
 | `AT+GTCUSTDATAVER?` | Device data version | Same |
 | `AT+CGSN` | IMEI | **Must be identical before and after.** If it changes or reads blank, stop and do not proceed to any further step that could make it worse |
@@ -133,6 +143,14 @@ Save this output to a text file outside the repo (it contains the IMEI and
 serial — do not commit it).
 
 ## Backup
+
+This repo already has its own ADB-based backup method, used for the much
+smaller, reversible DIPC edit rather than a full reflash — see [Dell guide,
+Step 3](dell-dw5931e-usb.md#step-3-get-the-adb-root-shell-and-make-a-backup)
+and [Diagnostics, Backup](diagnostics.md#backup-before-stage-2-or-3). The
+method below is specific to this flashing procedure, comes from a different
+source (WLGH01), and pulls different paths (`/dev/mtd0`, `/dev/mtd`) than
+those two.
 
 **SP Flash Tool's own Readback function cannot be relied on for the
 partitions that matter.** The WLGH01 (Chinese) guide states plainly that
@@ -161,7 +179,7 @@ our unit:
   blocking — it doesn't mean the flash itself will fail.
 - A successful backup does **not** mean a documented restore procedure
   exists. No source describes writing these files back. Treat it as a
-  forensic/last-resort artifact, not a guaranteed rollback.
+  forensic/last-resort artefact, not a guaranteed rollback.
 
 If ADB access fails, proceed without a partition backup — this matches
 what most of the community reports appear to have done, given `Download
@@ -265,10 +283,10 @@ does **not** document a hardware ID or preloader variant in any
 human-readable form — no source in this research showed a way to read the
 preloader hardware ID over AT commands. The only documented way to learn it
 is reading the raw `mtd0` partition, which itself requires the ADB access
-noted in [Backup](#backup) as unverified. If ADB access doesn't work and
-your downloaded package offers multiple preloader candidates, you do not
-have a documented way to pick the right one — that is a real, unresolved
-gap in this procedure, not an oversight.
+noted in [Backup](#backup) as unverified for Windows. If ADB access doesn't
+work and your downloaded package offers multiple preloader candidates, you
+do not have a documented way to pick the right one — that is a real,
+unresolved gap in this procedure, not an oversight.
 
 ### Checksums
 
@@ -370,7 +388,7 @@ Expected/hoped-for results, each flagged by how well-supported it is:
 | `AT+CGSN` (IMEI) **unchanged** from the pre-flash value | `Download Only` doesn't touch IMEI storage | Medium — stated by sources, not independently verified against this unit |
 | `AT+EGMR=0,5` (serial) **unchanged** | Same reasoning | Medium, same caveat |
 | `AT+ECAL?` still reports calibration present | Same reasoning | Medium, same caveat |
-| `AT+GTPKGVER?` / `AT+GTCUSTPACKVER?` / `AT+GTCFGELEMVER?` / `AT+GTCUSTDATAVER?` now show generic/default values instead of the `5025.0000.040...` OEM strings | OEM customization pack replaced | Medium — the files (`OEM_OTA.img`, `OP_OTA.img`) are exactly the ones that hold this data, so overwriting them should change these version strings; no source states this outcome explicitly |
+| `AT+GTPKGVER?` / `AT+GTCUSTPACKVER?` / `AT+GTCFGELEMVER?` / `AT+GTCUSTDATAVER?` now show generic/default values instead of the `5025.0000.040...` OEM strings | OEM customisation pack replaced | Medium — the files (`OEM_OTA.img`, `OP_OTA.img`) are exactly the ones that hold this data, so overwriting them should change these version strings; no source states this outcome explicitly |
 | `AT+GTDIPCMODE?` returns the generic default (`3,1,1,1,3,15` per our own manual, or is at least no longer locked against writes) | The actual hypothesis under test | **Not documented in sources at all.** This is the single most important unknown this flash is meant to resolve, and nothing in the research confirms it either way |
 | `AT+GTFCCEFFSTATUS?` still `0,1` (no FCC lock introduced) | Flashing shouldn't introduce a lock that wasn't there | Low-risk, not explicitly documented either way |
 | With a SIM inserted, `AT+CEREG?`/`AT+C5GREG?`/`AT+GTCCINFO?` now show a real cell | The actual goal | Unknown — if DIPC mode wasn't the root cause, this will still fail, and you're back to the hardware-fault hypothesis in bench-log.md |
@@ -520,3 +538,7 @@ At flash time:
   symptom), [compatibility-and-risks.md](compatibility-and-risks.md)
   (§6, prior note that this is a last-resort option), and the AT command
   reference in [at-commands.md](at-commands.md).
+
+## Glossary
+
+Terms used on this page, defined in the [shared glossary](glossary.md): [ADB](glossary.md#adb), [BROM / preloader](glossary.md#brom--preloader), [DIPC mode](glossary.md#dipc-mode), [FCC lock](glossary.md#fcc-lock), [IMEI / IMSI / ICCID](glossary.md#imei--imsi--iccid), [M.2 B-key](glossary.md#m2-b-key), [NV partitions / calibration](glossary.md#nv-partitions--calibration), [OEM image](glossary.md#oem-image), [Pigtail](glossary.md#pigtail), [SP Flash Tool](glossary.md#sp-flash-tool).

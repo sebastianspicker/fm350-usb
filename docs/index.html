@@ -1,5 +1,5 @@
 <!doctype html>
-<!-- GitHub Pages demo for 5g-failover.
+<!-- GitHub Pages demo for fm350-usb.
      Served from main:/docs (Settings -> Pages -> Deploy from a branch ->
      main -> /docs). Screenshots are real command output; run
      `python3 tools/screenshots.py` to regenerate them. -->
@@ -7,14 +7,14 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>5g-failover — a Fibocom FM350-GL 5G modem as a backup WAN link</title>
+<title>fm350-usb — a Fibocom FM350-GL 5G modem as a backup WAN link</title>
 <meta name="description" content="Tools and notes for running a Fibocom FM350-GL 5G modem (including the Dell DW5931e) as a backup WAN link over USB: OpenWrt/mwan3 failover scripts, a user-space macOS driver, and a Dell DW5931e field guide.">
 <meta property="og:type" content="website">
-<meta property="og:title" content="5g-failover — a Fibocom FM350-GL 5G modem as a backup WAN link">
+<meta property="og:title" content="fm350-usb — a Fibocom FM350-GL 5G modem as a backup WAN link">
 <meta property="og:description" content="OpenWrt/mwan3 failover scripts, a user-space macOS driver, and a Dell DW5931e field guide for the Fibocom FM350-GL 5G modem.">
-<meta property="og:image" content="https://sebastianspicker.github.io/5g-failover/assets/screenshots/status.svg">
-<meta property="og:url" content="https://sebastianspicker.github.io/5g-failover/">
-<link rel="canonical" href="https://sebastianspicker.github.io/5g-failover/">
+<meta property="og:image" content="https://sebastianspicker.github.io/fm350-usb/assets/screenshots/status.svg">
+<meta property="og:url" content="https://sebastianspicker.github.io/fm350-usb/">
+<link rel="canonical" href="https://sebastianspicker.github.io/fm350-usb/">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='5' fill='%230d1117'/%3E%3Cg fill='none' stroke='%2358a6ff' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M2 16.5 9 12l5 3 8-5'/%3E%3Cpath d='M14 4h6v6'/%3E%3C/g%3E%3C/svg%3E">
 <style>
   :root {
@@ -236,7 +236,7 @@
 <header class="hero">
   <div class="wrap">
     <p class="kicker">Fibocom FM350-GL · Dell DW5931e · OpenWrt · macOS</p>
-    <h1>5g-failover</h1>
+    <h1>fm350-usb</h1>
     <p class="tagline">
       Tools and notes for running a Fibocom FM350-GL 5G modem — including the
       Dell DW5931e that ships in Latitude laptops — as a backup WAN link over
@@ -256,7 +256,7 @@
     <div class="actions">
       <a class="btn primary" href="#tour">Screenshot tour</a>
       <a class="btn" href="#demos">Interactive demos</a>
-      <a class="btn" href="https://github.com/sebastianspicker/5g-failover">GitHub</a>
+      <a class="btn" href="https://github.com/sebastianspicker/fm350-usb">GitHub</a>
     </div>
   </div>
 </header>
@@ -269,15 +269,15 @@
     <p class="lede">Three parts, each usable on its own.</p>
     <div class="cards">
       <div class="card">
-        <h3><a href="https://github.com/sebastianspicker/5g-failover/blob/main/openwrt/README.md">OpenWrt failover</a></h3>
+        <h3><a href="https://github.com/sebastianspicker/fm350-usb/blob/main/openwrt/README.md">OpenWrt failover</a></h3>
         <p>Scripts that add the FM350-GL as a second WAN on an OpenWrt router and switch traffic to it with <code>mwan3</code> when the wired line goes down. Verified in Docker, an AT-command modem emulator, and OpenWrt 24.10.8 under QEMU.</p>
       </div>
       <div class="card">
-        <h3><a href="https://github.com/sebastianspicker/5g-failover/blob/main/fm350mac/README.md">fm350mac</a></h3>
+        <h3><a href="https://github.com/sebastianspicker/fm350-usb/blob/main/fm350mac/README.md">fm350mac</a></h3>
         <p>A user-space macOS driver: macOS has no driver for the modem's RNDIS network interface, so this talks to it over libusb and hands packets to a <code>utun</code> interface. No kernel extensions or SIP changes.</p>
       </div>
       <div class="card">
-        <h3><a href="https://github.com/sebastianspicker/5g-failover/blob/main/docs/dell-dw5931e-usb.md">Dell DW5931e field guide</a></h3>
+        <h3><a href="https://github.com/sebastianspicker/fm350-usb/blob/main/docs/dell-dw5931e-usb.md">Dell DW5931e field guide</a></h3>
         <p>What the Dell OEM firmware changes, how to reach the module's internal root shell, and how to switch it out of "PCIe Advance Mode", which AT commands refuse to do.</p>
       </div>
     </div>
@@ -291,7 +291,7 @@
       Every image below is real command output, redacted (IMEI/IMSI/ICCID/serial
       numbers, the serving cell's TAC and cell ID, and any MAC address that
       isn't the FM350-GL's well-known placeholder) and rendered to SVG by
-      <a href="https://github.com/sebastianspicker/5g-failover/blob/main/tools/screenshots.py">tools/screenshots.py</a>.
+      <a href="https://github.com/sebastianspicker/fm350-usb/blob/main/tools/screenshots.py">tools/screenshots.py</a>.
       The three modem shots only regenerate when the modem is actually
       plugged in; the others need Docker or QEMU. Regenerate any time with
       <code>python3 tools/screenshots.py</code>.
@@ -388,9 +388,9 @@
 <footer>
   <div class="wrap">
     <span>
-      <a href="https://github.com/sebastianspicker/5g-failover">GitHub</a> ·
-      <a href="https://github.com/sebastianspicker/5g-failover#readme">README</a> ·
-      <a href="https://github.com/sebastianspicker/5g-failover/blob/main/LICENSE">MIT license</a>
+      <a href="https://github.com/sebastianspicker/fm350-usb">GitHub</a> ·
+      <a href="https://github.com/sebastianspicker/fm350-usb#readme">README</a> ·
+      <a href="https://github.com/sebastianspicker/fm350-usb/blob/main/LICENSE">MIT license</a>
     </span>
     <span>Independent project, not affiliated with Fibocom, Dell, or GL.iNet. Screenshots: <code>python3 tools/screenshots.py</code></span>
   </div>

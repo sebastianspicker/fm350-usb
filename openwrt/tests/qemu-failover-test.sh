@@ -179,7 +179,7 @@ QEMU_PID=""
 SOCAT_PID=""
 SERIAL_READER_PID=""
 
-# shellcheck disable=SC2329 # invoked indirectly via the trap below
+# shellcheck disable=SC2317,SC2329 # invoked indirectly via the trap below
 cleanup() {
 	[ -n "$QEMU_PID" ] && kill "$QEMU_PID" >/dev/null 2>&1
 	[ -n "$SOCAT_PID" ] && kill "$SOCAT_PID" >/dev/null 2>&1

@@ -1,0 +1,51 @@
+name: Hardware report
+description: Share how your module, firmware or adapter behaved (works, fails, or differs from ours).
+title: "[hardware] "
+labels: ["hardware-report"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks, reports from hardware that differs from ours are the most useful.
+        **Before you paste anything:** remove the IMEI, IMSI, ICCID, serial number, and the cell ID and TAC of every cell.
+        `fm350_diag.py` reports and `fm350mac status --redact` / `fm350-status -x` already hide them, but skim the text anyway.
+  - type: input
+    id: module
+    attributes:
+      label: Module and firmware
+      description: Label, plus the output of `AT+GTPKGVER?` (the `_5025` part means Dell).
+      placeholder: "Dell DW5931e, 81600.0000.00.29.20.22_5025.0000.040.000.038_C69"
+    validations:
+      required: true
+  - type: input
+    id: adapter
+    attributes:
+      label: Adapter and host
+      placeholder: "Waveshare USB TO M.2 B KEY (SKU 23252) on a GL.iNet Flint 2, vanilla OpenWrt 24.10.x"
+    validations:
+      required: true
+  - type: dropdown
+    id: stage
+    attributes:
+      label: Highest diagnostics stage you ran
+      options:
+        - "None / not using fm350_diag.py"
+        - "0 (read)"
+        - "1 (volatile)"
+        - "2 (experiment)"
+        - "3 (dipc)"
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: What happened
+      description: What worked, what didn't, and anything that behaved differently from the docs.
+    validations:
+      required: true
+  - type: textarea
+    id: report
+    attributes:
+      label: Redacted report
+      description: Paste the redacted `report.md` from `fm350_diag.py`, or the output of `fm350mac doctor`.
+      render: markdown

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security problem
+    url: https://github.com/sebastianspicker/fm350-usb/security/advisories/new
+    about: Report vulnerabilities privately, not in a public issue.
+  - name: Documentation
+    url: https://github.com/sebastianspicker/fm350-usb#start-here-pick-your-goal
+    about: Setup guide, Dell DW5931e field guide, diagnostics and troubleshooting.

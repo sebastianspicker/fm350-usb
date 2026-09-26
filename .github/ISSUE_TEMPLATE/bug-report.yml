@@ -1,0 +1,53 @@
+name: Bug report
+description: Something in the scripts, fm350mac or the diagnostics tool doesn't work as documented.
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Don't paste unredacted modem output.** Remove the IMEI, IMSI, ICCID, serial number, and cell ID / TAC first.
+        For security problems, use the private "Report a vulnerability" button on the Security tab instead.
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - "openwrt/ (install.sh, uninstall.sh, watchdog, fm350-status)"
+        - "fm350mac (macOS driver)"
+        - "tools/fm350_diag.py"
+        - "tools/fm350_at.py or other tools"
+        - "Documentation"
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Commit or version
+      placeholder: "git rev-parse --short HEAD"
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      placeholder: "OpenWrt 24.10.x on GL-MT6000 / macOS 27 on Apple Silicon / ..."
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The exact commands you ran.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs actual
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Output or logs (redacted)
+      render: text

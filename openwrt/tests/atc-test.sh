@@ -79,10 +79,10 @@ OPENWRT_DIR=$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd)
 SIM_DIR="$SCRIPT_DIR/atc-sim"
 CACHE_DIR="$SCRIPT_DIR/.cache"
 IPK="$CACHE_DIR/atc-fib-fm350_gl.ipk"
-# Same file mrhaav/openwrt-packages atc-fib-fm350_gl_2025.08.24-r3 ipk
-# install.sh downloads (see openwrt/README.md's "Package URLs" section for
-# how/when to re-verify this URL).
-IPK_URL="https://github.com/mrhaav/openwrt/raw/master/atc/fib-fm350_gl/atc-fib-fm350_gl_2025.08.24-r3_all.ipk"
+# The same pinned file (commit + SHA-256) that install.sh downloads; keep the
+# two in sync (see openwrt/README.md, "Package URLs").
+IPK_URL="https://github.com/mrhaav/openwrt/raw/0d56d844cc49906285c9181a008186f4af515c85/atc/fib-fm350_gl/atc-fib-fm350_gl_2025.08.24-r3_all.ipk"
+IPK_SHA256="7a15abc63d09c36b75ac88b8601817f56d3e8e5f65385c02a5fb605fd6b15050"
 
 IMAGE=${DOCKER_TEST_IMAGE:-openwrt/rootfs:armsr-armv8-openwrt-24.10}
 APN="internet.telekom"
@@ -95,7 +95,7 @@ fail() {
 }
 
 CONTAINER=""
-# shellcheck disable=SC2329 # invoked indirectly via the trap below
+# shellcheck disable=SC2317,SC2329 # invoked indirectly via the trap below
 cleanup() {
 	[ -n "$CONTAINER" ] && docker rm -f "$CONTAINER" >/dev/null 2>&1
 	rm -rf "$WORK_TMP"
@@ -138,6 +138,15 @@ fi
 	echo "atc-test.sh: failed to fetch $IPK_URL into $IPK" >&2
 	exit 1
 }
+if command -v sha256sum >/dev/null 2>&1; then
+	ipk_sha=$(sha256sum "$IPK" | cut -d' ' -f1)
+else
+	ipk_sha=$(shasum -a 256 "$IPK" | cut -d' ' -f1)
+fi
+[ "$ipk_sha" = "$IPK_SHA256" ] || {
+	echo "atc-test.sh: $IPK has SHA-256 $ipk_sha, expected $IPK_SHA256 (delete it to re-download)" >&2
+	exit 1
+}
 
 echo "atc-test.sh: pulling $IMAGE"
 if ! docker pull "$IMAGE" >/dev/null; then
@@ -156,7 +165,7 @@ assert_match() {
 	fi
 }
 
-CONTAINER="5g-failover-atc-test-$$"
+CONTAINER="fm350-usb-atc-test-$$"
 echo "atc-test.sh: starting container $CONTAINER"
 docker run -d --name "$CONTAINER" "$IMAGE" /bin/sh -c "sleep 3600" >/dev/null
 

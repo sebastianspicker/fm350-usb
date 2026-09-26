@@ -1,5 +1,5 @@
 #!/bin/sh
-# shellcheck shell=dash disable=SC3043,SC2034,SC1091,SC2329
+# shellcheck shell=dash disable=SC3043,SC2034,SC1091,SC2317,SC2329
 # SC3043 (local): ash (this script's actual target shell) supports `local`,
 # matching atc.sh's own style; only plain POSIX sh doesn't.
 # SC2034 (INCLUDE_ONLY): consumed by atc.sh, which is sourced below, not

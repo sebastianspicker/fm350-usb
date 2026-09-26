@@ -2,7 +2,22 @@
 
 Step-by-step instructions for wiring up the Fibocom FM350-GL as an OpenWrt WAN interface and putting mwan3 in front of it for failover. Written for the GL.iNet Flint 2 (GL-MT6000) we used, but steps 5 onward should apply to any OpenWrt 24.10+ router with a USB port.
 
-Status: USB enumeration, AT access, the FCC-lock check, SIM detection and LTE registration are all verified on the bench, with the module connected to a Mac (see [bench-log.md](bench-log.md)). The router-side commands in steps 2-4 should give the same results, but we haven't run them on the Flint 2 itself yet. The OpenWrt install and failover scripts from steps 6-7 are tested in Docker, against a pty modem emulator, and under QEMU (see [openwrt/README.md](../openwrt/README.md)), but not yet on the Flint 2. A cellular data session (the last block in step 4) hasn't been tested on any host; we're waiting on a data SIM. Track your own results as you go through the steps below.
+## In short
+
+- Nine steps take you from assembling the dongle to mwan3 failover on OpenWrt: assemble → check enumeration → identify the module and check the FCC lock → register on the network → choose firmware → install a protocol handler → set up mwan3 → (optional) keep GL.iNet firmware → tune.
+- Step 4 is the go/no-go point: if `AT+CGPADDR=1` returns an IP address, the hardware combination works and what's left is software integration.
+- The fast path is [`openwrt/install.sh`](../openwrt/install.sh), which automates steps 6b and 7; the manual instructions further down are for reference, or if you'd rather do it by hand.
+- The biggest caveat: steps 2–4 have been run only with the module connected to a Mac, not on the Flint 2 itself. Nobody has completed a real data session yet on any host — see the table below.
+
+## Where each step has been tested
+
+| Steps | What was checked | Tested on | Status |
+|---|---|---|---|
+| 2–4 (USB enumeration, AT access, the FCC-lock check, SIM detection, LTE registration) | The commands in this guide | The module connected to a Mac | Verified on the bench [Bench log]. The router-side commands should give the same results, but we haven't run them on the Flint 2 itself yet. |
+| 4, the data-session block (`AT+CGDCONT`/`AT+CGACT`/`AT+CGPADDR`) | Whether a PDP context comes up | — | **Not tested on any host.** We're waiting on a data SIM. |
+| 6–7 (`install.sh`/`uninstall.sh`, mwan3 failover) | Install, uninstall, and failover/failback | Docker, a pty modem emulator, and QEMU | Verified in emulation [openwrt README]. Not yet run on the Flint 2. |
+
+Track your own results as you go through the steps below.
 
 ## 0. Before you start
 
@@ -10,6 +25,8 @@ Status: USB enumeration, AT access, the FCC-lock check, SIM detection and LTE re
 - [ ] Note the carrier APN (e.g. Telekom `internet.telekom`, Vodafone `web.vodafone.de`, O2 `internet`).
 - [ ] Back up the Flint 2 config (GL admin panel: System, then Backup/Restore) before you change firmware.
 - [ ] Have a separate 5 V ≥ 2 A USB charger for the auxiliary power plug.
+
+See [Hardware](hardware.md#power-budget) for why the auxiliary power plug matters.
 
 ## 1. Assemble the dongle
 
@@ -78,6 +95,8 @@ sh /root/fm350_fcc_unlock.sh /dev/ttyUSB4
 
 The script uses vendor hash `3df8c719` (Lenovo). For a Dell DW5931e module, change `VENDOR_ID_HASH` to `4909b5a4`. Close picocom first, because only one program can use the port at a time.
 
+**A note on this check, because two different readings are used across this repo's docs:** this guide's test above (mode 1 or 2, plus `AT+CFUN=1` returning `ERROR`) and the test used in [Compatibility](compatibility-and-risks.md) and the diagnostics tool look at the same response but read it differently. The first value (`<mode>`) is the *type* of lock (0 none, 1 one-time, 2 every power-up); the second value (`<status>`) is whether the radio is *unlocked right now*. If you just want a yes/no answer to "is it locked?", check the second value — status `1` means unlocked, and that's the test Compatibility and the diagnostics tool use. Our own module read `0,1`: mode 0 (no lock configured) and status 1 (unlocked) [Bench log]. See [Compatibility](compatibility-and-risks.md) for the full background on the FCC lock and the unlock algorithm.
+
 ## 4. Register on the network
 
 ```text
@@ -102,7 +121,7 @@ This is the go/no-go point: if you get an IP address here, the hardware combinat
 
 ## 5. Choose firmware
 
-See the options table in the [README](../README.md). The rest of this guide covers option A: vanilla OpenWrt.
+**A note on this section:** earlier text here pointed to "the options table in the README" — the README doesn't have one. The options are defined in this guide: **option A** is vanilla OpenWrt, covered by the rest of this guide; **options B/C** keep GL.iNet's own firmware and are covered in [§8 below](#8-option-bc-notes-keep-glinet-firmware).
 
 1. Download the `glinet_gl-mt6000` sysupgrade image for the current stable release (24.10.x or 25.12.x) from `firmware-selector.openwrt.org`.
 2. Follow the install notes on the OpenWrt wiki page for the GL-MT6000. It can be flashed from the GL admin panel (local upgrade, do **not** keep settings) or through the U-Boot recovery web UI (hold reset while powering on, then open 192.168.1.1).
@@ -140,9 +159,10 @@ Dependencies: `kmod-usb-serial-option kmod-usb-net-rndis comgt`. This handler re
 
 ```sh
 cd /tmp
-# check https://github.com/mrhaav/openwrt/tree/master/atc for the newest file names
-wget https://github.com/mrhaav/openwrt/raw/master/atc/luci-proto-atc_2025.01.10-r2_all.ipk
-wget https://github.com/mrhaav/openwrt/raw/master/atc/fib-fm350_gl/atc-fib-fm350_gl_2025.08.24-r3_all.ipk
+# the exact files install.sh pins (commit 0d56d84); newer releases: https://github.com/mrhaav/openwrt/tree/master/atc
+wget https://github.com/mrhaav/openwrt/raw/0d56d844cc49906285c9181a008186f4af515c85/atc/luci-proto-atc_2025.01.10-r2_all.ipk
+wget https://github.com/mrhaav/openwrt/raw/0d56d844cc49906285c9181a008186f4af515c85/atc/fib-fm350_gl/atc-fib-fm350_gl_2025.08.24-r3_all.ipk
+sha256sum luci-proto-atc_*.ipk atc-fib-fm350_gl_*.ipk   # compare with openwrt/README.md, "Package URLs"
 opkg install luci-proto-atc_*.ipk atc-fib-fm350_gl_*.ipk
 # 25.12 (apk): use the .apk files and `apk add --allow-untrusted`
 ```
@@ -229,3 +249,7 @@ Notes:
 - Temperature under load: `AT+GTSENRDTEMP=1`.
 - Carrier aggregation info: `AT+GTCAINFO?`.
 - Antenna placement: move the dongle on its USB extension cable to a window. Compare RSRP/SINR from `AT+GTCCINFO?` between positions.
+
+## Glossary
+
+Terms used on this page, defined in the [shared glossary](glossary.md): [APN](glossary.md#apn), [AT command](glossary.md#at-command), [AT port](glossary.md#at-port), [Failover / failback](glossary.md#failover--failback), [FCC lock](glossary.md#fcc-lock), [mwan3](glossary.md#mwan3), [PDP context / data session](glossary.md#pdp-context--data-session), [Protocol handler](glossary.md#protocol-handler), [QEMU / Docker](glossary.md#qemu--docker), [RAT](glossary.md#rat), [RNDIS](glossary.md#rndis), [RSRP / RSRQ / SINR](glossary.md#rsrp--rsrq--sinr).

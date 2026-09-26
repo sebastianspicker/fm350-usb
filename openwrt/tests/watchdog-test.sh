@@ -32,7 +32,7 @@ fail() {
 }
 
 CONTAINER=""
-# shellcheck disable=SC2329 # invoked indirectly via the trap below
+# shellcheck disable=SC2317,SC2329 # invoked indirectly via the trap below
 cleanup() {
 	[ -n "$CONTAINER" ] && docker rm -f "$CONTAINER" >/dev/null 2>&1
 	rm -rf "$WORK_TMP"
@@ -56,7 +56,7 @@ fi
 # Written to WORK_TMP (not checked in) so it can be shellchecked too.
 cat >"$WORK_TMP/harness.sh" <<'HARNESS'
 #!/bin/sh
-# shellcheck disable=SC2034,SC2154,SC2329
+# shellcheck disable=SC2034,SC2154,SC2317,SC2329
 # SC2034/SC2154 (assigned/referenced but not [visibly] assigned): tick() and
 # load_config(), sourced from fm350-watchdog below, both read and write
 # pending_since/up_since/backoff/next_allowed_restart/pending_threshold/
@@ -236,7 +236,7 @@ dexec() {
 	docker exec "$CONTAINER" /bin/sh -c "$1"
 }
 
-CONTAINER="5g-failover-watchdog-test-$$"
+CONTAINER="fm350-usb-watchdog-test-$$"
 echo "watchdog-test.sh: starting container $CONTAINER"
 docker run -d --name "$CONTAINER" "$IMAGE" /bin/sh -c "sleep 3600" >/dev/null
 

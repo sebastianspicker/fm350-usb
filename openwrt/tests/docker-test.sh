@@ -36,7 +36,7 @@ fail() {
 }
 
 CONTAINER=""
-# shellcheck disable=SC2329 # invoked indirectly via the trap below
+# shellcheck disable=SC2317,SC2329 # invoked indirectly via the trap below
 cleanup() {
 	[ -n "$CONTAINER" ] && docker rm -f "$CONTAINER" >/dev/null 2>&1
 	rm -rf "$WORK_TMP"
@@ -98,7 +98,7 @@ assert_no_match() {
 run_scenario() {
 	scenario=$1
 	mwan3_seed=$2 # "empty" or "stock"
-	CONTAINER="5g-failover-docker-test-$$-$scenario"
+	CONTAINER="fm350-usb-docker-test-$$-$scenario"
 
 	echo "docker-test.sh: === scenario: $scenario ==="
 	echo "docker-test.sh: starting container $CONTAINER"
