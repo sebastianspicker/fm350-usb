@@ -2,6 +2,14 @@
 
 Specs for the three parts of this setup, drawn from vendor datasheets and our own bench measurements. Useful if you're sourcing the same parts, checking a substitute, or trying to figure out why something doesn't fit.
 
+## In short
+
+- Three parts make up this setup: the router (GL.iNet Flint 2), the USB-to-M.2 adapter (Waveshare), and the modem (Fibocom FM350-GL, including the Dell DW5931e OEM variant).
+- The FM350-GL isn't on Waveshare's list of tested modules for this adapter, but it worked in our tests [Bench log].
+- Use the adapter's auxiliary power plug. 5G modules can draw short current spikes that a router's single USB port may not cover on its own.
+- Connect all 4 antennas: 5G NR uses 4×4 MIMO for download, and missing antennas lower both the reported signal quality and the throughput.
+- Buy decent antenna pigtails. A defective pair cost us most of a day chasing "no cells" as if it were a firmware or configuration problem [Bench log, Cable swap].
+
 ## GL.iNet Flint 2 (GL-MT6000)
 
 Source: GL.iNet datasheet `mt6000_datasheet_20251103.pdf`, product page, firmware page.
@@ -67,6 +75,8 @@ Sources: Fibocom AT manual V2.10, Linux `option` driver patch (June 2024), 4glte
 | 40 | `0e8d:7126` | RNDIS + AT + AP(GNSS) + META + DEBUG + NPT + ADB | USB interface 4 |
 | 41 (default) | `0e8d:7127` | as 40 + AP(LOG) + AP(META) | USB interface 6 |
 
+The mode-41 layout, interface by interface: 0/1 RNDIS, 2–4 serial, 5 ADB, **6 AT (the only interface that sends URCs, unsolicited status messages)**, 7–9 serial; interface 3 is the GNSS port [Dell guide, Step 1].
+
 - Interfaces 0–1 are RNDIS and use the `rndis_host` driver (`kmod-usb-net-rndis`).
 - The other interfaces are vendor-specific serial ports and use the `option` driver (`kmod-usb-serial-option`). The FM350 IDs were added to mainline `option` in June 2024 (in 6.6+ and backported to 5.10.222). **Kernel 5.4 (GL stock) does not have them**; there you add them at runtime with `new_id`.
 - There is no MBIM or QMI in USB mode. **ModemManager does not handle it.** Use AT-command scripts instead.
@@ -85,3 +95,7 @@ We assumed the router runs in Germany. Deutsche Telekom, Vodafone and O2/Telefó
 ## Thermal
 
 The FM350 runs hot under sustained 5G load. Use the included thermal pad between the module and the aluminium lid, and don't enclose the dongle. Watch `AT+GTSENRDTEMP` during load tests (see [at-commands.md](at-commands.md)).
+
+## Glossary
+
+Terms used on this page, defined in the [shared glossary](glossary.md): [ADB](glossary.md#adb), [GNSS](glossary.md#gnss), [LTE / NR](glossary.md#lte--nr), [M.2 B-key](glossary.md#m2-b-key), [MHF4 / IPEX-4](glossary.md#mhf4--ipex-4), [MIMO](glossary.md#mimo), [OpenWrt](glossary.md#openwrt), [Pigtail](glossary.md#pigtail), [RNDIS](glossary.md#rndis), [URC](glossary.md#urc), [USB mode 40 / 41](glossary.md#usb-mode-40--41).

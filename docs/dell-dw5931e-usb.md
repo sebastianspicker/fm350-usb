@@ -1,14 +1,15 @@
 # Dell DW5931e (Fibocom FM350-GL) over USB: field guide
 
-How to run a **Dell DW5931e**, the Dell OEM version of the Fibocom FM350-GL that comes out of Latitude laptops, as a USB modem in an M.2-to-USB adapter. The guide also covers how to switch the module from Dell's "PCIe Advance Mode" to the stock USB/PCIe dual mode, which AT commands refuse to do.
+How to run a **Dell DW5931e**, the Dell OEM version of the Fibocom FM350-GL that comes out of Latitude laptops, as a USB modem in an M.2-to-USB adapter. The guide also covers how to switch the module from Dell's "PCIe Advance Mode" to the stock USB/PCIe dual mode, which AT commands (text commands sent to the modem) refuse to do.
 
 Tested on one unit on 2026-09-25, in a Waveshare USB TO M.2 B KEY (SKU 23252) connected to a Mac. The full raw notes are in [bench-log.md](bench-log.md).
 
-## TL;DR
+## In short
 
-1. **A DW5931e in a USB adapter enumerates over USB out of the box** (`0e8d:7127`). Dell's PCIe Advance Mode only turns USB off when the module has a live PCIe link, which a USB adapter can't provide. No flashing, unlock or reconfiguration is needed to get AT access over USB.
-2. `AT+GTDIPCMODE=...` fails with `+CME ERROR: phone failure` on this unit. The mode is stored in a **plain text file** on the module's internal Linux system. The module exposes a **root ADB shell over USB**, so you can edit that file directly (see [Step 4](#step-4-optional-switch-from-pcie-advance-mode-to-dual-mode)).
-3. **If the modem sees no cells at all, check the antenna cables first.** We spent a day ruling out every firmware and configuration cause (FCC lock, DIPC mode, W_DISABLE#, SAR/antenna tuner, bands, APN, thermal). In the end the cause was defective **antenna pigtails**. After we swapped them, the module registered within 30 s and saw 10 cells.
+- **A DW5931e in a USB adapter works over USB out of the box** (`0e8d:7127`) — no flashing, unlock or reconfiguration needed. Dell's "PCIe Advance Mode" only turns USB off when the module has a live PCIe link, and a USB adapter never provides one.
+- The module's interface setting (**DIPC mode**) can't be changed by AT command on this unit (`AT+GTDIPCMODE=...` fails with `+CME ERROR: phone failure`), but it's stored in a plain text file on the module's internal Linux system. You edit it over a root shell reached through ADB (Android Debug Bridge) — see [Step 4](#step-4-optional-switch-from-pcie-advance-mode-to-dual-mode). You don't need to do this just to use the module over USB.
+- **If the modem sees no cells at all, check the antenna cables (pigtails) first.** We spent a day ruling out every firmware and configuration cause before finding a pair of defective pigtails. After swapping them, the module registered within 30 s and saw 10 cells.
+- Biggest caveat: this is one unit, tested once, and a real data session hasn't been tried yet (we're waiting for a data SIM).
 
 ## Is this your module?
 
@@ -67,8 +68,8 @@ The `dipcd` daemon validates the file at boot (`check_dipc_config`, `fibo_check_
 ## Hardware notes
 
 - **Adapter:** Waveshare USB TO M.2 B KEY (3042/3052, nano-SIM slot 1, 4× SMA). Waveshare doesn't list the FM350 as supported, but in our tests the adapter passed USB 3 SuperSpeed (5 Gbps) and the SIM slot and all four RF paths worked.
-- **Antenna cables:** our original IPEX/MHF4-to-SMA pigtails were defective. With them, the module measured nothing: `AT+CESQ` returned all 99/255, `AT+GTCCINFO?` was empty, and GNSS acquired 0 satellites even under open sky. The GNSS AGC levels didn't change between indoors and outdoors. That last sign is the useful one: if moving outdoors doesn't change the receiver gain, the problem is in the RF chain, not in the configuration. See [Troubleshooting](#no-cells-at-all-cesq-all-99255-gtccinfo-empty).
-- **Power:** idle worked on a bus-powered USB 3 hub (896 mA allocated). For real traffic, use the adapter's second, power-only USB plug.
+- **Antenna cables (pigtails):** our original IPEX/MHF4-to-SMA pigtails were defective. With them, the module measured nothing: `AT+CESQ` returned all 99/255, `AT+GTCCINFO?` was empty, and GNSS acquired 0 satellites even under open sky. The GNSS AGC (automatic gain control) levels didn't change between indoors and outdoors. That last sign is the useful one: if moving outdoors doesn't change the receiver gain, the problem is in the RF chain, not in the configuration. See [Troubleshooting](#no-cells-at-all-cesq-all-99255-gtccinfo-empty).
+- **Power:** idle worked on a bus-powered USB 3 hub (896 mA allocated) [Bench log]. For real traffic, use the adapter's second, power-only USB plug. See the [Hardware guide](hardware.md) for the full power budget [Hardware].
 
 ## Step 1: check that it enumerates
 
@@ -91,7 +92,7 @@ ls -d /sys/bus/usb/devices/*:1.6/ttyUSB*                          # usually /dev
 picocom -b 115200 --echo /dev/ttyUSB4
 ```
 
-**macOS** (no serial driver for these interfaces): use [`tools/fm350_at.py`](../tools/fm350_at.py), which talks to interface 6 directly through libusb:
+**macOS** (no serial driver for these interfaces): use [`tools/fm350_at.py`](../tools/fm350_at.py), which talks to interface 6 directly through libusb (a library that lets normal programs talk to USB devices without a kernel driver):
 
 ```sh
 brew install libusb
@@ -182,11 +183,11 @@ AT+CESQ
 AT+GTCCINFO?                   → serving cell + neighbours
 ```
 
-Our result after the cable swap (Vodafone DE SIM, indoors): `+CEREG: 0,1`, `+COPS: 0,2,"26202",13`, serving LTE cell on EARFCN 100 (band 1), and 9 neighbour cells on bands 7, 8, 20 and 28. `+COPS` access technology 13 means EN-DC (5G non-standalone) per 3GPP TS 27.007, and `+CESQ` also reported an NR carrier (SS-RSRP about −105 dBm, SS-SINR 5–8 dB). So 5G NSA should be available once data works, but we haven't seen an NR data leg yet.
+Our result after the cable swap (Vodafone DE SIM, indoors): `+CEREG: 0,1`, `+COPS: 0,2,"26202",13`, serving LTE cell on EARFCN 100 (band 1), and 9 neighbour cells on bands 7, 8, 20 and 28. `+COPS` access technology 13 means EN-DC (5G non-standalone: LTE plus a 5G carrier together) per 3GPP TS 27.007, and `+CESQ` also reported an NR carrier (SS-RSRP about −105 dBm, SS-SINR 5–8 dB). So 5G NSA should be available once data works, but we haven't seen an NR data leg yet.
 
 On macOS, `fm350mac doctor` runs the checks from this guide in one go, and `fm350mac status --redact` gives a readable version of the above. On the router, `fm350-status -x` does the same.
 
-The data session over RNDIS is covered in [setup-guide.md](setup-guide.md) (OpenWrt: `xmm-modem` or `atc-fib-fm350_gl`) and [macos-driver.md](macos-driver.md) (macOS: `fm350mac`). **We haven't verified a data session on this unit yet** because we're waiting for a data SIM.
+The data session (the cellular connection that gives you an IP address) over RNDIS is covered in [setup-guide.md](setup-guide.md) (OpenWrt: `xmm-modem` or `atc-fib-fm350_gl`) and [macos-driver.md](macos-driver.md) (macOS: `fm350mac`). **We haven't verified a data session on this unit yet** because we're waiting for a data SIM.
 
 ## Troubleshooting
 
@@ -197,8 +198,10 @@ Symptoms on our unit: `CPIN: READY`, `CFUN: 1`, `CEREG` cycles between 2 (search
 Check in this order:
 
 1. **Antenna cables and connectors.** Swap the pigtails and check that the MHF4 connectors on the module are fully seated. Ours were the cause.
-2. GNSS as an independent RF check: under open sky it should acquire satellites within a few minutes. If both cellular and GNSS get nothing and the AGC doesn't react to the location, suspect the RF chain before you suspect the configuration.
+2. GNSS (satellite positioning) as an independent RF check: under open sky it should acquire satellites within a few minutes. If both cellular and GNSS get nothing and the AGC doesn't react to the location, suspect the RF chain before you suspect the configuration.
 3. Only then look at software: see the next table.
+
+[`tools/fm350_diag.py read`](diagnostics.md) runs these checks by itself and samples for a minute. Its `experiment` stage repeats the software tests below, and restores each setting afterwards.
 
 ### Ruled out on our unit (none of these fixed "no cells")
 
@@ -242,8 +245,10 @@ Check in this order:
 
 ## Sources
 
-- OpenWrt forum, "Fibocom FM350-GL Support" (all 454 posts read): https://forum.openwrt.org/t/fibocom-fm350-gl-support/142682
-- Fibocom FM350 AT Commands User Manual V2.10 (DIPC, FCC, GTFMODE): see [sources.md](sources.md)
-- mrhaav `atc-fib-fm350_gl` and FCC unlock script: https://github.com/mrhaav/openwrt/tree/master/atc/fib-fm350_gl
-- ModemManager FCC unlock background: https://modemmanager.org/docs/modemmanager/fcc-unlock/
+The full list of external references, with retrieval dates, is in [sources.md](sources.md).
+
 - Our raw measurements: [bench-log.md](bench-log.md)
+
+## Glossary
+
+Terms used on this page, defined in the [shared glossary](glossary.md): [ADB](glossary.md#adb), [AGC](glossary.md#agc), [AP / MD](glossary.md#ap--md), [APN](glossary.md#apn), [AT command](glossary.md#at-command), [AT port](glossary.md#at-port), [DIPC mode](glossary.md#dipc-mode), [EN-DC / 5G NSA](glossary.md#en-dc--5g-nsa), [FCC lock](glossary.md#fcc-lock), [GNSS](glossary.md#gnss), [IMEI / IMSI / ICCID](glossary.md#imei--imsi--iccid), [libusb](glossary.md#libusb), [LTE / NR](glossary.md#lte--nr), [M.2 B-key](glossary.md#m2-b-key), [MHF4 / IPEX-4](glossary.md#mhf4--ipex-4), [NV partitions / calibration](glossary.md#nv-partitions--calibration), [OEM image](glossary.md#oem-image), [OpenWrt](glossary.md#openwrt), [PDP context / data session](glossary.md#pdp-context--data-session), [Pigtail](glossary.md#pigtail), [RAT](glossary.md#rat), [RNDIS](glossary.md#rndis), [RSRP / RSRQ / SINR](glossary.md#rsrp--rsrq--sinr), [SP Flash Tool](glossary.md#sp-flash-tool), [URC](glossary.md#urc), [USB mode 40 / 41](glossary.md#usb-mode-40--41), [W_DISABLE#](glossary.md#w_disable).

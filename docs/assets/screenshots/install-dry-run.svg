@@ -1,14 +1,14 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1259" height="1544" viewBox="0 0 1259 1544" role="img" aria-label="openwrt/install.sh --apn internet.example --dry-run">
+<svg xmlns="http://www.w3.org/2000/svg" width="2171" height="1565" viewBox="0 0 2171 1565" role="img" aria-label="openwrt/install.sh --apn internet.example --dry-run">
 <title>openwrt/install.sh --apn internet.example --dry-run</title>
-<defs><clipPath id="win"><rect x="0.5" y="0.5" width="1258" height="1543" rx="10"/></clipPath></defs>
+<defs><clipPath id="win"><rect x="0.5" y="0.5" width="2170" height="1564" rx="10"/></clipPath></defs>
 <g clip-path="url(#win)">
-<rect x="0.5" y="0.5" width="1258" height="1543" rx="10" fill="#0d1117" stroke="#30363d"/>
-<rect x="0.5" y="0.5" width="1258" height="36" fill="#161b22"/>
-<line x1="0.5" y1="36.5" x2="1258.5" y2="36.5" stroke="#30363d"/>
+<rect x="0.5" y="0.5" width="2170" height="1564" rx="10" fill="#0d1117" stroke="#30363d"/>
+<rect x="0.5" y="0.5" width="2170" height="36" fill="#161b22"/>
+<line x1="0.5" y1="36.5" x2="2170.5" y2="36.5" stroke="#30363d"/>
 <circle cx="20.0" cy="18.5" r="6" fill="#ff5f56"/>
 <circle cx="40.0" cy="18.5" r="6" fill="#ffbd2e"/>
 <circle cx="60.0" cy="18.5" r="6" fill="#27c93f"/>
-<text x="629.5" y="23" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="12.5" fill="#8b949e">openwrt/install.sh --apn internet.example --dry-run</text>
+<text x="1085.5" y="23" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="12.5" fill="#8b949e">openwrt/install.sh --apn internet.example --dry-run</text>
 <text x="22.0" y="66.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#3fb950" font-weight="600" xml:space="preserve">$ </text>
 <text x="39.4" y="66.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#f0f6fc" font-weight="600" xml:space="preserve">openwrt/install.sh --apn internet.example --dry-run</text>
 <text x="22.0" y="87.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">install.sh: package manager: opkg</text>
@@ -16,10 +16,10 @@
 <text x="22.0" y="129.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">install.sh: [dry-run] would run: opkg update</text>
 <text x="22.0" y="150.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">install.sh: installing: kmod-usb-net-rndis kmod-usb-serial-option comgt mwan3 luci-app-mwan3</text>
 <text x="22.0" y="171.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">install.sh: [dry-run] would install: kmod-usb-net-rndis kmod-usb-serial-option comgt mwan3 luci-app-mwan3</text>
-<text x="22.0" y="192.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">install.sh: [skipped] would download https://github.com/mrhaav/openwrt/raw/master/atc/luci-proto-atc_2025.01.10-r2_all.ipk</text>
-<text x="22.0" y="213.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">install.sh: [skipped] would download https://github.com/mrhaav/openwrt/raw/master/atc/fib-fm350_gl/atc-fib-fm350_gl_2025.08.24-r3_all.ipk</text>
+<text x="22.0" y="192.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">install.sh: [skipped] would download https://github.com/mrhaav/openwrt/raw/0d56d844cc49906285c9181a008186f4af515c85/atc/luci-proto-atc_2025.01.10-r2_all.ipk (sha256 c3c70dbeb90c1f181024cc6c9b0449b5c549f558cf8f932350ee6b93cebd81d6)</text>
+<text x="22.0" y="213.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">install.sh: [skipped] would download https://github.com/mrhaav/openwrt/raw/0d56d844cc49906285c9181a008186f4af515c85/atc/fib-fm350_gl/atc-fib-fm350_gl_2025.08.24-r3_all.ipk (sha256 7a15abc63d09c36b75ac88b8601817f56d3e8e5f65385c02a5fb605fd6b15050)</text>
 <text x="22.0" y="234.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">install.sh: installing luci-proto-atc and atc-fib-fm350_gl</text>
-<text x="22.0" y="255.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">install.sh: [dry-run] would install: /tmp/5g-failover-install.GEhjGJ/luci-proto-atc.ipk /tmp/5g-failover-install.GEhjGJ/atc-fib-fm350_gl.ipk</text>
+<text x="22.0" y="255.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">install.sh: [dry-run] would install: /tmp/fm350-usb-install.cLaoKi/luci-proto-atc.ipk /tmp/fm350-usb-install.cLaoKi/atc-fib-fm350_gl.ipk</text>
 <text x="22.0" y="276.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">install.sh: WARNING: could not detect the FM350 AT tty from sysfs (is it plugged in?).</text>
 <text x="22.0" y="297.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">install.sh: WARNING: defaulting network.wwan.device to '/dev/ttyUSB4'; edit /etc/config/network if wrong.</text>
 <text x="22.0" y="318.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">install.sh: applying network config (proto=atc, device=/dev/ttyUSB4, apn=internet.example)</text>
@@ -73,11 +73,12 @@
 <text x="22.0" y="1326.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">set fm350_watchdog.main.interface='wwan'</text>
 <text x="22.0" y="1347.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">set fm350_watchdog.main.check_interval='30'</text>
 <text x="22.0" y="1368.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">set fm350_watchdog.main.pending_threshold='180'</text>
-<text x="22.0" y="1389.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">set fm350_watchdog.main.backoff_max='1800'</text>
+<text x="22.0" y="1389.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#8b949e" xml:space="preserve">… (1 more uci commands elided)</text>
 <text x="22.0" y="1410.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">set fm350_watchdog.main.backoff_reset_after='300'</text>
-<text x="22.0" y="1431.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">commit fm350_watchdog</text>
-<text x="22.0" y="1452.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">install.sh: [dry-run] would copy /root/openwrt/files/usr/sbin/fm350-watchdog to /usr/sbin/fm350-watchdog</text>
-<text x="22.0" y="1473.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">install.sh: [dry-run] would copy /root/openwrt/files/etc/init.d/fm350-watchdog to /etc/init.d/fm350-watchdog</text>
-<text x="22.0" y="1494.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">install.sh: [dry-run] would run: /etc/init.d/fm350-watchdog enable</text>
-<text x="22.0" y="1515.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">install.sh: dry run complete, nothing was changed</text>
+<text x="22.0" y="1431.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">set fm350_watchdog.main.boot_grace='300'</text>
+<text x="22.0" y="1452.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">commit fm350_watchdog</text>
+<text x="22.0" y="1473.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">install.sh: [dry-run] would copy /root/openwrt/files/usr/sbin/fm350-watchdog to /usr/sbin/fm350-watchdog</text>
+<text x="22.0" y="1494.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">install.sh: [dry-run] would copy /root/openwrt/files/etc/init.d/fm350-watchdog to /etc/init.d/fm350-watchdog</text>
+<text x="22.0" y="1515.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">install.sh: [dry-run] would run: /etc/init.d/fm350-watchdog enable</text>
+<text x="22.0" y="1536.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">install.sh: dry run complete, nothing was changed</text>
 </g></svg>

@@ -10,7 +10,15 @@ registration and throughput before the module goes on a router.
 See [`../docs/macos-driver.md`](../docs/macos-driver.md) for the full
 architecture, session flow and rationale.
 
+## In short
+
+- `fm350mac` is a pure-Python program that talks to the FM350-GL's USB RNDIS interface directly (via libusb) and hands the packets to a macOS `utun` interface — no kernel extension, no DriverKit entitlement, no SIP change.
+- USB access itself needs no root. A small root helper, installed once as a background service, does only the part that does need root (creating the `utun` interface and setting routes/DNS), so the main program runs as you.
+- `probe` and the read-only commands (`status`, `doctor`, `at`) work against real hardware. The full data session (`up`) has code and unit-test coverage and has run successfully against an in-process fake modem (`--loopback`), but not yet against a real SIM.
+
 ## Status
+
+The [root README's status table](../README.md#status) has the project-wide picture; this section is the detail for `fm350mac` itself.
 
 Scaffold implemented and reviewed (2026-09-25): 101 unit tests pass, and
 `fm350mac probe` works against real hardware. The data path (`up`) has code
@@ -18,6 +26,8 @@ and unit-test coverage but hasn't run live yet -- it needs a SIM and root
 (or the helper, see below). `up --loopback`, which replaces the modem with
 an in-process fake, has run live successfully; see
 [`../docs/bench-log.md`](../docs/bench-log.md).
+
+Since then the suite has grown (`uv run pytest -q` collected **327 tests** on 2026-09-26, all passing). The sections below also cover `status --watch`, `doctor` and the privilege-separation helper.
 
 ## Requirements
 
@@ -59,7 +69,7 @@ ping 198.51.100.1                           # answered in-process, see loopback.
 uv run fm350mac async-selftest
 ```
 
-### `status` and `doctor`
+## Checking the modem: `status` and `doctor`
 
 `status` prints a readable snapshot: SIM, LTE and NR registration, operator and access technology, the serving cell (band, EARFCN, PCI, RSRP, RSRQ), NR signal when the modem measures a 5G carrier, neighbour cells by band, and temperature. Options:
 
@@ -68,13 +78,13 @@ uv run fm350mac async-selftest
 - `--redact` masks the cell ID and TAC (serving and neighbour cells). Use it before you paste output anywhere public: with the operator code, those two values locate you to within a few hundred metres in public cell databases.
 - `--watch [SECONDS]` refreshes every 2 s (or the interval you give) with a signal bar. It's handy for aiming antennas. Ctrl-C stops it.
 
-If the modem measures no cell at all, `status` says so and points at the antenna pigtails first. That was the cause on our unit (see [docs/dell-dw5931e-usb.md](../docs/dell-dw5931e-usb.md)).
+If `status` reports no cell at all, check the antenna pigtails before anything else — that was the cause on our own unit; see the [Dell guide's troubleshooting section](../docs/dell-dw5931e-usb.md#no-cells-at-all-cesq-all-99255-gtccinfo-empty) rather than repeating that story here.
 
 `doctor` reads the settings that matter on OEM modules and explains them: firmware image (`_5025` = Dell DW5931e), DIPC mode, FCC lock, `GTFMODE`, USB mode, RAT mode, antenna tuner, radio and SIM state, and whether any cell is measured. It prints one `[OK]`, `[WARN]` or `[INFO]` line per check and exits 1 if anything is a warning. It only sends read commands; a unit test enforces that.
 
 Signal values are decoded per 3GPP TS 27.007, reporting the lower bound of each range the modem returns (the router's `fm350-status` uses the same convention).
 
-### Running `up`
+## Running a data session: `up`
 
 With the helper installed, `up` (and `up --loopback`) need no root at all:
 they create the `utun` interface and set routes/DNS through the helper (see
@@ -193,17 +203,34 @@ remove State:/Network/Service/fm350mac/DNS
 EOF
 ```
 
-## Tests
+## Limitations
+
+- The real data path (`up` against actual hardware) hasn't been run live
+  yet -- we're waiting on a data SIM. Everything about it is verified either
+  by unit tests or by `up --loopback` against the in-process fake modem, not
+  against the real FM350-GL.
+- Throughput hasn't been measured with `iperf3`; the ~150 Mbps async design
+  target (see [`../docs/macos-driver.md`](../docs/macos-driver.md)) is an
+  estimate, not a result.
+- No IPv6 support yet (`IPV4V6` PDP context, router advertisements from the
+  modem).
+- macOS/Apple Silicon only, by design (see the rejected alternatives in
+  [`../docs/macos-driver.md`](../docs/macos-driver.md)): no Linux/Windows
+  support, no kernel extension, no DriverKit dext.
+- DHCP on the FM350's RNDIS interface is unreliable; `fm350mac` always
+  assigns the IP itself from `AT+CGPADDR` instead of relying on DHCP.
+
+## For contributors: Tests
 
 ```sh
 cd fm350mac && uv run pytest -q
 ```
 
-Tests are pure unit tests and fake-hardware end-to-end tests (RNDIS codec,
+Tests are pure unit tests and fake-hardware end-to-end tests: RNDIS codec,
 Ethernet/ARP, AT response parsers, utun AF framing, netconfig dry-run,
 bridge threads with fake USB/utun, CLI argument validation, `cli.py` command
 functions with a scriptable fake AT port and fake RNDIS/utun, the loopback
-fake modem, the reconnect supervisor) — no USB or network access, no root,
+fake modem, and the reconnect supervisor — no USB or network access, no root,
 no real subprocess calls, no SIM needed.
 
 `usb_async.py`'s ctypes binding has its own tests: `test_usb_async_layout.py`
@@ -215,8 +242,6 @@ no C compiler or the header is missing); `test_usb_async_pool.py` exercises
 transfer's callback with any status; `test_async_bridge.py` covers
 `AsyncBridge`'s RX ordering, ARP replies and TX pool exhaustion the same
 way. None of these touch real hardware.
-
-### Helper tests
 
 `test_helper.py` covers the root helper (`helper/fm350mac_helper.py`) and
 its client (`helper_client.py`): request validation for every op (bad IPs,
@@ -242,19 +267,6 @@ port of its core tests (`tests/helper_unittest_py39.py`) under that exact
 interpreter -- no pytest, no third-party imports, since `-I -S` gives it no
 access to site-packages.
 
-## Limitations
+## Glossary
 
-- The real data path (`up` against actual hardware) hasn't been run live
-  yet -- we're waiting on a data SIM. Everything about it is verified either
-  by unit tests or by `up --loopback` against the in-process fake modem, not
-  against the real FM350-GL.
-- Throughput hasn't been measured with `iperf3`; the ~150 Mbps async design
-  target (see [`../docs/macos-driver.md`](../docs/macos-driver.md)) is an
-  estimate, not a result.
-- No IPv6 support yet (`IPV4V6` PDP context, router advertisements from the
-  modem).
-- macOS/Apple Silicon only, by design (see the rejected alternatives in
-  [`../docs/macos-driver.md`](../docs/macos-driver.md)): no Linux/Windows
-  support, no kernel extension, no DriverKit dext.
-- DHCP on the FM350's RNDIS interface is unreliable; `fm350mac` always
-  assigns the IP itself from `AT+CGPADDR` instead of relying on DHCP.
+Terms used on this page, defined in the [shared glossary](../docs/glossary.md): [APN](../docs/glossary.md#apn), [AT command](../docs/glossary.md#at-command), [Band / EARFCN / PCI](../docs/glossary.md#band--earfcn--pci), [Cell ID / TAC](../docs/glossary.md#cell-id--tac), [DIPC mode](../docs/glossary.md#dipc-mode), [FCC lock](../docs/glossary.md#fcc-lock), [LaunchDaemon](../docs/glossary.md#launchdaemon), [libusb](../docs/glossary.md#libusb), [OEM image](../docs/glossary.md#oem-image), [PDP context / data session](../docs/glossary.md#pdp-context--data-session), [RAT](../docs/glossary.md#rat), [RNDIS](../docs/glossary.md#rndis), [RSRP / RSRQ / SINR](../docs/glossary.md#rsrp--rsrq--sinr), [utun](../docs/glossary.md#utun).

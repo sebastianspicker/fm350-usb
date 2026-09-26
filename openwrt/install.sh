@@ -15,17 +15,23 @@ SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 UCI_DIR="$SCRIPT_DIR/uci"
 FILES_DIR="$SCRIPT_DIR/files"
 
-# --- mrhaav atc-fib-fm350_gl / luci-proto-atc package URLs -----------------
-# Verified against the GitHub API listing of mrhaav/openwrt (atc/ and
-# atc/fib-fm350_gl/) on 2026-09-25. Re-check with
-#   curl -sI <url>
-# or the GitHub contents API before relying on these if install.sh starts
-# reporting 404s, since mrhaav ships new package revisions periodically and
-# only keeps a limited history.
-LUCI_PROTO_ATC_IPK_URL="https://github.com/mrhaav/openwrt/raw/master/atc/luci-proto-atc_2025.01.10-r2_all.ipk"
-ATC_FIB_FM350_IPK_URL="https://github.com/mrhaav/openwrt/raw/master/atc/fib-fm350_gl/atc-fib-fm350_gl_2025.08.24-r3_all.ipk"
-LUCI_PROTO_ATC_APK_URL="https://github.com/mrhaav/openwrt/raw/master/atc/luci-proto-atc-2025.01.10-r2.apk"
-ATC_FIB_FM350_APK_URL="https://github.com/mrhaav/openwrt/raw/master/atc/fib-fm350_gl/atc-fib-fm350_gl-2025.01.11-r2.apk"
+# --- mrhaav atc-fib-fm350_gl / luci-proto-atc packages -----------------------
+# Pinned to the mrhaav/openwrt commit we tested against (master as of
+# 2026-09-25; unchanged since 2026-05-18), and verified by SHA-256 before
+# anything is installed. The .ipk of atc-fib-fm350_gl is byte-identical to the
+# one openwrt/tests/atc-test.sh runs. To move to a newer release: pick the new
+# commit and file names, download the files, check them, and update the URLs
+# and hashes together.
+MRHAAV_COMMIT="0d56d844cc49906285c9181a008186f4af515c85"
+MRHAAV_BASE="https://github.com/mrhaav/openwrt/raw/$MRHAAV_COMMIT/atc"
+LUCI_PROTO_ATC_IPK_URL="$MRHAAV_BASE/luci-proto-atc_2025.01.10-r2_all.ipk"
+LUCI_PROTO_ATC_IPK_SHA256="c3c70dbeb90c1f181024cc6c9b0449b5c549f558cf8f932350ee6b93cebd81d6"
+ATC_FIB_FM350_IPK_URL="$MRHAAV_BASE/fib-fm350_gl/atc-fib-fm350_gl_2025.08.24-r3_all.ipk"
+ATC_FIB_FM350_IPK_SHA256="7a15abc63d09c36b75ac88b8601817f56d3e8e5f65385c02a5fb605fd6b15050"
+LUCI_PROTO_ATC_APK_URL="$MRHAAV_BASE/luci-proto-atc-2025.01.10-r2.apk"
+LUCI_PROTO_ATC_APK_SHA256="7a196e9a2565534d4657d81ce9c18794ad3687812fe941bf76aa2c4106577484"
+ATC_FIB_FM350_APK_URL="$MRHAAV_BASE/fib-fm350_gl/atc-fib-fm350_gl-2025.01.11-r2.apk"
+ATC_FIB_FM350_APK_SHA256="94e097b6a674f818921c648ed8c6ab80639e626c129f37d4224e64fe37c2eba0"
 
 MODEMFEED_URL="https://github.com/koshev-msk/modemfeed"
 
@@ -137,7 +143,12 @@ fi
 log "package manager: $pkg_mgr"
 
 pkg_install() {
-	# $@: package names or local file paths (.ipk / .apk)
+	# $1: "repo" (signed packages from the configured feeds) or "local"
+	# (downloaded .ipk / .apk files); rest: package names or file paths.
+	# Only local files skip apk's signature check: mrhaav's packages aren't
+	# signed with an OpenWrt feed key.
+	source_kind=$1
+	shift
 	[ "$skip_packages" -eq 1 ] && {
 		log "--skip-packages: would install: $*"
 		return 0
@@ -148,8 +159,10 @@ pkg_install() {
 	fi
 	if [ "$pkg_mgr" = opkg ]; then
 		opkg install "$@"
-	else
+	elif [ "$source_kind" = local ]; then
 		apk add --allow-untrusted "$@"
+	else
+		apk add "$@"
 	fi
 }
 
@@ -167,19 +180,29 @@ pkg_update() {
 }
 
 download() {
-	# $1: url  $2: destination path
+	# $1: url  $2: destination path  $3: expected SHA-256 of the file
 	if [ "$skip_packages" -eq 1 ] || [ "$dry_run" -eq 1 ]; then
-		log "[skipped] would download $1"
+		log "[skipped] would download $1 (sha256 $3)"
 		return 0
 	fi
 	if command -v wget >/dev/null 2>&1; then
-		wget -O "$2" "$1"
+		wget -O "$2" "$1" || return 1
 	elif command -v curl >/dev/null 2>&1; then
-		curl -L -o "$2" "$1"
+		curl -fL -o "$2" "$1" || return 1
 	else
 		echo "install.sh: neither wget nor curl found" >&2
 		return 1
 	fi
+	actual=$(sha256sum "$2" | cut -d' ' -f1)
+	if [ "$actual" != "$3" ]; then
+		echo "install.sh: checksum mismatch for $1" >&2
+		echo "  expected $3" >&2
+		echo "  got      $actual" >&2
+		echo "install.sh: refusing to install it. Nothing was installed from this download." >&2
+		rm -f "$2"
+		return 1
+	fi
+	log "sha256 ok: ${2##*/}"
 }
 
 # --- base packages -----------------------------------------------------------
@@ -191,11 +214,11 @@ log "updating package lists"
 pkg_update
 log "installing: $base_pkgs"
 # shellcheck disable=SC2086 # base_pkgs is an intentional word-split package list
-pkg_install $base_pkgs
+pkg_install repo $base_pkgs
 
 # --- protocol handler ---------------------------------------------------------
 if [ "$proto" = atc ]; then
-	tmp_dir=$(mktemp -d /tmp/5g-failover-install.XXXXXX) || {
+	tmp_dir=$(mktemp -d /tmp/fm350-usb-install.XXXXXX) || {
 		echo "install.sh: mktemp failed" >&2
 		exit 1
 	}
@@ -204,16 +227,16 @@ if [ "$proto" = atc ]; then
 	if [ "$pkg_mgr" = opkg ]; then
 		luci_pkg="$tmp_dir/luci-proto-atc.ipk"
 		fib_pkg="$tmp_dir/atc-fib-fm350_gl.ipk"
-		download "$LUCI_PROTO_ATC_IPK_URL" "$luci_pkg"
-		download "$ATC_FIB_FM350_IPK_URL" "$fib_pkg"
+		download "$LUCI_PROTO_ATC_IPK_URL" "$luci_pkg" "$LUCI_PROTO_ATC_IPK_SHA256" || exit 1
+		download "$ATC_FIB_FM350_IPK_URL" "$fib_pkg" "$ATC_FIB_FM350_IPK_SHA256" || exit 1
 	else
 		luci_pkg="$tmp_dir/luci-proto-atc.apk"
 		fib_pkg="$tmp_dir/atc-fib-fm350_gl.apk"
-		download "$LUCI_PROTO_ATC_APK_URL" "$luci_pkg"
-		download "$ATC_FIB_FM350_APK_URL" "$fib_pkg"
+		download "$LUCI_PROTO_ATC_APK_URL" "$luci_pkg" "$LUCI_PROTO_ATC_APK_SHA256" || exit 1
+		download "$ATC_FIB_FM350_APK_URL" "$fib_pkg" "$ATC_FIB_FM350_APK_SHA256" || exit 1
 	fi
 	log "installing luci-proto-atc and atc-fib-fm350_gl"
-	pkg_install "$luci_pkg" "$fib_pkg"
+	pkg_install local "$luci_pkg" "$fib_pkg"
 else
 	cat <<EOF
 install.sh: --proto xmm selected. xmm-modem/luci-proto-xmm are not in the
