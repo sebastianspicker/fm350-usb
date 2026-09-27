@@ -46,7 +46,13 @@ jobs:
       - name: shellcheck
         run: |
           shopt -s globstar
-          shellcheck openwrt/*.sh openwrt/tests/**/*.sh openwrt/files/etc/hotplug.d/usb/50-fm350_driver openwrt/files/usr/sbin/fm350-watchdog openwrt/files/etc/init.d/fm350-watchdog tools/bench-throughput.sh
+          shellcheck openwrt/*.sh openwrt/tests/**/*.sh openwrt/files/etc/hotplug.d/usb/50-fm350_driver openwrt/files/usr/sbin/fm350-watchdog openwrt/files/etc/init.d/fm350-watchdog tools/bench-throughput.sh tools/tests/bench-throughput-test.sh
 
       - name: status decoder test
         run: openwrt/tests/fm350-decode-test.sh
+
+      - name: installer input test
+        run: sh openwrt/tests/install-input-test.sh
+
+      - name: benchmark failure-path test
+        run: tools/tests/bench-throughput-test.sh

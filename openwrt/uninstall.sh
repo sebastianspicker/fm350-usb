@@ -4,14 +4,17 @@
 #
 # Removes:
 #   - network.wwan
+#   - restores network.wan.metric and the mwan3.wan options changed by the
+#     installer, including their original unset state; removes a wan/globals
+#     section if the installer had to create it
 #   - "wwan" from the wan firewall zone's network list, and the
 #     "Allow modem RA" firewall rule
 #   - the mwan3 sections exclusively owned by install.sh (wwan, wan_m1,
 #     wwan_m2, failover, default)
 #   - exactly the track_ip entries install.sh actually added to mwan3.wan,
 #     read from the fm350_added_track_ip option it recorded them in (the
-#     section itself, and mwan3.globals, are left in place: they belong to
-#     mwan3's own stock config, not to us). A track IP that already existed
+#     pre-existing wan/globals sections are left in place). A track IP that
+#     already existed
 #     before install.sh ran (e.g. it coincidentally matches a stock default)
 #     is never recorded there, so it survives uninstall untouched.
 #   - the use_policy override install.sh applied to the stock
@@ -49,8 +52,36 @@ restore_mwan3_rule() {
 	fi
 }
 
+restore_option() {
+	state=$1
+	name=$2
+	target=$3
+	case "$(uci -q get "$state.${name}_state" 2>/dev/null)" in
+	set)
+		original=$(uci -q get "$state.${name}_value")
+		uci set "$target=$original"
+		;;
+	unset) uci -q delete "$target" || true ;;
+	esac
+}
+
+restore_section() {
+	state=$1
+	name=$2
+	target=$3
+	if [ "$(uci -q get "$state.${name}_state" 2>/dev/null)" = absent ]; then
+		uci -q delete "$target" || true
+		return 1
+	fi
+	return 0
+}
+
 log "removing network.wwan"
 uci -q delete network.wwan || true
+if restore_section network.fm350_install_state wan network.wan; then
+	restore_option network.fm350_install_state wan_metric network.wan.metric
+fi
+uci -q delete network.fm350_install_state || true
 uci -q commit network || true
 
 wan_zone=$(find_wan_zone)
@@ -75,10 +106,20 @@ for ip in $(uci -q get mwan3.wan.fm350_added_track_ip 2>/dev/null); do
 done
 uci -q delete mwan3.wan.fm350_added_track_ip || true
 
+if restore_section mwan3.fm350_install_state wan mwan3.wan; then
+	for option in enabled family interval down up; do
+		restore_option mwan3.fm350_install_state "wan_$option" "mwan3.wan.$option"
+	done
+fi
+if restore_section mwan3.fm350_install_state globals mwan3.globals; then
+	restore_option mwan3.fm350_install_state globals_mmx_mask mwan3.globals.mmx_mask
+fi
+
 log "restoring the original use_policy on mwan3.default_rule_v4 / mwan3.https, if we changed them"
 restore_mwan3_rule default_rule_v4
 restore_mwan3_rule https
 
+uci -q delete mwan3.fm350_install_state || true
 uci -q commit mwan3 || true
 
 if [ -f /etc/hotplug.d/usb/50-fm350_driver ]; then

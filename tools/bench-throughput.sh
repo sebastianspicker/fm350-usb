@@ -106,6 +106,11 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [[ "${#MODES[@]}" -eq 0 ]]; then
+    echo "--modes must include sync or async" >&2
+    exit 2
+fi
+
 for mode in "${MODES[@]}"; do
     if [[ "$mode" != "sync" && "$mode" != "async" ]]; then
         echo "unknown --io mode: $mode (expected sync or async)" >&2
@@ -128,12 +133,12 @@ if [[ -z "$RESULTS_DIR" ]]; then
     RESULTS_DIR="$SCRIPT_DIR/bench-results/$(date '+%Y%m%d-%H%M%S')-$kind"
 fi
 
-if ! command -v iperf3 >/dev/null 2>&1 && [[ "$LOOPBACK" -ne 1 ]]; then
+if [[ "${BENCH_THROUGHPUT_TEST:-0}" != 1 ]] && ! command -v iperf3 >/dev/null 2>&1 && [[ "$LOOPBACK" -ne 1 ]]; then
     echo "iperf3 not found: brew install iperf3" >&2
     [[ "$DRY_RUN" -eq 1 ]] || exit 1
 fi
 
-if [[ ! -x "$FM350MAC" ]]; then
+if [[ "${BENCH_THROUGHPUT_TEST:-0}" != 1 && ! -x "$FM350MAC" ]]; then
     echo "fm350mac CLI not found at $FM350MAC (expected the fm350mac/.venv virtualenv)" >&2
     exit 1
 fi
@@ -141,7 +146,7 @@ fi
 # Detected by actually invoking `status --help` (harmless, no root/AT/USB
 # needed) -- skipped under --dry-run, which must not run fm350mac at all.
 STATUS_JSON_SUPPORTED=0
-if [[ "$DRY_RUN" -ne 1 ]] && "$FM350MAC" status --help 2>&1 | grep -q -- '--json'; then
+if [[ "${BENCH_THROUGHPUT_TEST:-0}" != 1 && "$DRY_RUN" -ne 1 ]] && "$FM350MAC" status --help 2>&1 | grep -q -- '--json'; then
     STATUS_JSON_SUPPORTED=1
 fi
 
@@ -175,6 +180,23 @@ wait_for_new_utun() {
 # start_up()/run_loopback_mode() to the cleanup trap and to verify_teardown().
 UP_PID=""
 UP_IFACE=""
+BENCH_FAILED=0
+BENCH_STARTED=0
+DEFAULT_ROUTE_BEFORE=""
+UTUNS_BEFORE=""
+
+# Print a stable description of the current IPv4 default route. An empty
+# signature means that no default route exists. Restricting the comparison to
+# gateway and interface avoids false failures from volatile route metadata.
+default_route_signature() {
+    local route_info gateway iface
+    route_info="$(route -n get default 2>/dev/null || true)"
+    gateway="$(awk '$1 == "gateway:" { print $2; exit }' <<< "$route_info")"
+    iface="$(awk '$1 == "interface:" { print $2; exit }' <<< "$route_info")"
+    if [[ -n "$gateway" || -n "$iface" ]]; then
+        printf 'gateway=%s;interface=%s' "$gateway" "$iface"
+    fi
+}
 
 stop_up() {
     local pid="$1"
@@ -201,14 +223,32 @@ stop_up() {
 }
 
 # Check that the utun this run created is gone, and that whatever route it
-# owned is gone too (the loopback host route, or -- in real mode -- the
-# default route handed to it by --default-route). Logs a warning and
-# returns 1 on any leftover; never raises (safe to call from the cleanup
-# trap).
+# owned is gone too. In real mode, also require the gateway/interface pair
+# captured before startup so a missing (rather than merely non-utun) default
+# route cannot be mistaken for successful cleanup. Logs a warning and returns
+# 1 on any leftover; never raises (safe to call from the cleanup trap).
 verify_teardown() {
     local iface="$1"
+    local expected_default="${2-}"
+    local before_utuns="${3-}"
+    local before_utuns_supplied=0
+    if [[ $# -ge 3 ]]; then
+        before_utuns_supplied=1
+    fi
     local ok=0
-    if [[ -n "$iface" ]] && list_utuns | grep -qx "$iface"; then
+    local current_utuns
+    current_utuns="$(list_utuns)"
+    if [[ "$before_utuns_supplied" -eq 1 ]]; then
+        local unexpected_utuns
+        unexpected_utuns="$(comm -13 \
+            <(printf '%s\n' "$before_utuns" | awk 'NF' | sort -u) \
+            <(printf '%s\n' "$current_utuns" | awk 'NF' | sort -u))"
+        if [[ -n "$unexpected_utuns" ]]; then
+            log "WARNING: new tunnel interfaces are still present after teardown:" \
+                "${unexpected_utuns//$'\n'/, }"
+            ok=1
+        fi
+    elif [[ -n "$iface" ]] && grep -qx "$iface" <<< "$current_utuns"; then
         log "WARNING: $iface is still present after teardown"
         ok=1
     fi
@@ -217,13 +257,23 @@ verify_teardown() {
             log "WARNING: loopback host route to $LOOPBACK_PEER is still present after teardown"
             ok=1
         fi
-    elif [[ -n "$iface" ]] && netstat -rn -f inet | grep '^default ' | grep -q "$iface"; then
-        log "WARNING: default route still points at $iface after teardown"
-        ok=1
+    else
+        if [[ -n "$iface" ]] && netstat -rn -f inet | grep '^default ' | grep -q "$iface"; then
+            log "WARNING: default route still points at $iface after teardown"
+            ok=1
+        fi
+        local current_default
+        current_default="$(default_route_signature)"
+        if [[ "$current_default" != "$expected_default" ]]; then
+            log "WARNING: default route was not restored after teardown" \
+                "(expected ${expected_default:-<none>}, got ${current_default:-<none>})"
+            ok=1
+        fi
     fi
     return $ok
 }
 
+# shellcheck disable=SC2329 # invoked by the EXIT/INT/TERM trap below
 cleanup() {
     local rc=$?
     trap - EXIT INT TERM
@@ -232,8 +282,11 @@ cleanup() {
         stop_up "$UP_PID"
         UP_PID=""
     fi
-    if [[ -n "$UP_IFACE" ]]; then
-        verify_teardown "$UP_IFACE" || true
+    if [[ -n "$UP_IFACE" || "$BENCH_STARTED" -eq 1 ]]; then
+        if ! verify_teardown "$UP_IFACE" "$DEFAULT_ROUTE_BEFORE" "$UTUNS_BEFORE"; then
+            log "ERROR: teardown left a tunnel or route behind; inspect the Mac's routes"
+            [[ "$rc" -ne 0 ]] || rc=1
+        fi
     fi
     exit "$rc"
 }
@@ -263,21 +316,25 @@ run_iperf() {
     log "iperf3 ${args[*]} (mode=$mode direction=$direction proto=$proto)"
     sample_cpu "$up_pid" "$cpu_file" "$((DURATION + 5))" &
     local sampler_pid=$!
+    local failed=0
     if ! iperf3 "${args[@]}" > "$out_json" 2> "${out_json}.stderr"; then
-        log "WARNING: iperf3 $direction/$proto failed for mode=$mode; see ${out_json}.stderr"
+        log "ERROR: iperf3 $direction/$proto failed for mode=$mode; see ${out_json}.stderr"
+        failed=1
     fi
     wait "$sampler_pid" 2>/dev/null || true
+    return "$failed"
 }
 
 start_up_real() {
     local mode="$1"
-    local before_utuns
-    before_utuns="$(list_utuns)"
+    DEFAULT_ROUTE_BEFORE="$(default_route_signature)"
+    UTUNS_BEFORE="$(list_utuns)"
     local -a cmd=("$FM350MAC" up --apn "$APN" --io "$mode" --default-route)
     log "starting: ${cmd[*]}"
+    BENCH_STARTED=1
     "${cmd[@]}" > "$RESULTS_DIR/up-$mode.log" 2>&1 &
     UP_PID=$!
-    UP_IFACE="$(wait_for_new_utun "$before_utuns" "$UP_WAIT_TIMEOUT")"
+    UP_IFACE="$(wait_for_new_utun "$UTUNS_BEFORE" "$UP_WAIT_TIMEOUT")"
     if [[ -z "$UP_IFACE" ]]; then
         log "ERROR: utun did not appear within ${UP_WAIT_TIMEOUT}s for mode=$mode"
         stop_up "$UP_PID"
@@ -291,6 +348,15 @@ start_up_real() {
 run_real_mode() {
     for mode in "${MODES[@]}"; do
         if ! start_up_real "$mode"; then
+            BENCH_FAILED=1
+            if ! verify_teardown "$UP_IFACE" "$DEFAULT_ROUTE_BEFORE" "$UTUNS_BEFORE"; then
+                log "ERROR: failed startup also failed teardown verification; stopping before another mode"
+                break
+            fi
+            BENCH_STARTED=0
+            DEFAULT_ROUTE_BEFORE=""
+            UTUNS_BEFORE=""
+            UP_IFACE=""
             continue
         fi
 
@@ -299,14 +365,14 @@ run_real_mode() {
         fi
 
         run_iperf "$mode" download tcp \
-            "$RESULTS_DIR/$mode-download-tcp.json" "$RESULTS_DIR/$mode-download-tcp.cpu" "$UP_PID"
+            "$RESULTS_DIR/$mode-download-tcp.json" "$RESULTS_DIR/$mode-download-tcp.cpu" "$UP_PID" || BENCH_FAILED=1
         run_iperf "$mode" upload tcp \
-            "$RESULTS_DIR/$mode-upload-tcp.json" "$RESULTS_DIR/$mode-upload-tcp.cpu" "$UP_PID"
+            "$RESULTS_DIR/$mode-upload-tcp.json" "$RESULTS_DIR/$mode-upload-tcp.cpu" "$UP_PID" || BENCH_FAILED=1
         if [[ -n "$UDP_BITRATE" ]]; then
             run_iperf "$mode" download udp \
-                "$RESULTS_DIR/$mode-download-udp.json" "$RESULTS_DIR/$mode-download-udp.cpu" "$UP_PID"
+                "$RESULTS_DIR/$mode-download-udp.json" "$RESULTS_DIR/$mode-download-udp.cpu" "$UP_PID" || BENCH_FAILED=1
             run_iperf "$mode" upload udp \
-                "$RESULTS_DIR/$mode-upload-udp.json" "$RESULTS_DIR/$mode-upload-udp.cpu" "$UP_PID"
+                "$RESULTS_DIR/$mode-upload-udp.json" "$RESULTS_DIR/$mode-upload-udp.cpu" "$UP_PID" || BENCH_FAILED=1
         fi
 
         if [[ "$STATUS_JSON_SUPPORTED" -eq 1 ]]; then
@@ -315,8 +381,15 @@ run_real_mode() {
 
         stop_up "$UP_PID"
         UP_PID=""
-        verify_teardown "$UP_IFACE" || log "WARNING: teardown check failed for mode=$mode"
+        if ! verify_teardown "$UP_IFACE" "$DEFAULT_ROUTE_BEFORE" "$UTUNS_BEFORE"; then
+            log "ERROR: teardown check failed for mode=$mode; stopping before another mode"
+            BENCH_FAILED=1
+            break
+        fi
         UP_IFACE=""
+        BENCH_STARTED=0
+        DEFAULT_ROUTE_BEFORE=""
+        UTUNS_BEFORE=""
     done
 
     local python_bin="python3"
@@ -347,17 +420,24 @@ parse_ping_log() {
 run_loopback_mode() {
     local -a summary_rows=()
     for mode in "${MODES[@]}"; do
-        local before_utuns
-        before_utuns="$(list_utuns)"
+        UTUNS_BEFORE="$(list_utuns)"
         local -a cmd=("$FM350MAC" up --apn "$APN" --loopback --io "$mode")
         log "starting: ${cmd[*]}"
+        BENCH_STARTED=1
         "${cmd[@]}" > "$RESULTS_DIR/up-loopback-$mode.log" 2>&1 &
         UP_PID=$!
-        UP_IFACE="$(wait_for_new_utun "$before_utuns" "$UP_WAIT_TIMEOUT")"
+        UP_IFACE="$(wait_for_new_utun "$UTUNS_BEFORE" "$UP_WAIT_TIMEOUT")"
         if [[ -z "$UP_IFACE" ]]; then
             log "ERROR: utun did not appear within ${UP_WAIT_TIMEOUT}s for mode=$mode"
             stop_up "$UP_PID"
             UP_PID=""
+            BENCH_FAILED=1
+            if ! verify_teardown "" "" "$UTUNS_BEFORE"; then
+                log "ERROR: failed startup also failed teardown verification; stopping before another mode"
+                break
+            fi
+            BENCH_STARTED=0
+            UTUNS_BEFORE=""
             continue
         fi
         log "utun $UP_IFACE is up (loopback, mode=$mode)"
@@ -367,13 +447,22 @@ run_loopback_mode() {
         log "${ping_cmd[*]}"
         local t0 t1
         t0="$(date +%s.%N)"
-        "${ping_cmd[@]}" > "$ping_log" 2>&1 || true
+        if ! "${ping_cmd[@]}" > "$ping_log" 2>&1; then
+            log "ERROR: ping failed for mode=$mode; see $ping_log"
+            BENCH_FAILED=1
+        fi
         t1="$(date +%s.%N)"
 
         stop_up "$UP_PID"
         UP_PID=""
-        verify_teardown "$UP_IFACE" || log "WARNING: teardown check failed for mode=$mode"
+        if ! verify_teardown "$UP_IFACE" "" "$UTUNS_BEFORE"; then
+            log "ERROR: teardown check failed for mode=$mode; stopping before another mode"
+            BENCH_FAILED=1
+            break
+        fi
         UP_IFACE=""
+        BENCH_STARTED=0
+        UTUNS_BEFORE=""
 
         parse_ping_log "$ping_log"
         local elapsed pps
@@ -441,6 +530,12 @@ print_plan() {
 
 # -- main ----------------------------------------------------------------------
 
+# Source-only hook for deterministic function tests; normal invocations still
+# run the command below. The caller passes --loopback --dry-run for parsing.
+if [[ "${BENCH_THROUGHPUT_TEST:-0}" == 1 ]]; then
+    return 0
+fi
+
 if [[ "$DRY_RUN" -eq 1 ]]; then
     print_plan
     exit 0
@@ -453,3 +548,4 @@ if [[ "$LOOPBACK" -eq 1 ]]; then
 else
     run_real_mode
 fi
+exit "$BENCH_FAILED"

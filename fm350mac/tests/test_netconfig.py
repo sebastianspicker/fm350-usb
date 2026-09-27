@@ -8,6 +8,8 @@ or (in the "teardown raises" test) actually invokes a command.
 
 import subprocess
 
+import pytest
+
 from fm350mac.netconfig import NetConfig
 
 
@@ -19,6 +21,7 @@ class _FakeRunner:
 
     def __init__(self, route_get_stdout: str = "", fail_on=None):
         self.route_get_stdout = route_get_stdout
+        self.original_route = route_get_stdout
         self.fail_on = fail_on or (lambda argv, kwargs: False)
         self.argvs: list[list[str]] = []
 
@@ -27,7 +30,15 @@ class _FakeRunner:
         self.argvs.append(argv)
         if self.fail_on(argv, kwargs):
             raise subprocess.CalledProcessError(1, argv)
+        if argv[:3] == ["route", "-n", "get"] and not self.route_get_stdout:
+            raise subprocess.CalledProcessError(1, argv)
         stdout = self.route_get_stdout if argv[:3] == ["route", "-n", "get"] else ""
+        if argv[:3] == ["route", "delete", "default"]:
+            self.route_get_stdout = ""
+        elif argv[:3] == ["route", "add", "default"]:
+            self.route_get_stdout = (
+                f"interface: {argv[-1]}\n" if "-interface" in argv else self.original_route
+            )
         return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
 
 
@@ -212,3 +223,120 @@ def test_teardown_continues_after_a_step_raises_and_stays_idempotent():
     before = len(runner.argvs)
     net.teardown()  # idempotent: nothing new is attempted
     assert len(runner.argvs) == before
+
+
+def test_failed_default_add_restores_previous_route_immediately():
+    original = "gateway: 10.0.0.1\ninterface: en0\n"
+    runner = _FakeRunner(
+        route_get_stdout=original,
+        fail_on=lambda argv, _: argv == ["route", "add", "default", "-interface", "utun7"],
+    )
+    net = NetConfig(runner=runner)
+    with pytest.raises(subprocess.CalledProcessError) as exc:
+        net.add_default_route("utun7")
+    assert exc.value.cmd == ["route", "add", "default", "-interface", "utun7"]
+    assert runner.argvs[-1] == ["route", "add", "default", "10.0.0.1"]
+    assert runner.route_get_stdout == original
+    net.teardown()
+    assert runner.argvs.count(["route", "delete", "default"]) == 1
+
+
+def test_failed_rollback_is_retained_for_teardown_retry():
+    restore_attempts = 0
+
+    def fail_on(argv, _):
+        nonlocal restore_attempts
+        if argv == ["route", "add", "default", "-interface", "utun7"]:
+            return True
+        if argv == ["route", "add", "default", "10.0.0.1"]:
+            restore_attempts += 1
+            return restore_attempts == 1
+        return False
+
+    runner = _FakeRunner("gateway: 10.0.0.1\ninterface: en0\n", fail_on=fail_on)
+    net = NetConfig(runner=runner)
+    with pytest.raises(subprocess.CalledProcessError) as exc:
+        net.add_default_route("utun7")
+    assert exc.value.cmd[-1] == "utun7"
+    net.teardown()
+    assert restore_attempts == 2
+    assert runner.route_get_stdout == runner.original_route
+
+
+def test_successful_add_retry_preserves_pending_original_route():
+    own_add_attempts = 0
+    restore_attempts = 0
+
+    def fail_on(argv, _):
+        nonlocal own_add_attempts, restore_attempts
+        if argv == ["route", "add", "default", "-interface", "utun7"]:
+            own_add_attempts += 1
+            return own_add_attempts == 1
+        if argv == ["route", "add", "default", "10.0.0.1"]:
+            restore_attempts += 1
+            return restore_attempts == 1
+        return False
+
+    runner = _FakeRunner("gateway: 10.0.0.1\ninterface: en0\n", fail_on=fail_on)
+    net = NetConfig(runner=runner)
+    with pytest.raises(subprocess.CalledProcessError):
+        net.add_default_route("utun7")
+
+    net.add_default_route("utun7")
+    net.teardown()
+
+    assert own_add_attempts == 2
+    assert restore_attempts == 2
+    assert runner.route_get_stdout == runner.original_route
+    route_gets = [argv for argv in runner.argvs if argv[:3] == ["route", "-n", "get"]]
+    assert len(route_gets) == 2  # initial capture and teardown; the add retry must not recapture
+
+
+@pytest.mark.parametrize("requested_ifname", ["utun7", "utun8"])
+def test_add_retry_leaves_a_replacement_default_route_untouched(requested_ifname):
+    runner = _FakeRunner("gateway: 10.0.0.1\ninterface: en0\n")
+    net = NetConfig(runner=runner)
+    net.add_default_route("utun7")
+    runner.route_get_stdout = "gateway: 192.0.2.1\ninterface: en1\n"
+    commands_before = list(net.commands)
+    runner_calls_before = len(runner.argvs)
+
+    net.add_default_route(requested_ifname)
+
+    assert net.commands == commands_before
+    assert runner.argvs[runner_calls_before:] == [["route", "-n", "get", "default"]]
+    assert runner.route_get_stdout.endswith("interface: en1\n")
+
+
+def test_add_retry_reinstalls_a_vanished_owned_route_without_delete():
+    runner = _FakeRunner("gateway: 10.0.0.1\ninterface: en0\n")
+    net = NetConfig(runner=runner)
+    net.add_default_route("utun7")
+    runner.route_get_stdout = ""  # another actor removed our route, but installed no replacement
+    commands_before = len(net.commands)
+
+    net.add_default_route("utun8")
+
+    assert net.commands[commands_before:] == [["route", "add", "default", "-interface", "utun8"]]
+    net.teardown()
+    assert runner.route_get_stdout == runner.original_route
+
+
+def test_teardown_leaves_a_new_default_route_untouched():
+    runner = _FakeRunner("gateway: 10.0.0.1\ninterface: en0\n")
+    net = NetConfig(runner=runner)
+    net.add_default_route("utun7")
+    runner.route_get_stdout = "gateway: 192.0.2.1\ninterface: en1\n"
+    before = len(runner.argvs)
+    net.teardown()
+    assert runner.argvs[before:] == [["route", "-n", "get", "default"]]
+    assert runner.route_get_stdout.endswith("interface: en1\n")
+
+
+def test_teardown_restores_previous_route_when_ours_is_already_gone():
+    runner = _FakeRunner("gateway: 10.0.0.1\ninterface: en0\n")
+    net = NetConfig(runner=runner)
+    net.add_default_route("utun7")
+    runner.fail_on = lambda argv, _: argv == ["route", "-n", "get", "default"]
+    net.teardown()
+    assert runner.argvs[-1] == ["route", "add", "default", "10.0.0.1"]

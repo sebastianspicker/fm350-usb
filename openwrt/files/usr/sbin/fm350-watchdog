@@ -149,8 +149,12 @@ interface_up() {
 
 restart_interface() {
 	log "$interface pending for ${elapsed}s, restarting it (backoff was ${backoff}s)"
-	ifdown "$interface" 2>/dev/null
-	ifup "$interface" 2>/dev/null
+	if ! ifdown "$interface" 2>/dev/null; then
+		log "ifdown $interface failed; continuing with ifup and backoff"
+	fi
+	if ! ifup "$interface" 2>/dev/null; then
+		log "ifup $interface failed; retaining restart backoff"
+	fi
 }
 
 # tick() - one decision-and-maybe-act cycle. Reads/writes the globals

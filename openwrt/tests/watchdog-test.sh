@@ -11,7 +11,8 @@
 # Scenarios (see tests/watchdog-harness.sh.tmpl below, generated into
 # WORK_TMP): healthy up -> no action; pending < threshold -> no action;
 # pending > threshold -> restart; a second restart is withheld until the
-# backoff elapses, and the backoff itself doubles; a disabled interface
+# backoff elapses, and the backoff itself doubles; failed ifdown/ifup calls
+# are logged and throttled without aborting; a disabled interface
 # (network.wwan.disabled=1) and a paused watchdog
 # (/tmp/fm350-watchdog.pause) both -> no action even once well past the
 # pending threshold.
@@ -80,9 +81,12 @@ FM350_WATCHDOG_TEST=1
 # real commands) at source time, which would otherwise clobber these.
 ifup_calls=0
 ifdown_calls=0
-ifup() { ifup_calls=$((ifup_calls + 1)); }
-ifdown() { ifdown_calls=$((ifdown_calls + 1)); }
-logger() { :; } # discard; restart_interface()'s log() call still runs fine
+FAIL_IFUP=0
+FAIL_IFDOWN=0
+LOGS=""
+ifup() { ifup_calls=$((ifup_calls + 1)); [ "$FAIL_IFUP" -eq 0 ]; }
+ifdown() { ifdown_calls=$((ifdown_calls + 1)); [ "$FAIL_IFDOWN" -eq 0 ]; }
+logger() { LOGS="$LOGS $*"; }
 
 STUB_UP=false
 ifstatus() { printf '{"up":%s,"pending":true}' "$STUB_UP"; }
@@ -111,6 +115,9 @@ reset_state() {
 	next_allowed_restart=0
 	ifup_calls=0
 	ifdown_calls=0
+	FAIL_IFUP=0
+	FAIL_IFDOWN=0
+	LOGS=""
 }
 
 uci -q delete network.wwan >/dev/null 2>&1 || true
@@ -155,6 +162,45 @@ STUB_NOW=$((1000200 + 181)) # after next_allowed_restart
 tick
 assert_eq "backoff: second restart once backoff elapses" "$ifup_calls" 2
 assert_eq "backoff: doubled" "$backoff" $((pending_threshold * 2))
+
+echo "=== failed ifdown still tries ifup and is throttled ==="
+reset_state
+FAIL_IFDOWN=1
+STUB_UP=false
+STUB_NOW=1000000
+tick
+STUB_NOW=1000200
+tick
+assert_eq "failed ifdown: ifdown called" "$ifdown_calls" 1
+assert_eq "failed ifdown: ifup still called" "$ifup_calls" 1
+assert_eq "failed ifdown: backoff advanced" "$backoff" "$pending_threshold"
+case "$LOGS" in *'ifdown wwan failed'*) ;; *) fail "failed ifdown was not logged" ;; esac
+STUB_NOW=1000300
+tick
+assert_eq "failed ifdown: restart withheld" "$ifdown_calls" 1
+STUB_NOW=1000381
+tick
+assert_eq "failed ifdown: second restart after backoff" "$ifdown_calls" 2
+assert_eq "failed ifdown: backoff doubled" "$backoff" $((pending_threshold * 2))
+
+echo "=== failed ifup retains backoff and loop keeps running ==="
+reset_state
+FAIL_IFUP=1
+STUB_UP=false
+STUB_NOW=1000000
+tick
+STUB_NOW=1000200
+tick
+assert_eq "failed ifup: both commands tried" "$ifdown_calls/$ifup_calls" "1/1"
+assert_eq "failed ifup: backoff advanced" "$backoff" "$pending_threshold"
+case "$LOGS" in *'ifup wwan failed'*) ;; *) fail "failed ifup was not logged" ;; esac
+STUB_NOW=1000300
+tick
+assert_eq "failed ifup: restart withheld" "$ifup_calls" 1
+STUB_NOW=1000381
+tick
+assert_eq "failed ifup: second restart after backoff" "$ifup_calls" 2
+assert_eq "failed ifup: backoff doubled" "$backoff" $((pending_threshold * 2))
 
 echo "=== disabled interface: no action ==="
 reset_state

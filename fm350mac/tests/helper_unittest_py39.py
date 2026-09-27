@@ -26,6 +26,7 @@ import fm350mac_helper as helper  # noqa: E402 (must follow the sys.path fix-up)
 class FakeRunner:
     def __init__(self, route_get_stdout="", fail_on=None):
         self.route_get_stdout = route_get_stdout
+        self.original_route = route_get_stdout
         self.fail_on = fail_on or (lambda argv, kwargs: False)
         self.argvs = []
 
@@ -34,7 +35,15 @@ class FakeRunner:
         self.argvs.append(argv)
         if self.fail_on(argv, kwargs):
             raise subprocess.CalledProcessError(1, argv)
+        if argv[:3] == [helper.ROUTE, "-n", "get"] and not self.route_get_stdout:
+            raise subprocess.CalledProcessError(1, argv)
         stdout = self.route_get_stdout if argv[:3] == [helper.ROUTE, "-n", "get"] else ""
+        if argv[:3] == [helper.ROUTE, "delete", "default"]:
+            self.route_get_stdout = ""
+        elif argv[:3] == [helper.ROUTE, "add", "default"]:
+            self.route_get_stdout = (
+                "interface: %s\n" % argv[-1] if "-interface" in argv else self.original_route
+            )
         return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
 
 
@@ -185,7 +194,7 @@ class JournalAndTeardownTests(unittest.TestCase):
         )
         self.assertTrue(all(r["ok"] for r in responses))
         route_get_calls = [a for a in runner.argvs if a[:3] == ["/sbin/route", "-n", "get"]]
-        self.assertEqual(len(route_get_calls), 1)
+        self.assertEqual(len(route_get_calls), 2)  # capture once, then check ownership on disconnect
 
     def test_default_route_never_captures_its_own_interface(self):
         runner = FakeRunner(route_get_stdout="   route to: default\n interface: utun-fake0\n")
@@ -193,6 +202,80 @@ class JournalAndTeardownTests(unittest.TestCase):
         self.assertTrue(responses[0]["ok"])
         default_adds = [c for c in h.net.commands if c[:3] == ["/sbin/route", "add", "default"]]
         self.assertEqual(default_adds, [["/sbin/route", "add", "default", "-interface", "utun-fake0"]])
+
+    def test_failed_default_add_restores_original_and_reports_failure(self):
+        original = "gateway: 10.0.0.1\ninterface: en0\n"
+        runner = FakeRunner(
+            original,
+            fail_on=lambda argv, _: argv == [helper.ROUTE, "add", "default", "-interface", "utun-fake0"],
+        )
+        responses, _h = drive_after_open([{"op": "set_default_route", "enable": True}], runner=runner)
+        self.assertFalse(responses[0]["ok"])
+        self.assertIn("-interface", responses[0]["error"])
+        self.assertEqual(runner.argvs[-1], [helper.ROUTE, "add", "default", "10.0.0.1"])
+        self.assertEqual(runner.route_get_stdout, original)
+
+    def test_failed_restore_is_retried_on_disconnect(self):
+        restore_attempts = [0]
+
+        def fail_on(argv, _):
+            if argv == [helper.ROUTE, "add", "default", "-interface", "utun-fake0"]:
+                return True
+            if argv == [helper.ROUTE, "add", "default", "10.0.0.1"]:
+                restore_attempts[0] += 1
+                return restore_attempts[0] == 1
+            return False
+
+        runner = FakeRunner("gateway: 10.0.0.1\ninterface: en0\n", fail_on=fail_on)
+        responses, _h = drive_after_open([{"op": "set_default_route", "enable": True}], runner=runner)
+        self.assertFalse(responses[0]["ok"])
+        self.assertEqual(restore_attempts[0], 2)
+        self.assertEqual(runner.route_get_stdout, runner.original_route)
+
+    def test_successful_enable_retry_preserves_pending_original_route(self):
+        own_add_attempts = [0]
+        restore_attempts = [0]
+
+        def fail_on(argv, _):
+            if argv == [helper.ROUTE, "add", "default", "-interface", "utun-fake0"]:
+                own_add_attempts[0] += 1
+                return own_add_attempts[0] == 1
+            if argv == [helper.ROUTE, "add", "default", "10.0.0.1"]:
+                restore_attempts[0] += 1
+                return restore_attempts[0] == 1
+            return False
+
+        runner = FakeRunner("gateway: 10.0.0.1\ninterface: en0\n", fail_on=fail_on)
+        net = helper.NetState("utun-fake0", runner=runner)
+        with self.assertRaises(subprocess.CalledProcessError):
+            net.enable_default_route()
+
+        net.enable_default_route()
+        net.disable_default_route()
+
+        self.assertEqual(own_add_attempts[0], 2)
+        self.assertEqual(restore_attempts[0], 2)
+        self.assertEqual(runner.route_get_stdout, runner.original_route)
+        route_gets = [argv for argv in runner.argvs if argv[:3] == [helper.ROUTE, "-n", "get"]]
+        self.assertEqual(len(route_gets), 2)
+
+    def test_disconnect_leaves_new_default_route_untouched(self):
+        runner = FakeRunner("gateway: 10.0.0.1\ninterface: en0\n")
+        net = helper.NetState("utun-fake0", runner=runner)
+        net.enable_default_route()
+        runner.route_get_stdout = "gateway: 192.0.2.1\ninterface: en1\n"
+        before = len(runner.argvs)
+        net.teardown()
+        self.assertEqual(runner.argvs[before:], [[helper.ROUTE, "-n", "get", "default"]])
+        self.assertEqual(runner.route_get_stdout, "gateway: 192.0.2.1\ninterface: en1\n")
+
+    def test_disconnect_restores_original_if_no_default_remains(self):
+        runner = FakeRunner("gateway: 10.0.0.1\ninterface: en0\n")
+        net = helper.NetState("utun-fake0", runner=runner)
+        net.enable_default_route()
+        runner.fail_on = lambda argv, _: argv == [helper.ROUTE, "-n", "get", "default"]
+        net.teardown()
+        self.assertEqual(runner.argvs[-1], [helper.ROUTE, "add", "default", "10.0.0.1"])
 
 
 class PeerUidTests(unittest.TestCase):

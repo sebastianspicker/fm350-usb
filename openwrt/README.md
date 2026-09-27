@@ -35,7 +35,7 @@ mwan3 status                # confirm the failover policy is active
 | Flag | Default | Effect |
 |---|---|---|
 | `--proto atc\|xmm` | `atc` | `atc`: downloads and installs `luci-proto-atc` + `atc-fib-fm350_gl` (mrhaav). `xmm`: prints instructions for the modemfeed `xmm-modem` package instead (not in official feeds) and applies the `network.wwan` config for proto `xmm` without installing anything. |
-| `--apn APN` | (required) | Carrier APN, e.g. `internet.telekom`, `web.vodafone.de`, `internet`. |
+| `--apn APN` | (required) | Carrier APN, e.g. `internet.telekom`, `web.vodafone.de`, `internet`. Letters, digits, dots, underscores, and hyphens are accepted. |
 | `--dry-run` | off | Prints the uci commands and package actions that would run; installs nothing and changes no config. |
 | `--no-mwan3` | off | Skips installing `mwan3`/`luci-app-mwan3` and skips `uci/mwan3.uci`. |
 | `--no-watchdog` | off | Skips installing and enabling `fm350-watchdog`. |
@@ -117,12 +117,16 @@ already there, e.g. `1.1.1.1` is coincidentally also a stock mwan3 default)
 in `mwan3.wan.fm350_added_track_ip`, so a value that predates `install.sh` is
 never removed by `uninstall.sh`.
 
-`uninstall.sh` mirrors all of this: it deletes `wwan`/`wan_m1`/`wwan_m2`/
+`install.sh` also records the original `network.wan.metric` and the
+`mwan3.wan` options it changes, preserving whether each option was unset.
+The first install's snapshot is retained if you run the installer again.
+`uninstall.sh` mirrors all of this: it restores those original values, deletes `wwan`/`wan_m1`/`wwan_m2`/
 `failover`/`default`, removes only the `track_ip` values listed in
 `mwan3.wan.fm350_added_track_ip` from `mwan3.wan` and then deletes that
-bookkeeping option (leaving the section and `mwan3.globals` alone), and
+bookkeeping option (leaving pre-existing sections in place), and
 restores `default_rule_v4`/`https`'s original `use_policy` from
-`fm350_orig_policy` before deleting that option.
+`fm350_orig_policy` before deleting that option. It also removes a
+`mwan3.wan` or `mwan3.globals` section if the installer created it.
 
 > **IPv6 is not covered**: `default_rule_v6` is left untouched (still pointed
 > at `balanced`), and the `failover` policy has no IPv6 members. If your ISP
@@ -204,11 +208,12 @@ shellcheck -s sh install.sh uninstall.sh fm350-status.sh \
   files/etc/hotplug.d/usb/50-fm350_driver \
   files/usr/sbin/fm350-watchdog files/etc/init.d/fm350-watchdog tests/*.sh
 ./tests/fm350-decode-test.sh   # status decoder against canned AT responses (plain sh, no Docker)
+sh ./tests/install-input-test.sh # APN validation and dry-run rendering (plain sh, no Docker)
 ./tests/watchdog-test.sh       # watchdog decision logic (Docker)
 ./tests/docker-test.sh         # install/uninstall idempotency (Docker)
 ```
 
-`tests/docker-test.sh` pulls an OpenWrt rootfs image and runs two scenarios,
+`tests/docker-test.sh` pulls an OpenWrt rootfs image and runs three scenarios,
 each in its own container:
 
 1. stock mwan3: seeds `tests/fixtures/mwan3.default` (the real
@@ -216,18 +221,21 @@ each in its own container:
    that after `install.sh` the `default` rule is reordered ahead of
    `https`/`default_rule_v4`, both of those now use `failover`, and
    `mwan3.wan` still has its stock `track_ip` entries plus ours.
-2. empty mwan3: seeds an empty `/etc/config/mwan3`, exercising the
-   from-scratch path.
+2. unset options: keeps the stock sections but removes selected options,
+   checking that uninstall restores their unset state.
+3. empty mwan3: seeds an empty `/etc/config/mwan3` and removes `network.wan`,
+   exercising the from-scratch section-creation path.
 
-Both scenarios seed a minimal `/etc/config/network` (`wan`/`lan`) and reuse
+All scenarios start with a minimal `/etc/config/network` (`wan`/`lan`) and reuse
 the image's default `/etc/config/firewall` (already has a `wan` zone), run
 `install.sh --dry-run` (must change nothing), then a real run with
 `--skip-packages` (a hidden flag that skips `opkg`/`apk` and all downloads,
 for use in environments without kernel modules or network access) twice
 to prove idempotency (`uci show` must be byte-identical after run 1 and
 run 2, including rule order and the `fm350_orig_policy` bookkeeping), then
-run `uninstall.sh` and check that every installer-owned section is gone,
-`mwan3.wan`/`mwan3.globals` still exist, and `default_rule_v4`/`https` (stock
+run `uninstall.sh` and compare the complete `uci show` output with its
+pre-install state. Existing `mwan3.wan`/`mwan3.globals` sections remain,
+installer-created ones are removed, and `default_rule_v4`/`https` (stock
 scenario) are back to their original `use_policy`. It exits non-zero on any
 mismatch and removes the containers it creates.
 

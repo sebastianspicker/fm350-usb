@@ -127,6 +127,12 @@ if [ -z "$apn" ]; then
 	echo "install.sh: --apn is required (e.g. --apn internet.telekom)" >&2
 	exit 1
 fi
+case "$apn" in
+	*[!a-zA-Z0-9._-]*)
+		echo "install.sh: --apn may contain only letters, digits, dots, underscores, and hyphens" >&2
+		exit 1
+		;;
+esac
 
 log() { echo "install.sh: $*"; }
 
@@ -294,13 +300,72 @@ apply_uci_template() {
 	for kv in "$@"; do
 		name=${kv%%=*}
 		value=${kv#*=}
-		rendered=$(echo "$rendered" | sed "s|@${name}@|${value}|g")
+		# Even though APNs are restricted above, escape sed replacement syntax
+		# for every placeholder so '&', '\' or '|' cannot change the template.
+		escaped=$(printf '%s' "$value" | sed 's/[\&|]/\\&/g')
+		rendered=$(printf '%s\n' "$rendered" | sed "s|@${name}@|${escaped}|g")
 	done
 	if [ "$dry_run" -eq 1 ]; then
 		log "[dry-run] uci batch from $(basename "$template"):"
 		echo "$rendered"
 	else
 		echo "$rendered" | uci -q batch
+	fi
+}
+
+# Save an option's original value and its set/unset state exactly once. The
+# state sections belong to this installer; they survive repeated installs and
+# are removed by uninstall.sh after restoration.
+save_option() {
+	state=$1
+	name=$2
+	target=$3
+	if uci -q get "$state.${name}_state" >/dev/null 2>&1; then
+		return 0
+	fi
+	if original=$(uci -q get "$target" 2>/dev/null); then
+		original_state='set'
+	else
+		original_state='unset'
+	fi
+	if [ "$dry_run" -eq 1 ]; then
+		log "[dry-run] would save $target ($original_state) in $state"
+		return 0
+	fi
+	uci set "$state.${name}_state=$original_state"
+	[ "$original_state" = unset ] || uci set "$state.${name}_value=$original"
+}
+
+save_section() {
+	state=$1
+	name=$2
+	target=$3
+	if uci -q get "$state.${name}_state" >/dev/null 2>&1; then
+		return 0
+	fi
+	if uci -q get "$target" >/dev/null 2>&1; then
+		original_state=present
+	else
+		original_state=absent
+	fi
+	if [ "$dry_run" -eq 1 ]; then
+		log "[dry-run] would save $target ($original_state) in $state"
+	else
+		uci set "$state.${name}_state=$original_state"
+	fi
+}
+
+ensure_state_section() {
+	state=$1
+	if existing_type=$(uci -q get "$state" 2>/dev/null); then
+		if [ "$existing_type" != fm350_install_state ]; then
+			echo "install.sh: $state already exists with type '$existing_type'; refusing to overwrite it" >&2
+			exit 1
+		fi
+	elif [ "$dry_run" -eq 1 ]; then
+		log "[dry-run] would create $state if absent"
+	else
+		uci set "$state=fm350_install_state"
 	fi
 }
 
@@ -372,6 +437,9 @@ neutralize_mwan3_rule() {
 }
 
 # --- network ------------------------------------------------------------------
+ensure_state_section network.fm350_install_state
+save_section network.fm350_install_state wan network.wan
+save_option network.fm350_install_state wan_metric network.wan.metric
 log "applying network config (proto=$proto, device=$device, apn=$apn)"
 if [ "$proto" = atc ]; then
 	apply_uci_template "$UCI_DIR/network-atc.uci" "DEVICE=$device" "APN=$apn"
@@ -392,6 +460,17 @@ apply_uci_template "$UCI_DIR/firewall.uci" "WAN_ZONE=$wan_zone"
 if [ "$no_mwan3" -eq 1 ]; then
 	log "--no-mwan3: skipping mwan3 config"
 else
+	ensure_state_section mwan3.fm350_install_state
+	save_section mwan3.fm350_install_state wan mwan3.wan
+	save_section mwan3.fm350_install_state globals mwan3.globals
+	for option in enabled family interval down up; do
+		save_option mwan3.fm350_install_state "wan_$option" "mwan3.wan.$option"
+	done
+	# The installer adds mmx_mask only when it is unset or empty. Capture
+	# that case, including an explicitly empty original value.
+	if [ -z "$(uci -q get mwan3.globals.mmx_mask 2>/dev/null)" ]; then
+		save_option mwan3.fm350_install_state globals_mmx_mask mwan3.globals.mmx_mask
+	fi
 	log "applying mwan3 config"
 	apply_uci_template "$UCI_DIR/mwan3.uci"
 	mwan3_add_wan_track_ip 1.1.1.1

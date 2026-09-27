@@ -48,6 +48,7 @@ class _FakeRunner:
 
     def __init__(self, route_get_stdout: str = "", fail_on=None):
         self.route_get_stdout = route_get_stdout
+        self.original_route = route_get_stdout
         self.fail_on = fail_on or (lambda argv, kwargs: False)
         self.argvs: list[list[str]] = []
 
@@ -56,7 +57,15 @@ class _FakeRunner:
         self.argvs.append(argv)
         if self.fail_on(argv, kwargs):
             raise subprocess.CalledProcessError(1, argv)
+        if argv[:3] == [helper.ROUTE, "-n", "get"] and not self.route_get_stdout:
+            raise subprocess.CalledProcessError(1, argv)
         stdout = self.route_get_stdout if argv[:3] == [helper.ROUTE, "-n", "get"] else ""
+        if argv[:3] == [helper.ROUTE, "delete", "default"]:
+            self.route_get_stdout = ""
+        elif argv[:3] == [helper.ROUTE, "add", "default"]:
+            self.route_get_stdout = (
+                f"interface: {argv[-1]}\n" if "-interface" in argv else self.original_route
+            )
         return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
 
 
@@ -377,7 +386,7 @@ def test_default_route_idempotent_and_restores_previous_gateway():
     )
     assert [r["ok"] for r in responses] == [True, True, True]
     route_get_calls = [a for a in runner.argvs if a[:3] == ["/sbin/route", "-n", "get"]]
-    assert len(route_get_calls) == 1  # never re-captured on the idempotent second enable
+    assert len(route_get_calls) == 2  # capture once, then check ownership before disabling
     assert ["/sbin/route", "add", "default", "10.0.0.1"] in handler.net.commands
 
 
@@ -399,6 +408,88 @@ def test_disable_default_route_without_enable_is_a_no_op():
     responses, handler = _drive_after_open([{"op": "set_default_route", "enable": False}])
     assert responses[0]["ok"] is True
     assert handler.net.commands == []
+
+
+def test_failed_default_add_restores_previous_route_and_reports_original_error():
+    original = "gateway: 10.0.0.1\ninterface: en0\n"
+    runner = _FakeRunner(
+        original,
+        fail_on=lambda argv, _: argv == [helper.ROUTE, "add", "default", "-interface", "utun-fake0"],
+    )
+    responses, _handler = _drive_after_open([{"op": "set_default_route", "enable": True}], runner=runner)
+    assert responses[0]["ok"] is False
+    assert "-interface" in responses[0]["error"]
+    assert runner.argvs[-1] == [helper.ROUTE, "add", "default", "10.0.0.1"]
+    assert runner.route_get_stdout == original
+
+
+def test_failed_default_restore_is_retried_on_disconnect():
+    restore_attempts = 0
+
+    def fail_on(argv, _):
+        nonlocal restore_attempts
+        if argv == [helper.ROUTE, "add", "default", "-interface", "utun-fake0"]:
+            return True
+        if argv == [helper.ROUTE, "add", "default", "10.0.0.1"]:
+            restore_attempts += 1
+            return restore_attempts == 1
+        return False
+
+    runner = _FakeRunner("gateway: 10.0.0.1\ninterface: en0\n", fail_on=fail_on)
+    responses, _handler = _drive_after_open([{"op": "set_default_route", "enable": True}], runner=runner)
+    assert responses[0]["ok"] is False
+    assert "-interface" in responses[0]["error"]
+    assert restore_attempts == 2
+    assert runner.route_get_stdout == runner.original_route
+
+
+def test_successful_enable_retry_preserves_pending_original_route():
+    own_add_attempts = 0
+    restore_attempts = 0
+
+    def fail_on(argv, _):
+        nonlocal own_add_attempts, restore_attempts
+        if argv == [helper.ROUTE, "add", "default", "-interface", "utun-fake0"]:
+            own_add_attempts += 1
+            return own_add_attempts == 1
+        if argv == [helper.ROUTE, "add", "default", "10.0.0.1"]:
+            restore_attempts += 1
+            return restore_attempts == 1
+        return False
+
+    runner = _FakeRunner("gateway: 10.0.0.1\ninterface: en0\n", fail_on=fail_on)
+    net = helper.NetState("utun-fake0", runner=runner)
+    with pytest.raises(subprocess.CalledProcessError):
+        net.enable_default_route()
+
+    net.enable_default_route()
+    net.disable_default_route()
+
+    assert own_add_attempts == 2
+    assert restore_attempts == 2
+    assert runner.route_get_stdout == runner.original_route
+    route_gets = [argv for argv in runner.argvs if argv[:3] == [helper.ROUTE, "-n", "get"]]
+    assert len(route_gets) == 2  # initial capture and disable; the enable retry must not recapture
+
+
+def test_disable_leaves_new_default_route_untouched():
+    runner = _FakeRunner("gateway: 10.0.0.1\ninterface: en0\n")
+    net = helper.NetState("utun-fake0", runner=runner)
+    net.enable_default_route()
+    runner.route_get_stdout = "gateway: 192.0.2.1\ninterface: en1\n"
+    before = len(runner.argvs)
+    net.disable_default_route()
+    assert runner.argvs[before:] == [[helper.ROUTE, "-n", "get", "default"]]
+    assert runner.route_get_stdout.endswith("interface: en1\n")
+
+
+def test_disable_restores_previous_route_when_ours_is_already_gone():
+    runner = _FakeRunner("gateway: 10.0.0.1\ninterface: en0\n")
+    net = helper.NetState("utun-fake0", runner=runner)
+    net.enable_default_route()
+    runner.fail_on = lambda argv, _: argv == [helper.ROUTE, "-n", "get", "default"]
+    net.disable_default_route()
+    assert runner.argvs[-1] == [helper.ROUTE, "add", "default", "10.0.0.1"]
 
 
 # --- journal undo order: dns, default route, host route, then the iface ---

@@ -274,10 +274,27 @@ def test_up_cleans_up_after_failure_following_utun_open():
 
 
 def test_up_cleans_up_after_failure_following_default_route():
+    import subprocess
+
     at_fake = FakeAtPort(sim_ready=True, registered=True)
     usb_fake = FakeRndisUsb()
     utun_fake = FakeUtun()
-    net = FailingNetConfig(dry_run=False, runner=_no_op_runner, fail_at="add_default_route")
+    route_iface = None
+
+    def route_runner(argv, **kwargs):
+        nonlocal route_iface
+        argv = list(argv)
+        if argv[:3] == ["route", "-n", "get"]:
+            if route_iface is None:
+                raise subprocess.CalledProcessError(1, argv)
+            return subprocess.CompletedProcess(argv, 0, stdout=f"interface: {route_iface}\n", stderr="")
+        if argv[:3] == ["route", "add", "default"]:
+            route_iface = argv[-1]
+        elif argv[:3] == ["route", "delete", "default"]:
+            route_iface = None
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    net = FailingNetConfig(dry_run=False, runner=route_runner, fail_at="add_default_route")
 
     args = _up_args(["--no-helper", "--default-route"])
     with pytest.raises(RuntimeError, match="add_default_route"):
@@ -293,6 +310,7 @@ def test_up_cleans_up_after_failure_following_default_route():
 
     assert net._default_route_added is False  # torn down
     assert ["route", "delete", "default"] in net.commands
+    assert route_iface is None
     assert utun_fake.closed
     assert usb_fake.halted
     assert usb_fake.closed
@@ -480,15 +498,22 @@ def test_up_supervise_reenum_with_default_route_reconfigures_and_restores_origin
             at_fake.ip_pool[cid] = "10.20.30.99"  # the modem got a new IP after re-enumerating
         return at_fake
 
-    route_get_calls: list[list[str]] = []
+    route_get_calls: list[str] = []
+    current_route = "en0"
 
     def fake_runner(argv, **kwargs):
         import subprocess
 
+        nonlocal current_route
         argv = list(argv)
         if argv[:3] == ["route", "-n", "get"]:
-            route_get_calls.append(argv)
-            return subprocess.CompletedProcess(argv, 0, stdout="   gateway: 192.168.1.1\n interface: en0\n", stderr="")
+            route_get_calls.append(current_route)
+            gateway = "gateway: 192.168.1.1\n" if current_route == "en0" else ""
+            return subprocess.CompletedProcess(argv, 0, stdout=f"{gateway}interface: {current_route}\n", stderr="")
+        if argv[:3] == ["route", "add", "default"]:
+            current_route = argv[-1] if "-interface" in argv else "en0"
+        elif argv[:3] == ["route", "delete", "default"]:
+            current_route = ""
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
     net = NetConfig(dry_run=False, runner=fake_runner)
@@ -511,7 +536,11 @@ def test_up_supervise_reenum_with_default_route_reconfigures_and_restores_origin
     assert rc == 0
     # The real previous default was captured exactly once -- never
     # re-captured on the restart (it would otherwise see our own route).
-    assert len(route_get_calls) == 1
+    assert route_get_calls == [
+        "en0",       # capture the original route
+        "utun-fake", # verify ownership before the supervised rebuild's no-op
+        "utun-fake", # verify ownership again before teardown
+    ]
 
     # The address changed across the restart: reconfigured in place (delete
     # old alias, add new one), not stacked as a second alias alongside the

@@ -164,6 +164,7 @@ Specs, power budget and band support are in [docs/hardware.md](docs/hardware.md)
 ```sh
 cd fm350mac && uv run pytest -q && uvx ruff check .     # macOS driver
 shellcheck openwrt/*.sh openwrt/tests/*.sh               # router scripts
+tools/tests/bench-throughput-test.sh                     # benchmark failure handling (no hardware)
 openwrt/tests/docker-test.sh                             # install/uninstall in an OpenWrt rootfs (Docker)
 openwrt/tests/atc-test.sh                                # protocol handler against a fake FM350
 openwrt/tests/qemu-failover-test.sh                      # real mwan3 failover in OpenWrt under QEMU

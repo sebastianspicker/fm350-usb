@@ -5,14 +5,16 @@
 # `uci show` and no duplicate sections/list entries), then uninstall.sh
 # removing everything that was added. Exits non-zero on any mismatch.
 #
-# Runs two scenarios, each in its own container:
-#   stock - /etc/config/mwan3 seeded from tests/fixtures/mwan3.default (the
+# Runs three scenarios, each in its own container:
+#   stock/unset - /etc/config/mwan3 seeded from tests/fixtures/mwan3.default (the
 #           real `opkg install mwan3` default config on OpenWrt 24.10), which
 #           ships rules ("https", "default_rule_v4") that would otherwise
 #           shadow our failover rule (mwan3 is first-match). Checks that
 #           install.sh reorders/neutralises them and uninstall.sh restores
 #           them, without touching mwan3.wan/mwan3.globals structurally.
-#   empty - an empty /etc/config/mwan3, exercising the from-scratch path.
+#           stock overrides existing values; unset leaves options absent.
+#   empty - an empty /etc/config/mwan3 and no network.wan, exercising the
+#           from-scratch section-creation path.
 #
 # Runs on the development host (needs Docker), not on the router. POSIX sh.
 set -e
@@ -147,8 +149,16 @@ EOF
 	fi
 	if [ "$mwan3_seed" = stock ]; then
 		docker cp "$OPENWRT_DIR/tests/fixtures/mwan3.default" "$CONTAINER:/etc/config/mwan3"
+		if [ "$scenario" = stock ]; then
+			# Exercise restoration of custom values, not just stock defaults.
+			dexec "uci set network.wan.metric='77'; uci commit network; uci set mwan3.wan.enabled='0'; uci set mwan3.wan.family='ipv6'; uci set mwan3.wan.interval='31'; uci set mwan3.wan.down='7'; uci set mwan3.wan.up='9'; uci set mwan3.globals.mmx_mask='0xAA00'; uci commit mwan3"
+		else
+			# Existing sections with several unset options, including mmx_mask.
+			dexec "uci -q delete network.wan.metric; uci commit network; uci -q delete mwan3.globals.mmx_mask; uci commit mwan3"
+		fi
 	else
 		dexec ": > /etc/config/mwan3"
+		dexec "uci -q delete network.wan; uci commit network"
 	fi
 
 	echo "docker-test.sh: [$scenario] install.sh --dry-run must change nothing"
@@ -242,6 +252,12 @@ EOF
 	dexec "cd $WORKDIR && ./uninstall.sh" >"$WORK_TMP/$scenario-uninstall.log" 2>&1 ||
 		fail "[$scenario] uninstall.sh exited non-zero"
 	after_uninstall=$(dexec "uci show 2>/dev/null")
+	if [ "$after_uninstall" != "$before_dry" ]; then
+		fail "[$scenario] uninstall did not restore the original UCI state"
+		printf '%s\n' "$before_dry" >"$WORK_TMP/$scenario-before.txt"
+		printf '%s\n' "$after_uninstall" >"$WORK_TMP/$scenario-after.txt"
+		diff "$WORK_TMP/$scenario-before.txt" "$WORK_TMP/$scenario-after.txt" >&2 || true
+	fi
 
 	assert_no_match "uninstall.sh left network.wwan behind" '^network\.wwan=' after_uninstall
 	assert_no_match "uninstall.sh left 'wwan' in the wan zone's network list" \
@@ -252,8 +268,13 @@ EOF
 			fail "[$scenario] uninstall.sh left mwan3.$section behind"
 		fi
 	done
-	assert_match "uninstall.sh removed mwan3.wan (should stay in place)" '^mwan3\.wan=interface$' after_uninstall
-	assert_match "uninstall.sh removed mwan3.globals (should stay in place)" '^mwan3\.globals=globals$' after_uninstall
+	if [ "$mwan3_seed" = stock ]; then
+		assert_match "uninstall.sh removed pre-existing mwan3.wan" '^mwan3\.wan=interface$' after_uninstall
+		assert_match "uninstall.sh removed pre-existing mwan3.globals" '^mwan3\.globals=globals$' after_uninstall
+	else
+		assert_no_match "uninstall.sh left installer-created mwan3.wan" '^mwan3\.wan=' after_uninstall
+		assert_no_match "uninstall.sh left installer-created mwan3.globals" '^mwan3\.globals=' after_uninstall
+	fi
 	assert_no_match "uninstall.sh left our 9.9.9.9 track_ip in mwan3.wan" \
 		"^mwan3\.wan\.track_ip=.*'9\.9\.9\.9'" after_uninstall
 	assert_no_match "uninstall.sh left the fm350_added_track_ip bookkeeping option behind" \
@@ -299,10 +320,11 @@ EOF
 }
 
 run_scenario stock stock
+run_scenario unset stock
 run_scenario empty empty
 
 if [ "$status" -eq 0 ]; then
-	echo "docker-test.sh: PASS (image: $IMAGE, scenarios: stock empty)"
+	echo "docker-test.sh: PASS (image: $IMAGE, scenarios: stock unset empty)"
 else
 	echo "docker-test.sh: FAIL, see output above" >&2
 	for f in "$WORK_TMP"/*.log; do
