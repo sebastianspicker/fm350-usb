@@ -27,6 +27,7 @@ class NetConfig:
         self.commands: list[list[str]] = []
         self._prev_default_restore_cmd: list[str] | None = None
         self._default_route_added = False
+        self._default_route_restore_pending = False
         self._default_route_ifname: str | None = None
         self._dns_set = False
         self._configured_iface: str | None = None
@@ -86,10 +87,42 @@ class NetConfig:
         captured default.
         """
         if self._default_route_added:
-            if self._default_route_ifname == ifname:
+            exists, current_iface = self._current_default_iface()
+            if exists and current_iface != self._default_route_ifname:
+                _log.warning(
+                    "default route moved from %s to %s; leaving the replacement route untouched",
+                    self._default_route_ifname,
+                    current_iface or "an unknown interface",
+                )
                 return
-            self._run(["route", "delete", "default"])
-            self._run(["route", "add", "default", "-interface", ifname])
+            if exists and self._default_route_ifname == ifname:
+                return
+            if exists:
+                self._run(["route", "delete", "default"])
+            try:
+                self._run(["route", "add", "default", "-interface", ifname])
+            except Exception:
+                # Our old route is gone; leave the original gateway available
+                # for teardown if installing the replacement fails.
+                self._default_route_added = False
+                self._default_route_ifname = None
+                self._restore_previous_default()
+                raise
+            self._default_route_ifname = ifname
+            return
+
+        # A previous add failed after deleting the original route, and its
+        # immediate rollback failed too. Do not re-read an empty route table
+        # and overwrite the saved restore command: a successful retry still
+        # has to restore that original route during teardown.
+        if self._default_route_restore_pending:
+            try:
+                self._run(["route", "add", "default", "-interface", ifname])
+            except Exception:
+                self._restore_previous_default()
+                raise
+            self._default_route_restore_pending = False
+            self._default_route_added = True
             self._default_route_ifname = ifname
             return
 
@@ -123,9 +156,41 @@ class NetConfig:
 
         if self._prev_default_restore_cmd is not None:
             self._run(["route", "delete", "default"])
-        self._run(["route", "add", "default", "-interface", ifname])
+            self._default_route_restore_pending = True
+        try:
+            self._run(["route", "add", "default", "-interface", ifname])
+        except Exception:
+            self._restore_previous_default()
+            raise
+        self._default_route_restore_pending = False
         self._default_route_added = True
         self._default_route_ifname = ifname
+
+    def _current_default_iface(self) -> tuple[bool, str | None]:
+        """Return whether a default route exists and its interface, if known."""
+        if self.dry_run and self._default_route_added:
+            # No command changed the real route during a dry run. Inspect the
+            # route we would have installed, not the host's unchanged route.
+            return True, self._default_route_ifname
+        try:
+            out = self._runner(["route", "-n", "get", "default"], capture_output=True, text=True, check=True).stdout
+        except subprocess.CalledProcessError:
+            return False, None
+        match = re.search(r"interface:\s*(\S+)", out)
+        return True, match.group(1) if match else None
+
+    def _restore_previous_default(self) -> None:
+        if self._prev_default_restore_cmd is None:
+            self._default_route_restore_pending = False
+            return
+        try:
+            self._run(self._prev_default_restore_cmd)
+        except Exception:
+            self._default_route_restore_pending = True
+            _log.exception("failed to restore previous default route")
+        else:
+            self._default_route_restore_pending = False
+            self._prev_default_restore_cmd = None
 
     def set_dns(self, servers: list[str]) -> None:
         """Publish ``servers`` as the DNS resolver via a dynamic-store key."""
@@ -151,9 +216,8 @@ class NetConfig:
         """Undo whatever was configured, in reverse order.
 
         Best-effort: a failure in one step is logged but never skips the
-        rest, and each step's state is cleared before running it so a
-        failure never leaves teardown() stuck retrying it forever
-        (idempotent either way).
+        rest. Failed route cleanup stays pending for a later retry; completed
+        steps remain idempotent.
         """
         if self._dns_set:
             self._dns_set = False
@@ -161,19 +225,32 @@ class NetConfig:
                 self._run_scutil(f"remove {_DNS_KEY}\n")
             except Exception:
                 _log.exception("failed to remove DNS key")
-        if self._default_route_added:
-            self._default_route_added = False
-            self._default_route_ifname = None
+        if self._default_route_added or self._default_route_restore_pending:
             try:
-                self._run(["route", "delete", "default"])
+                exists, current_iface = self._current_default_iface()
             except Exception:
-                _log.exception("failed to delete our default route")
-            restore_cmd, self._prev_default_restore_cmd = self._prev_default_restore_cmd, None
-            if restore_cmd is not None:
-                try:
-                    self._run(restore_cmd)
-                except Exception:
-                    _log.exception("failed to restore previous default route")
+                _log.exception("could not check current default route; leaving it unchanged")
+            else:
+                if exists and current_iface != self._default_route_ifname:
+                    # A different service has installed a default route. It
+                    # owns that route; our old gateway is stale now.
+                    self._default_route_added = False
+                    self._default_route_restore_pending = False
+                    self._default_route_ifname = None
+                    self._prev_default_restore_cmd = None
+                else:
+                    if exists:
+                        try:
+                            self._run(["route", "delete", "default"])
+                        except Exception:
+                            _log.exception("failed to delete our default route")
+                            exists = True
+                        else:
+                            exists = False
+                    if not exists:
+                        self._default_route_added = False
+                        self._default_route_ifname = None
+                        self._restore_previous_default()
         if self._host_route:
             host_ip, self._host_route = self._host_route, None
             try:
