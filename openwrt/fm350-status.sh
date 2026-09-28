@@ -24,11 +24,8 @@
 # it's treated as millidegree Celsius (matches this firmware family's
 # community-reported values), which is inferred, not manual-confirmed.
 #
-# The decoder itself (run_decode(), an awk program fed a "@@Q <command>"
-# tagged transcript on stdin) has no modem/gcom dependency, so
-# tests/fm350-decode-test.sh sources this file with FM350_STATUS_TEST=1 (to
-# skip the "$@"-driven main() call at the bottom) and feeds it canned AT
-# responses directly. POSIX sh/ash (busybox) compatible; awk is busybox awk.
+# The decoder (run_decode()) consumes tagged AT responses independently of
+# modem access. POSIX sh/ash (busybox) compatible; awk is busybox awk.
 set -e
 
 raw_mode=0
@@ -91,8 +88,7 @@ find_at_device() {
 run_decode() {
 	# busybox mktemp requires the template to *end* in XXXXXX (no suffix
 	# after it) - a suffixed template like "...XXXXXX.awk" errors out with
-	# "Invalid argument" on real OpenWrt/busybox, verified in the same
-	# openwrt/rootfs image tests/docker-test.sh uses.
+	# "Invalid argument" on real OpenWrt/busybox.
 	awk_script=$(mktemp /tmp/fm350-status-awk.XXXXXX) || {
 		echo "fm350-status.sh: mktemp failed" >&2
 		return 1
@@ -422,4 +418,4 @@ $out"
 	printf '%s\n' "$dump" | run_decode "$redact"
 }
 
-[ -n "$FM350_STATUS_TEST" ] || main "$@"
+main "$@"

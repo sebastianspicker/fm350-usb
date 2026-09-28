@@ -5,9 +5,8 @@ See docs/macos-driver.md, "Async USB I/O: our own ctypes binding to
 libusb", for the design this implements. stdlib only (ctypes).
 
 Layout: ``Libusb`` declares argtypes/restype for every libusb function used
-and exposes thin, snake_cased convenience methods a fake can mimic in
-tests. ``LibusbTransfer`` mirrors ``struct libusb_transfer`` field by field
-(checked against a compiled C program in tests/test_usb_async_layout.py).
+and exposes thin, snake_cased convenience methods. ``LibusbTransfer``
+mirrors ``struct libusb_transfer`` field by field.
 ``UsbDevice`` is one open handle per process, shared by every interface
 claimed on it (see ``open_device()``), with sync helpers that map libusb
 errors to typed exceptions. ``AsyncEndpoint`` is a pool of pre-allocated
@@ -128,8 +127,7 @@ def _clamped_bytes(buf: ctypes.Array, n: int) -> bytes:
 
 
 # --- ctypes structures mirroring libusb.h -----------------------------------
-# (field layout checked against a compiled C program: see
-# tests/test_usb_async_layout.py)
+# Field layout follows libusb.h.
 
 
 class _LibusbContext(ctypes.Structure):

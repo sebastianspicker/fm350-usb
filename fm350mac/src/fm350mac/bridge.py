@@ -47,7 +47,7 @@ _TX_STALL_TIMEOUT_MS = 50  # short write timeout while tx is stalled, so utun do
 _TX_STALL_WARN_INTERVAL_S = 10.0
 # If a "wait for a notification" call returns in much less than the timeout
 # it was given, several times in a row, treat it as not really blocking
-# (e.g. a fake transport in tests/loopback mode) and sleep out the rest of
+# (e.g. the loopback transport) and sleep out the rest of
 # the interval ourselves -- otherwise the control thread busy-spins and
 # starves the rx/tx threads of the GIL between Python's thread-switch
 # checks (measured: 18 ms median echo RTT instead of <1 ms in --loopback).

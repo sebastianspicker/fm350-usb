@@ -1,39 +1,68 @@
-# Modem backups hold the IMEI and RF calibration of one physical unit. Never commit them.
+# Sensitive local modem data and captured diagnostics
 /backups/
+/fm350-diag-*/
+*.nma
+*.log
 
-# Python
+# Python build output and tool caches
 __pycache__/
 *.pyc
 .venv/
 .pytest_cache/
 .ruff_cache/
 *.egg-info/
-/dist/
-/build/
+dist/
+build/
+.cache/
+.history/
+.codacy/
+.repowise/
+.codegraph/
+.serena/
 
-# Downloaded OpenWrt images and packages for the router tests (hundreds of MB)
-/openwrt/tests/.cache/
+# Agent instructions, state, and local worktrees
+.agents/
+.claude/
+.codex/
+.cursor/
+.continue/
+.windsurf/
+.aider*/
+.impeccable/
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+.cursorrules
+.mcp.json
+**/.github/copilot-instructions.md
+.worktrees/
+worktrees/
+rewritten/
 
-# Captured modem logs (may contain IMEI, ICCID, cell IDs)
-*.nma
-*.log
+# Purged tests and downloaded test images
+/fm350mac/tests/
+/openwrt/tests/
+/tools/tests/
 
-# OS and editor debris
+# Local helper scripts and their output
+/tools/bench-throughput.sh
+/tools/bench_summarize.py
+/tools/screenshots.py
+/tools/bench-results/
+
+# Work in progress documents and agent logs
+*TODO*
+*ROADMAP*
+drafts/
+plans/
+adr/
+progress.md
+session-notes.md
+
+# OS and editor files
 .DS_Store
 ._*
 *.swp
 *~
 .idea/
 .vscode/
-
-# Local agent workspace (kept out of the published repo)
-/.agents/
-/.claude/
-/AGENTS.md
-/CLAUDE.md
-
-# Benchmark run output (tools/bench-throughput.sh)
-/tools/bench-results/
-
-# fm350_diag.py run output (reports/transcripts/journals may hold operator or cell data)
-/fm350-diag-*/

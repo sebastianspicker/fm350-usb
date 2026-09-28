@@ -381,9 +381,9 @@ def cmd_status(args: argparse.Namespace, *, at_port_factory=at_mod.AtPort, sleep
 
 # --- doctor: read-only diagnostic checks ------------------------------------
 
-# Commands doctor sends. All are queries (``?``) except the ones listed in
-# _DOCTOR_ALLOWED_EQUALS_COMMANDS below -- see test_cli_e2e.py's assertion
-# that doctor never sends a write/set command.
+# Commands doctor sends. All are queries (``?``) except the explicit
+# _DOCTOR_ALLOWED_EQUALS_COMMANDS allowlist below. Keeping this list query-only
+# prevents doctor from sending a write/set command.
 _DOCTOR_COMMANDS = (
     ("pkgver", "AT+GTPKGVER?"),
     ("dipcmode", "AT+GTDIPCMODE?"),

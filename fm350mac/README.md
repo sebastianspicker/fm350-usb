@@ -14,20 +14,18 @@ architecture, session flow and rationale.
 
 - `fm350mac` is a pure-Python program that talks to the FM350-GL's USB RNDIS interface directly (via libusb) and hands the packets to a macOS `utun` interface — no kernel extension, no DriverKit entitlement, no SIP change.
 - USB access itself needs no root. A small root helper, installed once as a background service, does only the part that does need root (creating the `utun` interface and setting routes/DNS), so the main program runs as you.
-- `probe` and the read-only commands (`status`, `doctor`, `at`) work against real hardware. The full data session (`up`) has code and unit-test coverage and has run successfully against an in-process fake modem (`--loopback`), but not yet against a real SIM.
+- `probe` and the read-only commands (`status`, `doctor`, `at`) work against real hardware. The full data session (`up`) has run successfully against an in-process fake modem (`--loopback`), but not yet against a real SIM.
 
 ## Status
 
 The [root README's status table](../README.md#status) has the project-wide picture; this section is the detail for `fm350mac` itself.
 
-Scaffold implemented and reviewed (2026-09-25): 101 unit tests pass, and
-`fm350mac probe` works against real hardware. The data path (`up`) has code
-and unit-test coverage but hasn't run live yet -- it needs a SIM and root
+`fm350mac probe` works against real hardware. The data path (`up`) hasn't run live yet -- it needs a SIM and root
 (or the helper, see below). `up --loopback`, which replaces the modem with
 an in-process fake, has run live successfully; see
 [`../docs/bench-log.md`](../docs/bench-log.md).
 
-Since then the suite has grown (`uv run pytest -q` collected **327 tests** on 2026-09-26, all passing). The sections below also cover `status --watch`, `doctor` and the privilege-separation helper.
+The sections below also cover `status --watch`, `doctor` and the privilege-separation helper.
 
 ## Requirements
 
@@ -80,7 +78,7 @@ uv run fm350mac async-selftest
 
 If `status` reports no cell at all, check the antenna pigtails before anything else — that was the cause on our own unit; see the [Dell guide's troubleshooting section](../docs/dell-dw5931e-usb.md#no-cells-at-all-cesq-all-99255-gtccinfo-empty) rather than repeating that story here.
 
-`doctor` reads the settings that matter on OEM modules and explains them: firmware image (`_5025` = Dell DW5931e), DIPC mode, FCC lock, `GTFMODE`, USB mode, RAT mode, antenna tuner, radio and SIM state, and whether any cell is measured. It prints one `[OK]`, `[WARN]` or `[INFO]` line per check and exits 1 if anything is a warning. It only sends read commands; a unit test enforces that.
+`doctor` reads the settings that matter on OEM modules and explains them: firmware image (`_5025` = Dell DW5931e), DIPC mode, FCC lock, `GTFMODE`, USB mode, RAT mode, antenna tuner, radio and SIM state, and whether any cell is measured. It prints one `[OK]`, `[WARN]` or `[INFO]` line per check and exits 1 if anything is a warning. It only sends read commands.
 
 Signal values are decoded per 3GPP TS 27.007, reporting the lower bound of each range the modem returns (the router's `fm350-status` uses the same convention).
 
@@ -207,7 +205,7 @@ EOF
 
 - The real data path (`up` against actual hardware) hasn't been run live
   yet -- we're waiting on a data SIM. Everything about it is verified either
-  by unit tests or by `up --loopback` against the in-process fake modem, not
+  by `up --loopback` against the in-process fake modem, not
   against the real FM350-GL.
 - Throughput hasn't been measured with `iperf3`; the ~150 Mbps async design
   target (see [`../docs/macos-driver.md`](../docs/macos-driver.md)) is an
@@ -219,53 +217,6 @@ EOF
   support, no kernel extension, no DriverKit dext.
 - DHCP on the FM350's RNDIS interface is unreliable; `fm350mac` always
   assigns the IP itself from `AT+CGPADDR` instead of relying on DHCP.
-
-## For contributors: Tests
-
-```sh
-cd fm350mac && uv run pytest -q
-```
-
-Tests are pure unit tests and fake-hardware end-to-end tests: RNDIS codec,
-Ethernet/ARP, AT response parsers, utun AF framing, netconfig dry-run,
-bridge threads with fake USB/utun, CLI argument validation, `cli.py` command
-functions with a scriptable fake AT port and fake RNDIS/utun, the loopback
-fake modem, and the reconnect supervisor — no USB or network access, no root,
-no real subprocess calls, no SIM needed.
-
-`usb_async.py`'s ctypes binding has its own tests: `test_usb_async_layout.py`
-compiles a small C program against the real `libusb.h` and checks
-`LibusbTransfer`'s field layout against it (skipped, with a reason, only if
-no C compiler or the header is missing); `test_usb_async_pool.py` exercises
-`AsyncEndpoint`/`EventLoop`'s transfer-lifetime state machine against a fake
-`Libusb` that records submit/cancel/free calls and lets tests fire a
-transfer's callback with any status; `test_async_bridge.py` covers
-`AsyncBridge`'s RX ordering, ARP replies and TX pool exhaustion the same
-way. None of these touch real hardware.
-
-`test_helper.py` covers the root helper (`helper/fm350mac_helper.py`) and
-its client (`helper_client.py`): request validation for every op (bad IPs,
-`0.0.0.0`, multicast, oversize messages, unknown ops/fields, a non-`/24`
-loopback host), the reverse-order teardown on disconnect, default-route
-capture/restore semantics, peer-uid rejection (with an injected credential
-lookup), `SCM_RIGHTS` fd passing over a `socket.socketpair()` (a pipe fd
-standing in for a real utun), and an end-to-end run of `cli.cmd_up
---loopback` against a real helper server on a background thread. `helper
-install|uninstall|status` are covered by `test_helper_admin.py`, entirely
-through `--dry-run`/injected `subprocess.run`/`launchctl` fakes -- no sudo,
-nothing under `/usr/local`, `/Library` or `/var/run` is ever touched.
-
-Because the helper file itself must run under the *system*
-`/usr/bin/python3` (3.9.6, `-I -S`), not this project's `.venv`:
-
-```sh
-tests/run_helper_tests_py39.sh
-```
-
-compiles it with `python3 -I -S -m py_compile` and runs a stdlib-`unittest`
-port of its core tests (`tests/helper_unittest_py39.py`) under that exact
-interpreter -- no pytest, no third-party imports, since `-I -S` gives it no
-access to site-packages.
 
 ## Glossary
 

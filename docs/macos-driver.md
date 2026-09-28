@@ -2,7 +2,7 @@
 
 Design notes for `fm350mac`, a user-space macOS data path for the Fibocom
 FM350-GL 5G modem: the architecture, the alternatives we rejected, and why.
-For the package itself (install, commands, tests), see
+For the package itself (install and commands), see
 [fm350mac/README.md](../fm350mac/README.md).
 
 This is a design record, written for the technically curious and for anyone
@@ -26,8 +26,8 @@ task-focused door in.
   throughput before the dongle goes on the Flint 2, and as an ad-hoc Mac
   uplink. The production failover path is still the router (see
   [setup-guide.md](setup-guide.md)).
-- Status (2026-09-25): the scaffold is implemented and reviewed. 101 unit
-  tests pass (327 by 2026-09-26) and `fm350mac probe` (USB enumeration + RNDIS init) works
+- Status (2026-09-25): the scaffold is implemented and reviewed.
+  `fm350mac probe` (USB enumeration + RNDIS init) works
   against real hardware. The actual data path (`up`) has **not run live
   yet** — it needs a SIM and root (or the root helper described below).
 - Biggest caveat: everything about live throughput, including the ~150 Mbps
@@ -151,7 +151,6 @@ fm350mac/                 Python ≥3.11 project, uv-managed (pyproject.toml)
     netconfig.py          ifconfig/route/scutil wrappers, dry-run capable, restore on exit
     bridge.py             rx/tx threads, stats, shutdown
     cli.py                `fm350mac probe|at|status|connect|up|down`
-  tests/                  pytest: rndis codec, ethernet/ARP, utun framing, netconfig dry-run
 ```
 
 `probe`, `at` and `status` need no root. `up` needs root (utun + routes).
@@ -193,7 +192,6 @@ running sync pyusb (packets can be reordered on RX).
 
 - `Libusb`: loads `libusb-1.0.dylib` via ctypes (same search order as today). Declares `argtypes`/`restype` for every function used: `libusb_init_context` (fallback `libusb_init`), `libusb_exit`, `libusb_get_device_list`/`free_device_list`, `libusb_get_device_descriptor`, `libusb_open`/`close`, `libusb_get_active_config_descriptor`/`free_config_descriptor` (endpoint discovery), `libusb_claim_interface`/`release_interface`, `libusb_clear_halt`, `libusb_reset_device`, `libusb_control_transfer`, `libusb_bulk_transfer`, `libusb_interrupt_transfer`, `libusb_alloc_transfer`/`free_transfer`/`submit_transfer`/`cancel_transfer`, `libusb_handle_events_timeout_completed`, `libusb_error_name`, `libusb_get_version`.
 - `LibusbTransfer(ctypes.Structure)` mirrors `struct libusb_transfer` field by field (`dev_handle`, `flags` u8, `endpoint` u8, `type` u8, `timeout` c_uint, `status` c_int, `length` c_int, `actual_length` c_int, `callback`, `user_data`, `buffer`, `num_iso_packets` c_int). ctypes natural alignment gives 64 bytes on LP64. `libusb_fill_bulk_transfer` is `static inline` in the header, so we fill the fields ourselves.
-- **Layout test:** `tests/test_usb_async_layout.py` compiles a small C program with `cc` against `/opt/homebrew/include/libusb-1.0/libusb.h` that prints `sizeof`/`offsetof` for every field, and compares them with `ctypes.sizeof`/`Field.offset`. It is skipped (with a reason) only if no compiler or header is present.
 - `UsbDevice`: one open handle per process, shared by the RNDIS ifaces (0/1) and the AT iface (6). Ctx-managed, releases claimed ifaces on close. It has sync helpers (`control_in/out`, `bulk_in/out`, `interrupt_in`) that map libusb errors to typed exceptions: `UsbTimeout`, `UsbNoDevice`, `UsbPipeError`, `UsbError(code, name)`.
 - `AsyncEndpoint`: a pool of N pre-allocated transfers plus buffers for one endpoint.
   - **Lifetime rules (a mistake here crashes a root process):** transfers, buffers and the single `CFUNCTYPE` callback object are allocated once and kept referenced in the pool until *every* transfer has reported a final status after cancel. Never free or resize a buffer while its transfer is in flight. `free_transfer` only after its callback ran with a non-resubmitted status. No `LIBUSB_TRANSFER_FREE_*` flags (Python owns the memory).
@@ -210,7 +208,6 @@ running sync pyusb (packets can be reordered on RX).
 
 ### Verification without a SIM
 
-- Unit tests: layout test; pool state machine with a fake `Libusb` that records submits/cancels and lets the test fire callbacks with each status (COMPLETED, TIMED_OUT, CANCELLED, NO_DEVICE, STALL); lifetime test that the pool frees nothing before all transfers retire; AsyncBridge RX ordering (callbacks in order → utun writes in order) and TX pool exhaustion → drops/stalls.
 - Live (read-only, no hammering): `fm350mac async-selftest`:
   1. open, claim 0/1, RNDIS init, 8 RX transfers pending for 3 s (expect 0 frames), cancel → all 8 retire as CANCELLED, no leaks/crash;
   2. submit 5 ARP frames on the async OUT pool, expect 3 COMPLETED and 2 TIMED_OUT (the known no-bearer queue of 3);
@@ -245,7 +242,6 @@ running sync pyusb (packets can be reordered on RX).
 - Commands run with fixed argv lists via absolute paths (`/sbin/ifconfig`, `/sbin/route`, `/usr/sbin/scutil`), with a minimal environment and no shell.
 - **Main process:** `HelperClient` implements the existing `Utun` + `NetConfig` interfaces over the socket, so cli/bridge/supervisor don't change. `up` no longer needs root when the helper is installed. `--no-helper` keeps the current sudo mode as a fallback.
 - **Install/uninstall** (run these with sudo; they print every step first and have `--dry-run`): `fm350mac helper install` copies the helper file, writes `/Library/LaunchDaemons/de.fm350mac.helper.plist` (root:wheel 0644, `ProgramArguments = [/usr/bin/python3, -I, -S, /usr/local/libexec/fm350mac-helper, --allowed-uid, <uid>]`), then `launchctl bootstrap system …`. `helper uninstall` reverses it. `helper status` shows whether it's loaded and reachable.
-- **Tests:** the helper's request validation and state machine are unit-tested with a fake command runner, **also executed under `/usr/bin/python3` (3.9)**. The fd passing is tested with a socketpair and a pipe fd. Client/helper end to end runs in-process with the fake runner. The only live root step is running `helper install` and then `up --loopback` without sudo.
 
 This design has since run live end to end — see the [bench log's privilege
 separation entry](bench-log.md), which found no gaps beyond what's listed
@@ -257,8 +253,8 @@ from a user's point of view.
 ## What's not proven yet
 
 - The real data path (`up` against the actual FM350-GL) has not run live —
-  it needs a SIM. Everything about it so far is either unit-tested or
-  exercised through `up --loopback` against the in-process fake modem, not
+  it needs a SIM. So far it has been exercised through `up --loopback`
+  against the in-process fake modem, not
   the real device [fm350mac README, Limitations].
 - The async I/O rewrite's whole point — higher throughput than the ~9 k
   pkt/s / ~100 Mbps synchronous ceiling — has not been measured; only the

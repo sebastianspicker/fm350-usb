@@ -1,8 +1,7 @@
 <!doctype html>
 <!-- GitHub Pages demo for fm350-usb.
      Served from main:/docs (Settings -> Pages -> Deploy from a branch ->
-     main -> /docs). Screenshots are real command output; run
-     `python3 tools/screenshots.py` to regenerate them. -->
+     main -> /docs). Screenshots record redacted command output. -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -290,11 +289,7 @@
     <p class="lede">
       Every image below is real command output, redacted (IMEI/IMSI/ICCID/serial
       numbers, the serving cell's TAC and cell ID, and any MAC address that
-      isn't the FM350-GL's well-known placeholder) and rendered to SVG by
-      <a href="https://github.com/sebastianspicker/fm350-usb/blob/main/tools/screenshots.py">tools/screenshots.py</a>.
-      The three modem shots only regenerate when the modem is actually
-      plugged in; the others need Docker or QEMU. Regenerate any time with
-      <code>python3 tools/screenshots.py</code>.
+      isn't the FM350-GL's well-known placeholder) and preserved as SVG.
     </p>
     <div class="shots">
       <figure class="shot">
@@ -322,8 +317,8 @@
         <figcaption><code>openwrt/install.sh --apn internet.example --dry-run</code> — every <code>uci</code> command it would run, changing nothing (captured inside the OpenWrt Docker test image).</figcaption>
       </figure>
       <figure class="shot">
-        <img src="assets/screenshots/qemu-failover-summary.svg" alt="qemu-failover-test.sh summary showing baseline, failover, failback, and both-down assertions all passing" loading="lazy">
-        <figcaption><code>openwrt/tests/qemu-failover-test.sh</code> — the end-to-end failover test in QEMU: baseline, failover, failback, and both-uplinks-down, all passing.</figcaption>
+        <img src="assets/screenshots/qemu-failover-summary.svg" alt="OpenWrt QEMU failover validation showing baseline, failover, failback, and both-down outcomes" loading="lazy">
+        <figcaption>OpenWrt failover validation in QEMU: baseline, failover, failback, and both-uplinks-down.</figcaption>
       </figure>
     </div>
   </div>
@@ -356,7 +351,7 @@
         <button id="foBtnUpstream" class="warn">Upstream dead (link up)</button>
         <button id="foBtnRestore" class="ok" disabled>Restore</button>
       </div>
-      <p class="note">Simulation using timings measured in the QEMU test (<code>openwrt/tests/qemu-failover-test.sh</code>), not a live router: link-down failover 5 s / failback 4 s, upstream-dead failover 13 s / failback 16 s. Cutting the second uplink while already on backup shows the "both down" case mwan3 calls <code>unreachable</code>.</p>
+      <p class="note">Simulation using timings measured in OpenWrt QEMU validation, not a live router: link-down failover 5 s / failback 4 s, upstream-dead failover 13 s / failback 16 s. Cutting the second uplink while already on backup shows the "both down" case mwan3 calls <code>unreachable</code>.</p>
     </div>
 
     <div class="demo">
@@ -392,7 +387,7 @@
       <a href="https://github.com/sebastianspicker/fm350-usb#readme">README</a> ·
       <a href="https://github.com/sebastianspicker/fm350-usb/blob/main/LICENSE">MIT license</a>
     </span>
-    <span>Independent project, not affiliated with Fibocom, Dell, or GL.iNet. Screenshots: <code>python3 tools/screenshots.py</code></span>
+    <span>Independent project, not affiliated with Fibocom, Dell, or GL.iNet.</span>
   </div>
 </footer>
 

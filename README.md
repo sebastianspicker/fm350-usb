@@ -41,7 +41,7 @@ We tested this on one module on 2026-09-25.
 | USB 3 enumeration through the adapter, AT access, ADB | Verified on hardware |
 | SIM detection, LTE registration (Vodafone DE, band 1) | Verified on hardware |
 | Router scripts (install, uninstall, failover, failback) | Verified in Docker, a modem emulator, and OpenWrt 24.10.8 under QEMU |
-| `fm350mac` data path | Verified in loopback mode (fake modem); 327 unit tests (2026-09-26) |
+| `fm350mac` data path | Verified in loopback mode (fake modem) |
 | Cellular data session, throughput | **Not tested yet** (waiting for a data SIM) |
 | 5G NR | The cell offers EN-DC (5G NSA) and the modem measures an NR carrier; no NR data yet |
 
@@ -61,7 +61,7 @@ cd /root/openwrt
 
 This installs the FM350 protocol handler (mrhaav's `atc`, or modemfeed's `xmm` with `--proto xmm`), adds a `wwan` interface, and sets up an `mwan3` failover policy. It keeps your existing mwan3 settings: the stock catch-all rules get pointed at the failover policy, and `uninstall.sh` puts them back. It also installs a small watchdog that restarts `wwan` if the protocol handler gets stuck (a known `atc.sh` bug); `--no-watchdog` skips it. `fm350-status` shows decoded signal and cell info on the router.
 
-In the QEMU test, traffic moved to the modem 5 s after the wired link dropped and came back 4 s after it returned. When the link stayed up but the upstream died, it took 13 s and 16 s — the [openwrt README](openwrt/README.md#failover-end-to-end-testsqemu-failover-testsh) gives a tighter bound of 12–13 s for the same test; the difference is rounding, not a second measurement.
+In QEMU validation, traffic moved to the backup uplink 5 s after the wired link dropped and came back 4 s after it returned. When the link stayed up but the upstream died, it took 12–13 s to fail over and 16 s to fail back; see the [OpenWrt validation notes](openwrt/README.md#failover-validation).
 
 We built it for a GL.iNet Flint 2 (GL-MT6000). Nothing in it is specific to that router, but we haven't tried it on others. GL.iNet's stock firmware doesn't recognise the FM350; see [docs/compatibility-and-risks.md](docs/compatibility-and-risks.md). Full walkthrough: [docs/setup-guide.md](docs/setup-guide.md).
 
@@ -102,7 +102,7 @@ Stage 0 only reads. Stages 1–3 repeat the changes we made while debugging our 
 
 ## Screenshot tour
 
-Every image is real output from our bench, rendered to SVG by [`tools/screenshots.py`](tools/screenshots.py). IMEI, IMSI, ICCID, serial number, and the serving cell's ID and TAC are redacted.
+Every image records or summarizes real output from our bench or OpenWrt validation. IMEI, IMSI, ICCID, serial number, and the serving cell's ID and TAC are redacted.
 
 **`fm350mac status --redact`**: SIM, registration, operator and access technology (here LTE with 5G NSA), serving cell with signal strength, the NR carrier, neighbour cells by band.
 
@@ -124,7 +124,7 @@ Every image is real output from our bench, rendered to SVG by [`tools/screenshot
 
 ![install.sh dry run](docs/assets/screenshots/install-dry-run.svg)
 
-**`qemu-failover-test.sh`**: OpenWrt 24.10.8 under QEMU with real mwan3. It fails over when the wired link drops or the upstream dies, fails back, and handles both links down.
+**OpenWrt failover validation (edited output summary):** OpenWrt 24.10.8 under QEMU with real mwan3. It fails over when the wired link drops or the upstream dies, fails back, and handles both links down.
 
 ![QEMU failover test](docs/assets/screenshots/qemu-failover-summary.svg)
 
@@ -158,18 +158,6 @@ Specs, power budget and band support are in [docs/hardware.md](docs/hardware.md)
 | [docs/bench-log.md](docs/bench-log.md) | Dated lab notes with every measurement |
 | [docs/sources.md](docs/sources.md) | References |
 | [docs/glossary.md](docs/glossary.md) | Plain-language definitions of every technical term used in these docs |
-
-## Development
-
-```sh
-cd fm350mac && uv run pytest -q && uvx ruff check .     # macOS driver
-shellcheck openwrt/*.sh openwrt/tests/*.sh               # router scripts
-tools/tests/bench-throughput-test.sh                     # benchmark failure handling (no hardware)
-openwrt/tests/docker-test.sh                             # install/uninstall in an OpenWrt rootfs (Docker)
-openwrt/tests/atc-test.sh                                # protocol handler against a fake FM350
-openwrt/tests/qemu-failover-test.sh                      # real mwan3 failover in OpenWrt under QEMU
-python3 tools/screenshots.py                             # regenerate the README screenshots
-```
 
 ## Not affiliated
 

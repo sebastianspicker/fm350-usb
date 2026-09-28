@@ -139,8 +139,8 @@ def _plist_xml(allowed_uid: int, install_path: Path) -> str:
 def _check_dir_safe(path: Path, expected_uid: int = 0) -> Optional[str]:
     """Check ``path`` and every existing ancestor of it: each must be a
     real directory, not a symlink, owned by ``expected_uid`` (always 0/root
-    in production; tests pass their own uid to exercise this without being
-    root), and not writable by group or other. Components that don't exist
+    for a normal installation), and not writable by group or other. Components
+    that don't exist
     yet are fine (they'll be created, ``expected_uid``:wheel 0755, by
     ``_ensure_dir_tree`` -- see that function's docstring for why only those
     are ever touched). Returns an error message, or None if everything
@@ -149,7 +149,7 @@ def _check_dir_safe(path: Path, expected_uid: int = 0) -> Optional[str]:
     # The filesystem root itself is always uid-0-owned regardless of who
     # everything under it is meant to belong to, and nothing can ever change
     # that -- checking it against `expected_uid` would always fail for a
-    # non-root `expected_uid` (only ever used in tests) for no safety
+    # non-root `expected_uid` for no safety
     # benefit, so it's excluded; every other ancestor is still checked.
     ancestors = [p for p in reversed(path.parents) if p != Path(p.anchor)] + [path]
     for ancestor in ancestors:
@@ -185,8 +185,7 @@ def _check_leaf_safe(path: Path) -> Optional[str]:
 
 def _ensure_dir_tree(path: Path, uid: int = 0, gid: int = 0) -> None:
     """Create ``path`` and any missing parents, owned ``uid``:``gid`` (always
-    root:wheel in production; tests inject their own uid/gid, since chowning
-    to root needs real root). Only components that don't already exist are
+    root:wheel by default). Only components that don't already exist are
     created or touched; an existing ancestor (e.g. a Homebrew-owned
     ``/usr/local`` on Intel Macs) is never chowned/chmoded here --
     ``_check_dir_safe(path)`` must have already verified every existing
@@ -205,7 +204,7 @@ def _ensure_dir_tree(path: Path, uid: int = 0, gid: int = 0) -> None:
 
 def _write_root_file(dest: Path, data: bytes, mode: int, uid: int = 0, gid: int = 0) -> None:
     """Atomically install ``data`` as ``dest``, owned ``uid``:``gid`` (always
-    root:wheel in production; tests inject their own uid/gid) with ``mode``:
+    root:wheel by default) with ``mode``:
     written into a private temp file in the same directory first
     (``O_EXCL|O_NOFOLLOW``, created 0600 so nothing else can open it while
     it's being written), ``fsync``ed, given its final owner/mode while it
@@ -288,15 +287,12 @@ def cmd_helper_install(
     a real install would be refused).
 
     ``install_dir``/``install_path``/``plist_path`` default to the real
-    system paths; tests point them at a temporary root instead.
-    ``owner_uid``/``owner_gid`` (tests only -- production is always root:wheel,
-    the default) control both what the safety checks require existing
+    system paths. ``owner_uid``/``owner_gid`` default to root:wheel and
+    control both what the safety checks require existing
     ancestors to be owned by, and what gets chowned into the destinations,
     since actually chowning to root needs real root.
-    ``after_source_read_hook`` (tests only) runs right after the helper
-    source is read, before it's compiled/installed -- used to prove that
-    mutating the source file afterwards has no effect on what gets
-    installed.
+    ``after_source_read_hook`` runs after reading the helper source and
+    before compiling and installing those same bytes.
     """
     install_dir = Path(install_dir) if install_dir is not None else INSTALL_DIR
     install_path = Path(install_path) if install_path is not None else (install_dir / "fm350mac-helper")

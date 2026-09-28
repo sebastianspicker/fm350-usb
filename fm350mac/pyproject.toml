@@ -15,11 +15,6 @@ Issues = "https://github.com/sebastianspicker/fm350-usb/issues"
 [project.scripts]
 fm350mac = "fm350mac.cli:main"
 
-[dependency-groups]
-dev = [
-    "pytest>=8.0",
-]
-
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
