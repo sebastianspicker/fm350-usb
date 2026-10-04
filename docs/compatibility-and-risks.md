@@ -66,7 +66,7 @@ The module firmware can be updated with SP Flash Tool (MediaTek's Windows progra
 
 ## Known behaviour of the `atc` protocol handler (tested against a fake modem, 2026-09-25)
 
-Found by `openwrt/tests/atc-test.sh` (atc-fib-fm350_gl 2025.08.24-r3):
+Found against a fake modem (atc-fib-fm350_gl 2025.08.24-r3):
 
 - No SIM: fails fast and cleanly (`SIM not inserted`, restart blocked). It does not loop.
 - `AT+CGACT` errors: only `+CME ERROR: Requested service option not subscribed (#33)` is treated as fatal. Any other `+CME ERROR` during activation is ignored, and the `atc` protocol handler (the OpenWrt add-on that dials the modem) then waits forever for URCs (unsolicited status messages from the modem) that never arrive. `wwan` stays "connecting" and never goes online in mwan3 (OpenWrt's multi-WAN package that does the switching), so failover would silently be unavailable. If this happens on the bench, `ifup wwan` restarts it. The repo now includes a watchdog service, `fm350-watchdog`, that does exactly this automatically after a 180 s threshold — see [openwrt/README.md, fm350-watchdog: recovering a stuck `wwan`](../openwrt/README.md#fm350-watchdog-recovering-a-stuck-wwan) [openwrt README, fm350-watchdog].

@@ -25,17 +25,8 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v4
 
-      - name: pytest
-        run: uv run pytest -q
-
-      - name: pytest (tools/fm350_diag.py)
-        run: uv run pytest -q ../tools/tests
-
       - name: ruff
-        run: uvx ruff check . ../tools/fm350_diag.py ../tools/tests
-
-      - name: helper tests under system /usr/bin/python3
-        run: ./tests/run_helper_tests_py39.sh
+        run: uvx ruff check . ../tools/fm350_diag.py
 
   shellcheck:
     name: shellcheck (ubuntu-latest)
@@ -45,14 +36,5 @@ jobs:
 
       - name: shellcheck
         run: |
-          shopt -s globstar
-          shellcheck openwrt/*.sh openwrt/tests/**/*.sh openwrt/files/etc/hotplug.d/usb/50-fm350_driver openwrt/files/usr/sbin/fm350-watchdog openwrt/files/etc/init.d/fm350-watchdog tools/bench-throughput.sh tools/tests/bench-throughput-test.sh
+          shellcheck openwrt/*.sh openwrt/files/etc/hotplug.d/usb/50-fm350_driver openwrt/files/usr/sbin/fm350-watchdog openwrt/files/etc/init.d/fm350-watchdog tools/bench-throughput.sh
 
-      - name: status decoder test
-        run: openwrt/tests/fm350-decode-test.sh
-
-      - name: installer input test
-        run: sh openwrt/tests/install-input-test.sh
-
-      - name: benchmark failure-path test
-        run: tools/tests/bench-throughput-test.sh

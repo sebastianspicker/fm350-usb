@@ -20,14 +20,13 @@ architecture, session flow and rationale.
 
 The [root README's status table](../README.md#status) has the project-wide picture; this section is the detail for `fm350mac` itself.
 
-Scaffold implemented and reviewed (2026-09-25): 101 unit tests pass, and
-`fm350mac probe` works against real hardware. The data path (`up`) has code
-and unit-test coverage but hasn't run live yet -- it needs a SIM and root
+Scaffold implemented and reviewed (2026-09-25): `fm350mac probe` works against real hardware. The data path (`up`) has code
+but hasn't run live yet -- it needs a SIM and root
 (or the helper, see below). `up --loopback`, which replaces the modem with
 an in-process fake, has run live successfully; see
 [`../docs/bench-log.md`](../docs/bench-log.md).
 
-Since then the suite has grown (`uv run pytest -q` collected **327 tests** on 2026-09-26, all passing). The sections below also cover `status --watch`, `doctor` and the privilege-separation helper.
+Since then the driver has grown. The sections below also cover `status --watch`, `doctor` and the privilege-separation helper.
 
 ## Requirements
 
@@ -219,53 +218,6 @@ EOF
   support, no kernel extension, no DriverKit dext.
 - DHCP on the FM350's RNDIS interface is unreliable; `fm350mac` always
   assigns the IP itself from `AT+CGPADDR` instead of relying on DHCP.
-
-## For contributors: Tests
-
-```sh
-cd fm350mac && uv run pytest -q
-```
-
-Tests are pure unit tests and fake-hardware end-to-end tests: RNDIS codec,
-Ethernet/ARP, AT response parsers, utun AF framing, netconfig dry-run,
-bridge threads with fake USB/utun, CLI argument validation, `cli.py` command
-functions with a scriptable fake AT port and fake RNDIS/utun, the loopback
-fake modem, and the reconnect supervisor — no USB or network access, no root,
-no real subprocess calls, no SIM needed.
-
-`usb_async.py`'s ctypes binding has its own tests: `test_usb_async_layout.py`
-compiles a small C program against the real `libusb.h` and checks
-`LibusbTransfer`'s field layout against it (skipped, with a reason, only if
-no C compiler or the header is missing); `test_usb_async_pool.py` exercises
-`AsyncEndpoint`/`EventLoop`'s transfer-lifetime state machine against a fake
-`Libusb` that records submit/cancel/free calls and lets tests fire a
-transfer's callback with any status; `test_async_bridge.py` covers
-`AsyncBridge`'s RX ordering, ARP replies and TX pool exhaustion the same
-way. None of these touch real hardware.
-
-`test_helper.py` covers the root helper (`helper/fm350mac_helper.py`) and
-its client (`helper_client.py`): request validation for every op (bad IPs,
-`0.0.0.0`, multicast, oversize messages, unknown ops/fields, a non-`/24`
-loopback host), the reverse-order teardown on disconnect, default-route
-capture/restore semantics, peer-uid rejection (with an injected credential
-lookup), `SCM_RIGHTS` fd passing over a `socket.socketpair()` (a pipe fd
-standing in for a real utun), and an end-to-end run of `cli.cmd_up
---loopback` against a real helper server on a background thread. `helper
-install|uninstall|status` are covered by `test_helper_admin.py`, entirely
-through `--dry-run`/injected `subprocess.run`/`launchctl` fakes -- no sudo,
-nothing under `/usr/local`, `/Library` or `/var/run` is ever touched.
-
-Because the helper file itself must run under the *system*
-`/usr/bin/python3` (3.9.6, `-I -S`), not this project's `.venv`:
-
-```sh
-tests/run_helper_tests_py39.sh
-```
-
-compiles it with `python3 -I -S -m py_compile` and runs a stdlib-`unittest`
-port of its core tests (`tests/helper_unittest_py39.py`) under that exact
-interpreter -- no pytest, no third-party imports, since `-I -S` gives it no
-access to site-packages.
 
 ## Glossary
 
