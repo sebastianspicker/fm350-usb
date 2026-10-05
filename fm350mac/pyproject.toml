@@ -1,16 +1,31 @@
 [project]
 name = "fm350mac"
-version = "0.1.0"
+dynamic = ["version"]
 description = "User-space macOS data path for a Fibocom FM350-GL 5G modem (USB RNDIS -> utun)"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Sebastian Spicker" }]
+keywords = ["fm350", "fm350-gl", "dw5931e", "5g", "modem", "rndis", "libusb", "utun", "macos"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Networking",
+]
 dependencies = []
 
 [project.urls]
 Homepage = "https://github.com/sebastianspicker/fm350-usb"
-Documentation = "https://github.com/sebastianspicker/fm350-usb/tree/main/fm350mac#readme"
+Documentation = "https://github.com/sebastianspicker/fm350-usb/tree/v0.1.0a1/fm350mac#readme"
 Issues = "https://github.com/sebastianspicker/fm350-usb/issues"
+Changelog = "https://github.com/sebastianspicker/fm350-usb/blob/v0.1.0a1/CHANGELOG.md"
 
 [project.scripts]
 fm350mac = "fm350mac.cli:main"
@@ -18,14 +33,23 @@ fm350mac = "fm350mac.cli:main"
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+    "ruff",
 ]
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.32.4"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/fm350mac/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/fm350mac"]
+
+# The test suites are kept local (not tracked); never ship them in an sdist
+# built from a working copy that has them.
+[tool.hatch.build.targets.sdist]
+exclude = ["/tests"]
 
 [tool.ruff]
 line-length = 120

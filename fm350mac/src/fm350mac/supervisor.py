@@ -32,6 +32,12 @@ STABLE_RESET_S = 600.0
 TICK_S = 1.0
 MIN_EARLY_POLL_SPACING_S = 5.0  # min gap between a poll and a tx-stall-triggered early poll
 AT_TIMEOUT_S = 10.0  # per-command AT timeout (AtPort's default is 240 s)
+# Data-path stall detection while CONNECTED: the modem keeps refusing OUT
+# transfers (at least STALL_MIN_TX_TIMEOUTS new tx_timeouts) while rx stays
+# flat for this long. Sent-but-unanswered traffic alone (a host that drops
+# ICMP, SYN retries, one-way UDP) is not a stall: the modem took it.
+STALL_WINDOW_S = 60.0
+STALL_MIN_TX_TIMEOUTS = 20
 
 
 class State(Enum):
@@ -51,6 +57,7 @@ class SupervisorStats:
     at_errors: int = 0
     reconnects: int = 0
     ip_changes: int = 0
+    stalls: int = 0  # data-path stalls detected while CONNECTED (see STALL_WINDOW_S)
 
 
 class Supervisor:
@@ -76,6 +83,8 @@ class Supervisor:
         tick: float = TICK_S,
         min_early_poll_spacing: float = MIN_EARLY_POLL_SPACING_S,
         at_timeout: float = AT_TIMEOUT_S,
+        stall_window: float = STALL_WINDOW_S,
+        stall_min_tx_timeouts: int = STALL_MIN_TX_TIMEOUTS,
         refresh_dns=None,
         time_source=time.monotonic,
         sleep=time.sleep,
@@ -92,6 +101,8 @@ class Supervisor:
         self.tick = tick
         self.min_early_poll_spacing = min_early_poll_spacing
         self.at_timeout = at_timeout
+        self.stall_window = stall_window
+        self.stall_min_tx_timeouts = stall_min_tx_timeouts
         # Optional ``refresh_dns(new_ip)`` callback, called after an IP change
         # so the caller can re-query/re-apply DNS (the supervisor itself only
         # reconfigures the interface address).
@@ -103,11 +114,20 @@ class Supervisor:
         self.stats = SupervisorStats()
         self.current_ip: str | None = initial_ip
         self.failure_reason: str | None = None
+        # True if this supervisor itself failed the bridge over a data-path
+        # stall (see _check_stall): ``up`` rebuilds without counting that
+        # toward its cap on RNDIS-level rebuilds.
+        self.stall_failure = False
         self._backoff = backoff_initial
         self._connected_since: float | None = self._time()
         self._last_tx_timeouts = bridge.stats.tx_timeouts
         self._last_poll_time = self._time()
         self._stop = threading.Event()
+        # Stall window baseline: (since, rx_packets, tx_timeouts) at its
+        # start, or None while not CONNECTED. _stall_cycled: the PDP context
+        # was already cycled once for the current stall.
+        self._stall_baseline: tuple[float, int, int] | None = None
+        self._stall_cycled = False
 
     def stop(self) -> None:
         """Ask ``run()`` to exit at the next opportunity."""
@@ -171,6 +191,8 @@ class Supervisor:
             self._step_connected(registered)
         else:
             self._step_disconnected(registered)
+        if self.state != State.CONNECTED:
+            self._stall_baseline = None  # an outage is not a stall; start afresh once connected
 
     def _step_connected(self, registered: bool) -> None:
         if not registered:
@@ -188,6 +210,64 @@ class Supervisor:
             return
         self._note_ip(ip)
         self._maybe_reset_backoff()
+        self._check_stall()
+
+    def _check_stall(self) -> None:
+        """Catch a session that reports CONNECTED but no longer passes
+        traffic: the modem refuses OUT transfers (``tx_timeouts`` grows by
+        at least ``stall_min_tx_timeouts``) while rx stays flat for
+        ``stall_window``. The first time, cycle the PDP context; if it's
+        still stalled after that, fail the bridge so ``up`` rebuilds the
+        whole session. Packets the modem accepted but nobody answered
+        (``tx_packets`` growth alone) are not a stall, and neither is an
+        idle session. A window that passes without a stall, or rx flowing
+        again, ends the current stall.
+        """
+        stats = self.bridge.stats
+        rx = stats.rx_packets
+        tx_timeouts = stats.tx_timeouts
+        now = self._time()
+        if self._stall_baseline is None:
+            self._stall_baseline = (now, rx, tx_timeouts)
+            return
+        since, rx0, tx_timeouts0 = self._stall_baseline
+        if rx != rx0:
+            self._stall_baseline = (now, rx, tx_timeouts)
+            self._stall_cycled = False  # traffic flows again
+            return
+        if now - since < self.stall_window:
+            return
+        self._stall_baseline = (now, rx, tx_timeouts)
+        refused = tx_timeouts - tx_timeouts0
+        if refused < self.stall_min_tx_timeouts:
+            self._stall_cycled = False  # idle or merely unanswered: no stall in this window
+            return
+        self.stats.stalls += 1
+        detail = f"{refused} tx timeouts while rx stayed at {rx} for {now - since:.0f}s"
+        if self._stall_cycled:
+            reason = f"data path stalled ({detail}) even after cycling the PDP context"
+            _log.error("%s; failing the bridge to force a rebuild", reason)
+            self.stall_failure = True
+            self._fail_bridge(reason)
+            return
+        _log.warning("data path stalled (%s); cycling the PDP context once", detail)
+        self._stall_cycled = True
+        if not self._deactivate_activate():
+            self.state = State.LOST
+            self._connected_since = None
+            return
+        _answered, ip = self._poll_ip()
+        if ip is None:
+            self.state = State.LOST
+            self._connected_since = None
+            return
+        self._note_ip(ip)
+
+    def _fail_bridge(self, reason: str) -> None:
+        # AsyncBridge.fail() is public; the frozen sync Bridge only has
+        # _mark_failed(), which does the same.
+        fail = getattr(self.bridge, "fail", None) or getattr(self.bridge, "_mark_failed")
+        fail(reason)
 
     def _step_disconnected(self, registered: bool) -> None:
         if not registered:
@@ -230,6 +310,11 @@ class Supervisor:
 
     # --- AT helpers (all defensive: never raise, just count errors) ------
 
+    def _command(self, cmd: str, timeout: float) -> str:
+        # stop() aborts an in-flight command (e.g. a 60 s CGACT mid-reconnect)
+        # within one AT read instead of after its full timeout.
+        return self.at_port.command(cmd, timeout=timeout, stop_event=self._stop)
+
     def _poll_registration(self) -> bool | None:
         """Poll both CEREG (LTE) and C5GREG (NR) and report whether either
         one says registered.
@@ -244,8 +329,8 @@ class Supervisor:
         response parses.
         """
         try:
-            cereg_stat = at_mod.parse_registration(self.at_port.command("AT+CEREG?", timeout=self.at_timeout))
-            c5greg_stat = at_mod.parse_registration(self.at_port.command("AT+C5GREG?", timeout=self.at_timeout))
+            cereg_stat = at_mod.parse_registration(self._command("AT+CEREG?", self.at_timeout))
+            c5greg_stat = at_mod.parse_registration(self._command("AT+C5GREG?", self.at_timeout))
         except TimeoutError:
             self.stats.at_errors += 1
             _log.warning("registration poll timed out")
@@ -267,7 +352,7 @@ class Supervisor:
         """
         try:
             # at_mod.ip_address() takes no timeout, so do what it does here.
-            resp = self.at_port.command(f"AT+CGPADDR={self.cid}", timeout=self.at_timeout)
+            resp = self._command(f"AT+CGPADDR={self.cid}", self.at_timeout)
             return True, at_mod.valid_assigned_ipv4(at_mod.parse_cgpaddr(resp))
         except TimeoutError:
             self.stats.at_errors += 1
@@ -280,8 +365,8 @@ class Supervisor:
 
     def _deactivate_activate(self) -> bool:
         try:
-            self.at_port.command(f"AT+CGACT=0,{self.cid}", timeout=at_mod.ACTIVATE_TIMEOUT_S)
-            resp = self.at_port.command(f"AT+CGACT=1,{self.cid}", timeout=at_mod.ACTIVATE_TIMEOUT_S)
+            self._command(f"AT+CGACT=0,{self.cid}", at_mod.ACTIVATE_TIMEOUT_S)
+            resp = self._command(f"AT+CGACT=1,{self.cid}", at_mod.ACTIVATE_TIMEOUT_S)
         except TimeoutError:
             self.stats.at_errors += 1
             _log.warning("CGACT during reconnect timed out")

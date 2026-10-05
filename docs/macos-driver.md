@@ -2,7 +2,7 @@
 
 Design notes for `fm350mac`, a user-space macOS data path for the Fibocom
 FM350-GL 5G modem: the architecture, the alternatives we rejected, and why.
-For the package itself (install, commands, tests), see
+For the package itself (install, commands), see
 [fm350mac/README.md](../fm350mac/README.md).
 
 This is a design record, written for the technically curious and for anyone
@@ -20,19 +20,14 @@ task-focused door in.
   (the same kind of virtual network device VPNs use), doing the
   Ethernet‑framing and ARP work ourselves in user space. No kernel
   extension, no DriverKit entitlement, no SIP changes.
-- Goal: IP connectivity from the FM350-GL on macOS (Apple Silicon, macOS 27)
+- Goal: IP connectivity from the FM350-GL on macOS (developed on Apple Silicon, macOS 27)
   without third-party drivers, kernel extensions or SIP changes, using only
   code in this repo. Main use: bench-testing SIM, registration and
   throughput before the dongle goes on the Flint 2, and as an ad-hoc Mac
   uplink. The production failover path is still the router (see
   [setup-guide.md](setup-guide.md)).
-- Status (2026-09-25): the scaffold is implemented and reviewed. 101 unit
-  tests pass (327 by 2026-09-26) and `fm350mac probe` (USB enumeration + RNDIS init) works
-  against real hardware. The actual data path (`up`) has **not run live
-  yet** — it needs a SIM and root (or the root helper described below).
-- Biggest caveat: everything about live throughput, including the ~150 Mbps
-  figure used below as a design threshold, is an estimate, not a
-  measurement.
+- Status (release 0.1.0a1, alpha): verified on hardware on 2026-10-05 (FM350-GL / Dell DW5931e, Telekom DE SIM, LTE B3/B7, macOS 27, Apple Silicon): USB enumeration, AT, `status`/`doctor`/`probe`, `up --route-host` (ping, HTTPS, capped `iperf3`), `helper install`/`helper status`, clean teardown, a 10-minute idle soak, automatic recovery after unplug/replug (57 s) and 50 MB transfers (42.1 Mbit/s down, 34.7 Mbit/s up). Not verified on hardware: `--default-route`, `--dns`, sessions longer than 10 minutes, the keepalive watchdog and stall detection actually firing, rebuild retry after a failed bring-up, the RNDIS-level rebuild, and Intel Macs. Not supported: IPv6 (IPv4 only) and more than one modem. See "What's not proven yet".
+- Biggest caveat: live throughput has only been measured in short, capped runs on a weak cell (roughly 10-20 Mbit/s down, 7-15 Mbit/s up, driver CPU 3-8%). That is a radio-limited figure, not a capacity figure.
 
 ## Facts measured on this Mac
 
@@ -82,106 +77,111 @@ possible piece of the job.
            macOS IP stack  (routes, DNS via scutil)
                  │  IP packets (4-byte AF header)
            ┌─────┴──────┐
-           │  utunN     │  utun.py  – PF_SYSTEM socket, point-to-point
-           └─────┬──────┘
-   tx thread ▲   │ ▼  rx thread                 bridge.py
+           │  utunN     │  utun.py  – PF_SYSTEM socket, point-to-point, read non-blocking
+           └─────┬──────┘                (created by the root helper, fd passed to us)
+   tx thread ▲   │ ▼  EventLoop thread          async_bridge.py (--io async)
            ┌─────┴──────┐
            │ L2 shim    │  ethernet.py – add/strip Ethernet, learn peer MAC,
            │            │               answer ARP for our IP, drop non-IP
            └─────┬──────┘
            ┌─────┴──────┐
-           │ RNDIS      │  rndis.py (pure codec) + rndis_device.py (init/query/set/halt,
-           │            │               keepalive, PACKET_MSG framing)
+           │ RNDIS      │  rndis.py (pure codec) + rndis_device.py (init/query/set/halt)
+           │            │               PACKET_MSG framing, keepalive
            └─────┬──────┘
            ┌─────┴──────┐
-           │ USB (libusb│  usb_transport.py – claim ifaces 0/1, ctrl encapsulated
-           │  via pyusb)│               cmd/resp, interrupt notify, bulk in/out
+           │ libusb     │  usb_async.py – our own ctypes binding: transfer pools,
+           │ (ctypes)   │               event loop, claim ifaces 0/1/6, control + bulk + interrupt
            └─────┬──────┘
                  │                    control plane: at.py on iface 6
                FM350  ◄────────────── CGDCONT / CGACT / CGPADDR / GTDNS
+
+   Root helper (separate process, LaunchDaemon):  creates the utun, sets address/routes/DNS
+   on request over a Unix socket, undoes everything when the connection closes.
+   Supervisor (supervisor.py): polls registration/PDP state, detects stalls, reconnects.
 ```
 
-> **Note (stale text, C2):** the bottom box above still reads "USB (libusb
-> via pyusb)". That reflects the original scaffold. pyusb has since been
-> replaced everywhere by our own ctypes binding to libusb, `usb_async.py`
-> (see "Async USB I/O" below) — the [fm350mac README](../fm350mac/README.md)
-> is explicit that the current code uses "our own ctypes binding
-> (`usb_async.py`) -- no pyusb". The rest of the diagram (RNDIS, the L2 shim,
-> utun) is unchanged by that rewrite.
+The pieces, in the order a packet or a failure meets them:
 
-### Session flow (`sudo fm350mac up --apn <apn>`)
+- **Root helper.** The only part that runs as root. It creates the `utun`, hands its file descriptor to the unprivileged process and applies address, routes and DNS on request (see "Privilege separation"). Everything else, including USB, runs as the user.
+- **Async bridge** (`async_bridge.py`, the default). Keeps several bulk transfers in flight per direction. RX completions arrive on one libusb event thread and are written to the utun in order; a tx thread reads the utun and submits OUT transfers; a control thread handles the RNDIS control channel (below). Details in "Async USB I/O".
+- **Notification-driven control channel.** The control thread never polls: it does exactly one `GET_ENCAPSULATED_RESPONSE` per `RESPONSE_AVAILABLE` interrupt notification (polling crashed the modem firmware).
+- **Keepalive watchdog.** We send an RNDIS keepalive every 5 s and the modem answers with `KEEPALIVE_CMPLT` through that same notification path. If no *successful* acknowledgement arrives for 3 intervals (15 s), the control side is wedged: the bridge fails and the rebuild path (below) takes over. A `KEEPALIVE_CMPLT` with an error status is logged but not counted as an ack. It only looks at timestamps and never issues an extra GET.
+- **Backpressure.** When all OUT transfers are busy, the tx thread waits up to 1 s for a free slot instead of dropping, so the utun's kernel queue fills and TCP sees the real link rate. Only a modem that stops draining (no slot for 1 s) causes drops, counted as `tx_stalls`.
+- **ARP queue.** ARP replies are built on the event thread, which must never wait for an OUT slot. If none is free, the reply goes into a small bounded queue (4) and the tx thread sends it before its next utun packet.
+- **Supervisor stall detection.** Besides polling registration and the PDP context every 10 s, the supervisor watches the packet counters: if the modem refuses OUT transfers (at least 20 new tx timeouts) while rx stays flat for 60 s, it cycles the PDP context once; if the stall persists through another window it fails the bridge. Traffic the modem accepted but nobody answered (a host that drops ICMP, SYN retries, one-way UDP) is not a stall, and neither is an idle link. A growing OUT-timeout count also triggers an early poll, at least 5 s after the previous one.
+- **Rebuild retry.** A failed bridge ends in one of two rebuilds, see "Failure handling and rebuilds" below.
 
-1. **AT (iface 6):** `AT+CPIN?` = READY → `AT+CGDCONT=1,"IP","<apn>"` → `AT+CGACT=1,1` → `AT+CGPADDR=1` → our IPv4 → `AT+GTDNS=1` → DNS servers.
-2. **RNDIS (ifaces 0/1):** INITIALIZE (MaxTransferSize 0x4000) → query MAC/MTU → SET `OID_GEN_CURRENT_PACKET_FILTER` = directed | multicast | broadcast (0x0B).
-3. **utun:** open → `ifconfig utunN inet <ip> <peer> mtu 1500 up`, with peer = a placeholder like `<ip>` (point-to-point; the gateway is implicit).
-4. **Routes:** with `--route-host IP` (repeatable, max 8; unicast IPv4 only), add a host route `IP -> utunN` for each (`route add -host IP -interface utunN`); this is the way to test on a metered SIM, since only those hosts use the tunnel. With `--default-route`, save the current default → `route add default -interface utunN`. Everything is removed on exit, routes and DNS first, and also while waiting for the modem to re-enumerate (so the Mac is never left routing into a dead utun); they are re-added after the rebuild.
-5. **DNS:** the modem's DNS servers are always queried and logged (`DNS=[...]` or `DNS=<none returned>`). Only with `--dns` is a `State:/Network/Service/fm350mac/DNS` key published via `scutil` (removed on exit). `--dns` requires `--default-route`: without it the carrier resolver would be queried over the normal uplink, so `up` refuses. If `--dns` is given but the modem returned no servers, a warning is logged and DNS is left unchanged.
+### Session flow (`fm350mac up --apn <apn>`)
 
-`up --dry-run` has no side effects: it sends only read-only AT queries (`CPIN?`, `CGSN`, `CGACT?`, `CGPADDR`, `GTDNS`; no `CGDCONT`/`CGACT` writes), does no RNDIS init/halt and runs no system command. It prints the AT commands and system commands it would run (using a placeholder address if the PDP context isn't already active).
+1. **Helper:** unless `--no-helper` or `--dry-run`, connect to the helper (`hello`; a version mismatch only warns). `up` needs no `sudo` with the helper installed.
+2. **AT (iface 6):** read the IMEI (identity pinning), `AT+CPIN?` = READY → `AT+CGDCONT=1,"IP","<apn>"` → `AT+CGACT=1,1` → `AT+CGPADDR=1` → our IPv4 → `AT+GTDNS=1` → DNS servers.
+3. **RNDIS (ifaces 0/1):** INITIALIZE (MaxTransferSize 0x4000, clamped to the device's reported size) → query MAC/MTU → SET `OID_GEN_CURRENT_PACKET_FILTER` = directed | multicast | broadcast (0x0B).
+4. **utun:** open (via the helper) → `ifconfig utunN inet <ip> <ip> mtu 1500 up` (point-to-point; the gateway is implicit).
+5. **Routes:** with `--route-host IP` (repeatable, max 8; unicast IPv4 only), add a host route `IP -> utunN` for each (`route add -host IP -interface utunN`); this is the way to test on a metered SIM, since only those hosts use the tunnel. With `--default-route`, save the current default → `route add default -interface utunN` (unverified on hardware). With neither, nothing uses the tunnel and `up` warns. Everything is removed on exit, routes and DNS first, and also while waiting for the modem to re-enumerate (so the Mac is never left routing into a dead utun); they are re-added after the rebuild.
+6. **DNS:** the modem's DNS servers are always queried and logged (`DNS=[...]` or `DNS=<none returned>`). Only with `--dns` is a `State:/Network/Service/fm350mac/DNS` key published via `scutil` (removed on exit). `--dns` requires `--default-route`: without it the carrier resolver would be queried over the normal uplink, so `up` refuses. If `--dns` is given but the modem returned no servers, a warning is logged and DNS is left unchanged. Unverified on hardware.
+7. **Pump:** RX = bulk IN → RNDIS PACKET_MSG decode → Ethernet strip / ARP reply → utun write. TX = utun read → Ethernet wrap (dst = learned peer MAC, fallback broadcast; src = device MAC) → PACKET_MSG → bulk OUT.
+8. **Keepalive and supervision:** answer device `KEEPALIVE_MSG` with `KEEPALIVE_CMPLT`, send our own every 5 s; the supervisor polls and watches for stalls.
+9. **Teardown (SIGINT/SIGTERM/SIGHUP):** remove DNS key and restore routes, stop the bridge, log `stats:` and `perf:`, `AT+CGACT=0,1`, RNDIS HALT, release interfaces, then close the utun (with the helper, closing the connection also undoes anything left).
+
+`up --dry-run` has no side effects: it sends only read-only AT queries (`CPIN?`, `CGSN`, `CGACT?`, `CGPADDR`, `GTDNS`; no `CGDCONT`/`CGACT` writes), does no RNDIS init/halt and runs no system command. It prints the AT commands and system commands it would run (using a placeholder address if the PDP context isn't already active). It needs neither root nor the helper.
 
 Shutdown order (SIGINT/SIGTERM/SIGHUP handlers are installed before the first network change): routes/DNS, then the bridge, then AT deactivate, then RNDIS halt.
-6. **Pump:** rx thread = bulk IN → RNDIS PACKET_MSG decode → Ethernet strip / ARP reply → utun write. tx thread = utun read → Ethernet wrap (dst = learned peer MAC, fallback broadcast; src = device MAC) → PACKET_MSG → bulk OUT.
-7. **Keepalive:** answer device `KEEPALIVE_MSG` with `KEEPALIVE_CMPLT`, and send our own every 5 s on the control channel.
-8. **Teardown (SIGINT/SIGTERM/SIGHUP):** remove DNS key and restore routes, stop the bridge, `AT+CGACT=0,1`, RNDIS HALT, release interfaces, then close utun.
 
-> **Note (stale text, C3):** the heading above still shows `sudo fm350mac
-> up`. That was accurate before privilege separation existed. With the root
-> helper installed (see "Privilege separation" below), `up` needs no `sudo`
-> at all — the helper does only the utun/route/DNS steps, as root, on
-> request [fm350mac README]. `--no-helper` keeps the original `sudo`
-> behaviour shown here as a fallback. The AT/RNDIS/pump steps themselves
-> never needed root.
+### Failure handling and rebuilds
+
+All of this is exercised with `up --loopback`; none of it has run on hardware yet.
+
+- **Device loss** (the FM350's firmware is known to crash and re-enumerate under real network conditions). The utun stays, routes and DNS are removed, `up` waits up to `--reenum-timeout` (default 180 s) for the modem, waits 15 s for its firmware to settle, then rebuilds AT, RNDIS and the bridge. The modem's IMEI is pinned at first bring-up: if a different IMEI comes back, `up` refuses to rebuild (exit 4). A different USB port only logs a warning. If the modem does not return in time: exit 3.
+- **Bridge failure with the modem still on the bus** (watchdog, stall detection, an endpoint error). A bounded RNDIS-level rebuild without waiting for re-enumeration: at most 3 in a row (the counter resets after a session was stable for 10 minutes), then exit 2. Rebuilds forced by the supervisor's stall detection are not counted toward that cap, by design: a backup link that is down keeps being retried. The rebuild pauses 3 s between the RNDIS HALT and the re-INIT so the modem settles.
+- **Rebuild retry.** While rebuilding, a failed bring-up step (SIM, AT, RNDIS, USB) is retried with backoff (5 s doubling to 60 s) until 600 s have passed since the session was lost (the budget is measured from the loss, re-enumeration wait included) instead of ending the session; after that, exit 3. The first bring-up still fails fast. A successful rebuild starts a fresh budget.
+- **Exit codes:** 0 ok (including a clean Ctrl-C of a running session), 1 error, 2 bridge failure or usage error, 3 modem did not come back or rebuild budget exhausted, 4 modem identity changed, 130 interrupted during bring-up or the re-enumeration wait.
 
 ### Throughput expectation
 
-The device takes 1 packet per transfer, so throughput is bound by packets
-per second. Python with two threads is enough for bench tests; libusb calls
-release the GIL through ctypes. The first milestone is correctness, then we
-measure with `iperf3`. If the result is well under about 150 Mbps and that
-matters, port only `bridge.py` and the USB hot path to Swift or Rust behind
-the same interfaces. The control plane stays in Python.
+The device takes 1 packet per transfer, so throughput is bound by packets per second, and in practice by the radio link. On 2026-10-05, on a weak LTE B3/B7 cell with a Telekom DE SIM, capped `iperf3` runs gave roughly 10-20 Mbit/s down and 7-15 Mbit/s up at 3-8% driver CPU, so the driver was not the limit. Those are short runs on one cell, not a capacity figure; nothing faster has been measured, and no speed target is claimed. If a faster link ever shows the Python hot path as the ceiling, only `async_bridge.py` and the USB hot path would be ported (Swift or Rust) behind the same interfaces; the control plane stays in Python. See "Performance and tuning" below for how to tell the pool, the modem and the CPU apart.
 
 ## Package layout
 
 ```text
-fm350mac/                 Python ≥3.11 project, uv-managed (pyproject.toml)
+fm350mac/                 Python >=3.11 project, uv-managed (pyproject.toml, hatchling)
   src/fm350mac/
+    usb_async.py          our ctypes libusb binding: device, sync helpers, async transfer pools, EventLoop
+    usb_transport.py      device discovery, interface claim, endpoints, RNDIS control transfers
     rndis.py              constants, message encode/decode, PACKET_MSG pack/unpack (pure)
+    rndis_device.py       RNDIS control state machine (init/query/set/halt)
     ethernet.py           Ethernet header add/strip, ARP parse/reply (pure)
-    usb_transport.py      device discovery + libusb backend, iface claim, endpoints
-    rndis_device.py       RNDIS control state machine on top of usb_transport
-    at.py                 AT command channel (moved from tools/fm350_at.py)
-    utun.py               utun open/read/write (AF header handling)
-    netconfig.py          ifconfig/route/scutil wrappers, dry-run capable, restore on exit
-    bridge.py             rx/tx threads, stats, shutdown
+    async_bridge.py       the default data path: RX/TX pools, control thread, keepalive watchdog
+    bridge.py             the frozen sync data path (--io sync, unsupported)
+    at.py                 AT command channel and parsers
+    cellinfo.py           status/doctor decoders (3GPP TS 27.007)
+    utun.py               utun open/read/write (AF header handling, non-blocking read)
+    netconfig.py          ifconfig/route/scutil wrappers (direct/root path), dry-run capable
+    helper_client.py      the unprivileged side of the helper protocol (HelperClient, HelperNetConfig)
+    helper_admin.py       `helper install|uninstall|status`
+    helper/fm350mac_helper.py   the root helper: one stdlib-only Python 3.9 file, never imported
+    supervisor.py         reconnect supervisor, stall detection
+    loopback.py           in-process fake modem for `up --loopback`
+    redact.py             masking for logs and output
     cli.py                `fm350mac probe|at|status|doctor|connect|disconnect|up|async-selftest|helper`
-  tests/                  pytest: rndis codec, ethernet/ARP, utun framing, netconfig dry-run
 ```
 
-`probe`, `at` and `status` need no root. `up` needs root (utun + routes).
-
-> **Note (stale text, C2):** this layout describes the original scaffold,
-> built directly on pyusb. `usb_transport.py`'s pyusb backend and the rest of
-> that USB layer were superseded by the async ctypes binding in
-> `usb_async.py`, covered in full in "Async USB I/O" below — see the
-> [fm350mac README](../fm350mac/README.md), which confirms the shipped code
-> has "no pyusb". The module boundaries above (RNDIS/ethernet/utun/netconfig
-> as separate, independently testable pieces) are still how the code is
-> organised.
+`probe`, `at`, `status`, `doctor` and `up` need no root when the helper is installed; `helper install|uninstall` need `sudo`.
 
 ## Milestones
 
-1. Done: `probe`, RNDIS init + OID queries (done manually; now in the package).
-2. `status`/`connect`: AT data session, print IP and DNS. Done; verified live with a Telekom DE SIM (2026-10-05).
-3. `up` with `--no-default-route`: utun + pump, then `ping -b utunN 1.1.1.1`.
-4. `--default-route` + DNS + clean teardown.
-5. Measure with iperf3 and decide whether the hot path needs porting.
-6. IPv6 (`IPV4V6` PDP, RA via the modem): later.
+1. Done: `probe`, RNDIS init + OID queries.
+2. Done: `status`/`connect` (AT data session, IP and DNS), verified live with a Telekom DE SIM (2026-10-05).
+3. Done: `up` with `--route-host`: utun + pump, verified live 2026-10-05 (ping, HTTPS, capped iperf3, clean teardown).
+4. Done: the root helper, installed and checked on hardware (`helper install`, `helper status`).
+5. Open: `--default-route` + `--dns` on hardware.
+6. Done 2026-10-05: 10-minute soak and unplug/replug recovery on hardware. Open: longer sessions; the keepalive watchdog, stall detection and rebuild retry actually firing on hardware (so far only the healthy path was observed there).
+7. Open: Intel Macs.
+8. Later, not planned for 0.1.0a1: IPv6 (`IPV4V6` PDP, RA via the modem), more than one modem.
 
 ## Async USB I/O: our own ctypes binding to libusb (decided 2026-09-25)
 
-This is the current, canonical design for the USB layer — it replaced the
-pyusb-based scaffold shown above.
+This is the current, canonical design for the USB layer. It replaced the
+original pyusb-based scaffold; pyusb is no longer used anywhere in the package.
 
 **Why:** synchronous pyusb transfers cost ~106 µs each (measured), which caps
 a single-transfer-per-packet path at ~9 k pkt/s (≈100 Mbps at 1400 B). Linux
@@ -197,7 +197,7 @@ running sync pyusb (packets can be reordered on RX).
 
 - `Libusb`: loads `libusb-1.0.dylib` via ctypes (same search order as today). Declares `argtypes`/`restype` for every function used: `libusb_init_context` (fallback `libusb_init`), `libusb_exit`, `libusb_get_device_list`/`free_device_list`, `libusb_get_device_descriptor`, `libusb_open`/`close`, `libusb_get_active_config_descriptor`/`free_config_descriptor` (endpoint discovery), `libusb_claim_interface`/`release_interface`, `libusb_clear_halt`, `libusb_reset_device`, `libusb_control_transfer`, `libusb_bulk_transfer`, `libusb_interrupt_transfer`, `libusb_alloc_transfer`/`free_transfer`/`submit_transfer`/`cancel_transfer`, `libusb_handle_events_timeout_completed`, `libusb_error_name`, `libusb_get_version`.
 - `LibusbTransfer(ctypes.Structure)` mirrors `struct libusb_transfer` field by field (`dev_handle`, `flags` u8, `endpoint` u8, `type` u8, `timeout` c_uint, `status` c_int, `length` c_int, `actual_length` c_int, `callback`, `user_data`, `buffer`, `num_iso_packets` c_int). ctypes natural alignment gives 64 bytes on LP64. `libusb_fill_bulk_transfer` is `static inline` in the header, so we fill the fields ourselves.
-- **Layout test:** `tests/test_usb_async_layout.py` compiles a small C program with `cc` against `/opt/homebrew/include/libusb-1.0/libusb.h` that prints `sizeof`/`offsetof` for every field, and compares them with `ctypes.sizeof`/`Field.offset`. It is skipped (with a reason) only if no compiler or header is present.
+- **Struct layout:** the field offsets and sizes follow `struct libusb_transfer` in `/opt/homebrew/include/libusb-1.0/libusb.h` (64 bytes on LP64).
 - `UsbDevice`: one open handle per process, shared by the RNDIS ifaces (0/1) and the AT iface (6). Ctx-managed, releases claimed ifaces on close. It has sync helpers (`control_in/out`, `bulk_in/out`, `interrupt_in`) that map libusb errors to typed exceptions: `UsbTimeout`, `UsbNoDevice`, `UsbPipeError`, `UsbError(code, name)`.
 - `AsyncEndpoint`: a pool of N pre-allocated transfers plus buffers for one endpoint.
   - **Lifetime rules (a mistake here crashes a root process):** transfers, buffers and the single `CFUNCTYPE` callback object are allocated once and kept referenced in the pool until *every* transfer has reported a final status after cancel. Never free or resize a buffer while its transfer is in flight. `free_transfer` only after its callback ran with a non-resubmitted status. No `LIBUSB_TRANSFER_FREE_*` flags (Python owns the memory).
@@ -208,14 +208,32 @@ running sync pyusb (packets can be reordered on RX).
 ### New data path `AsyncBridge` (same public API as `Bridge`: start/stop/failed/stats)
 
 - **RX:** `--rx-urbs` (default 8) bulk-IN transfers of 16 KiB on 0x81. On completion: `unpack_packets` → strip → utun write (non-blocking; count drops on EAGAIN) → ARP handling → resubmit immediately. The utun write happens on the event thread, which keeps the order.
-- **TX:** the tx thread reads utun and wraps into PACKET_MSG (+1 pad byte when the length is a multiple of wMaxPacketSize, and drop if > max_transfer_size). It takes a free OUT transfer from a pool of `--tx-urbs` (default 8) and submits it. If none is free (all in flight / modem stalled), drop and count `tx_stalls` (rate-limited log). OUT timeout 500 ms.
+- **TX:** the tx thread reads utun (non-blocking `recv`, `poll` only when empty) and wraps into PACKET_MSG (+1 pad byte when the length is a multiple of wMaxPacketSize, and drop if > max_transfer_size). It takes a free OUT transfer from a pool of `--tx-urbs` (default 8) and submits it. If none is free it waits up to 1 s for one to retire (backpressure into the utun's kernel queue, so TCP sees the real link rate), using a generation counter under a condition so a slot freed between the failed submit and the wait is never missed (no lost wakeup). Only if none frees up in time (modem stalled) does it drop and count `tx_stalls` (rate-limited log). OUT timeout 500 ms. ARP replies are built on the event thread; if no OUT slot is free they are queued (small bounded queue) to the tx thread, which sends them before its next utun packet, since the event thread must never wait for a slot.
 - **Control:** a 1-deep async interrupt-IN transfer on 0x82 increments a counted condition, once per `RESPONSE_AVAILABLE` notification. The control thread then does exactly one `GET_ENCAPSULATED_RESPONSE` per counted notification (never poll without a notification: that crashed the modem firmware), handles KEEPALIVE/INDICATE_STATUS, and sends our 5 s keepalive. The FM350 sends the RNDIS-spec encoding of RESPONSE_AVAILABLE (`01 00 00 00 00 00 00 00`), not the CDC `A1 01 …` form; both are accepted. It also sends more notifications than it has responses, so some GETs return the spec's 1-byte `00` "nothing pending" reply, which is ignored (verified on hardware 2026-10-05).
-- `cli up --io async|sync` (default async). `Bridge` (sync) stays as the fallback until async is proven with a SIM.
+- `cli up --io async|sync` (default async). `Bridge` (sync, `bridge.py`) is a frozen fallback and unsupported in 0.1.0a1: it had one unexplained download stall in 6 runs (the missing data never reached the driver), and the keepalive watchdog, ARP queue and stall counters described here only exist in the async bridge.
+
+### Performance and tuning
+
+Measured in pure Python (no hardware): RX costs about 1.1 µs per packet, TX about 4 µs per packet including the utun `recv`. Filling a transfer struct on every submit cost about 0.74 µs (0.33 µs of it the `ctypes.cast`), so the static fields (`dev_handle`, `endpoint`, `type`, `timeout`, `callback`, `user_data`, buffer pointer) are now set once per slot at pool creation and a submit only sets `length` (about 0.08 µs). The utun fd is read non-blocking (`recv` first, `poll` for up to 0.5 s only on EAGAIN), because `recv` on a socket in timeout mode does a `poll()` first (0.84 µs against 0.43 µs). At start the bridge also logs the utun socket's `SO_RCVBUF`/`SO_SNDBUF` at DEBUG and tries to raise `SO_SNDBUF` (our writes into the utun) to 1 MiB so a burst from the modem does not hit `ENOBUFS`. `SO_RCVBUF` (the outbound queue the kernel holds for us) stays at the system default, because a deep queue there only adds upload latency; a refused `SO_SNDBUF` request is non-fatal.
+
+The CPU cost is not the limit; the modem's OUT latency is. With `N` OUT transfers in flight, TX tops out at about `pps ≈ N_tx_urbs / OUT_latency`. For example 8 URBs at 1 ms per transfer allow about 8000 packets/s, roughly 96 Mbit/s at 1500 bytes. Once the pool is the limit, the tx thread waits for slots (`tx_slot_waits` rises).
+
+At shutdown the driver logs one INFO line, and with `--verbose` an extra DEBUG `stats-detail:` line (the INFO `stats:` line is unchanged; tools parse it):
+
+```
+perf: out_latency[n=… mean=…us max=…us <100us:… <250us:… <500us:… <1000us:… <2000us:… <5000us:… >=5000us:…] tx_inflight_max=A/B tx_slot_waits=… tx_slot_wait=…ms rx_urbs=… rx_frames_per_urb mean=… max=…
+```
+
+- `out_latency`: submit-to-completion time of completed OUT transfers, in fixed buckets (failed or timed-out transfers are not included; they show up in `tx_timeouts`).
+- `tx_inflight_max=A/B`: the most OUT transfers in flight at once, out of `--tx-urbs` (B). A below B means the pool never limited TX.
+- `tx_slot_waits` / `tx_slot_wait`: how often the tx thread found every slot busy, and the total time it then waited.
+- `rx_frames_per_urb`: Ethernet frames per completed RX URB (mean and max); a mean near 1 means `--rx-urbs` is not what limits RX.
+
+To test the pool size on hardware, run the same iperf3 upload with `--tx-urbs 4`, `8`, `16` and compare `tx_inflight_max`, `tx_slot_waits` and the upper `out_latency` buckets: if `tx_inflight_max` hits the limit, `tx_slot_waits` is high and throughput grows with `--tx-urbs`, the pool was the ceiling; if latency buckets shift right as URBs are added, the modem is the ceiling and more URBs only add queueing. The defaults are unchanged until that has been measured.
 
 ### Verification without a SIM
 
-- Unit tests: layout test; pool state machine with a fake `Libusb` that records submits/cancels and lets the test fire callbacks with each status (COMPLETED, TIMED_OUT, CANCELLED, NO_DEVICE, STALL); lifetime test that the pool frees nothing before all transfers retire; AsyncBridge RX ordering (callbacks in order → utun writes in order) and TX pool exhaustion → drops/stalls.
-- Live (read-only, no hammering): `fm350mac async-selftest`:
+- Live (read-only, no hammering): `fm350mac async-selftest --yes` (the flag, or an interactive "yes", confirms the USB reset at the end):
   1. open, claim 0/1, RNDIS init, 8 RX transfers pending for 3 s (expect 0 frames), cancel → all 8 retire as CANCELLED, no leaks/crash;
   2. submit 5 ARP frames on the async OUT pool, expect 3 COMPLETED and 2 TIMED_OUT (the known no-bearer queue of 3);
   3. halt, release.
@@ -224,7 +242,7 @@ running sync pyusb (packets can be reordered on RX).
 
 ## Privilege separation (decided 2026-09-25)
 
-**Problem:** `sudo fm350mac up` runs Homebrew Python, the project `.venv` and libusb as root. All of them are user-writable, so anything running under your account can plant code that then runs as root. Measured: USB access (libusb claim, RNDIS, AT) **doesn't need root**. Only utun creation and ifconfig/route/scutil do.
+**Problem:** running the whole data path under `sudo` (the original design) would run Homebrew Python, the project `.venv` and libusb as root. All of them are user-writable, so anything running under your account can plant code that then runs as root. Measured: USB access (libusb claim, RNDIS, AT) **doesn't need root**. Only utun creation and ifconfig/route/scutil do.
 
 **Design:** split into an unprivileged main process and a tiny root helper.
 
@@ -237,7 +255,7 @@ running sync pyusb (packets can be reordered on RX).
 
 - **Transport:** a Unix socket `/var/run/fm350mac-helper.sock` (created by launchd via the plist `Sockets` key, mode 0600, owner = the installing user; alternatively the helper creates it itself). The helper checks the peer uid with `LOCAL_PEERCRED` against `AllowedUID` fixed at install time, and rejects everyone else.
 - **Protocol:** one JSON object per line, request→response, max 4 KiB per message. Unknown fields and ops are rejected. Ops:
-  - `hello {version}` → `{version, pid}`
+  - `hello {version}` → `{version, helper_version, pid}`. `helper_version` is the release version of the helper file; `up` and `helper status` warn when it is missing (an older helper) or differs from the driver's.
   - `open_utun {}` → the fd via `SCM_RIGHTS` + `{ifname}`. Max 1 per connection.
   - `set_address {ip}`: ip must pass the same checks as `at.valid_assigned_ipv4` (the helper has its own copy; no import from the package).
   - `reconfigure_address {old_ip, new_ip}`
@@ -249,8 +267,15 @@ running sync pyusb (packets can be reordered on RX).
 - **Automatic cleanup:** the helper tracks all changes per connection. When the connection closes for any reason (including SIGKILL or a crash of the main process), it undoes them in reverse order and closes the utun. That removes the "SIGKILL leaves routes/DNS behind" problem.
 - Commands run with fixed argv lists via absolute paths (`/sbin/ifconfig`, `/sbin/route`, `/usr/sbin/scutil`), with a minimal environment and no shell.
 - **Main process:** `HelperClient` implements the existing `Utun` + `NetConfig` interfaces over the socket, so cli/bridge/supervisor don't change. `up` no longer needs root when the helper is installed. `--no-helper` keeps the current sudo mode as a fallback.
-- **Install/uninstall** (run these with sudo; they print every step first and have `--dry-run`): `fm350mac helper install` copies the helper file, writes `/Library/LaunchDaemons/de.fm350mac.helper.plist` (root:wheel 0644, `ProgramArguments = [/usr/bin/python3, -I, -S, /usr/local/libexec/fm350mac-helper, --allowed-uid, <uid>]`), then `/bin/launchctl bootout system/de.fm350mac.helper` (failure ignored) and `/bin/launchctl bootstrap system …`. The bootout matters: once launchd has started the helper (on the first connection) it stays resident, so a reinstall would otherwise keep running the old code. `helper uninstall` reverses it (and removes `/var/log/fm350mac-helper.log`). `helper status` shows whether it's loaded and reachable, and prints "installed helper is out of date — run `fm350mac helper install`" if the installed file differs from the packaged one. Connections that stay silent for 300 s before opening a utun are dropped (the timeout only applies until the utun is open; a live session may idle for hours); SIGTERM unwinds through the connection's cleanup (one teardown).
+- **Install/uninstall** (run these with sudo; they print every step first and have `--dry-run`): `fm350mac helper install` copies the helper file, writes `/Library/LaunchDaemons/de.fm350mac.helper.plist` (root:wheel 0644, `ProgramArguments = [/usr/bin/python3, -I, -S, /usr/local/libexec/fm350mac-helper, --allowed-uid, <uid>]`), then `/bin/launchctl bootout system/de.fm350mac.helper` (failure ignored) and `/bin/launchctl bootstrap system …`. The bootout matters: once launchd has started the helper (on the first connection) it stays resident, so a reinstall would otherwise keep running the old code. `helper install --expect-sha256 HEX` refuses to install unless the helper file's sha256 is `HEX`; the sha256 is printed as `helper sha256:` (also by `--dry-run`). `helper uninstall` reverses it (and removes `/var/log/fm350mac-helper.log`); it exits 1 if `launchctl bootout` really fails or the job is still loaded afterwards, and warns if the socket file is left behind. `helper status` shows whether it's loaded and reachable, prints the installed file's `helper sha256 :` (a consistency check, not an integrity proof), and prints "installed helper is out of date — run `fm350mac helper install`" if the installed file differs from the packaged one. Connections that stay silent for 300 s before opening a utun are dropped (the timeout only applies until the utun is open; a live session may idle for hours); SIGTERM unwinds through the connection's cleanup (one teardown).
 - **Tests:** the helper's request validation and state machine are unit-tested with a fake command runner, **also executed under `/usr/bin/python3` (3.9)**. The fd passing is tested with a socketpair and a pipe fd. Client/helper end to end runs in-process with the fake runner. The only live root step is running `helper install` and then `up --loopback` without sudo.
+
+**Trust model, stated plainly.**
+
+- Installing runs the package as root once: `sudo "$(command -v fm350mac)" helper install` executes the installed `fm350mac` and its Python environment as root, to read one file, check that it compiles under `/usr/bin/python3 -I -S`, and write the helper and its plist. That interpreter and those packages are owned by the user, so anything that can write to them decides what runs as root for that step. Inspecting the helper file or running `helper install --dry-run --allowed-uid <uid>` does not limit this: both use the same user-owned code. The mitigation is to compare the printed `helper sha256:` with the value published in the release notes and the CHANGELOG and install with `--expect-sha256 <sha256>`, which pins the one file that stays on the system as root. `helper install` also warns (`WARNING: running user-owned code as root`) when run as root from a user-owned Python, and root-owned `__pycache__` files may be written into the user's venv. `sudo uv run` must not be used: it runs uv as root and leaves root-owned files in the project's `.venv`.
+- After that, only the copied helper file runs as root, with nothing user-writable on its interpreter or import path. The install step writes it atomically and refuses symlinks and directories that are not root-owned or are group/other-writable.
+- The helper is not harmless: any process running as the allowed uid can ask it, as root, to create a utun, set an address, add up to 8 host routes, replace the default route and set DNS. It runs fixed argv lists without a shell and validates every argument, so it cannot be made to run arbitrary commands, but a hostile process running as that user could redirect the Mac's traffic. The socket (mode 0600, owned by the installing uid, plus the `LOCAL_PEERCRED` check) keeps other users out.
+- Nothing is code-signed or notarized.
 
 This design has since run live end to end — see the [bench log's privilege
 separation entry](bench-log.md), which found no gaps beyond what's listed
@@ -261,21 +286,21 @@ from a user's point of view.
 
 ## What's not proven yet
 
-- The real data path (`up` against the actual FM350-GL) has run live only
-  briefly (2026-10-05, Telekom DE SIM, `up --route-host`: ping, HTTPS, a 1 MB
-  download). Long sessions, re-enumeration recovery and `--default-route` /
-  `--dns` on hardware are still verified only by unit tests and
-  `up --loopback` [fm350mac README, Limitations].
-- The async I/O rewrite's whole point — higher throughput than the ~9 k
-  pkt/s / ~100 Mbps synchronous ceiling — has not been measured; only the
-  synchronous figure above comes from a real measurement. The "~150 Mbps"
-  threshold used above to decide whether to port the hot path is a design
-  estimate, not a result [fm350mac README, Limitations].
-- IPv6 (`IPV4V6` PDP context, router advertisements from the modem) is
-  still just a milestone on the list above, not implemented.
-- The design is macOS/Apple Silicon only, by choice: none of the rejected
-  options (kernel extension, DriverKit, Network Extension, Linux/Windows
-  parity) are being pursued.
+Everything verified so far was verified on one unit on 2026-10-05 (Telekom DE SIM, LTE B3/B7, macOS 27, Apple Silicon): USB enumeration, AT, `status`/`doctor`/`probe`, `up --route-host` with ping, HTTPS and capped `iperf3`, `helper install`/`status`, and clean teardown (routes removed, PDP deactivated). Not verified on hardware:
+
+- `--default-route` and `--dns`.
+- Sessions longer than 10 minutes (a 10-minute idle soak passed).
+- Recovery when the modem re-enumerates on its own (firmware crash). Unplug/replug recovery is verified: session rebuilt automatically 57 s after the unplug.
+- The resilience features actually firing: keepalive watchdog, supervisor stall detection, rebuild retry after a failed bring-up, RNDIS-level rebuild. On hardware only the healthy path (watchdog not firing) has been observed.
+- Intel Macs. The libusb loader also looks in `/usr/local`, but that is untested.
+- Throughput above about 40 Mbit/s. 50 MB transfers reached 42.1 Mbit/s down and 34.7 Mbit/s up on LTE B8, radio-limited; the measured USB OUT latency (mean 184 µs) puts the 8-URB TX ceiling near 43k packets/s, far above that.
+
+Not supported:
+
+- IPv6. The data path is IPv4 only (`IPV4V6` PDP contexts and router advertisements from the modem are not implemented).
+- More than one modem.
+- Anything other than macOS: the design is macOS-only by choice, and none of the rejected options (kernel extension, DriverKit, Network Extension, Linux/Windows parity) are being pursued.
+- `--io sync`, which is a frozen fallback.
 
 ## Glossary
 

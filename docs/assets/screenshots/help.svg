@@ -1,8 +1,8 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="808" height="599" viewBox="0 0 808 599" role="img" aria-label="fm350mac --help">
+<svg xmlns="http://www.w3.org/2000/svg" width="808" height="641" viewBox="0 0 808 641" role="img" aria-label="fm350mac --help">
 <title>fm350mac --help</title>
-<defs><clipPath id="win"><rect x="0.5" y="0.5" width="807" height="598" rx="10"/></clipPath></defs>
+<defs><clipPath id="win"><rect x="0.5" y="0.5" width="807" height="640" rx="10"/></clipPath></defs>
 <g clip-path="url(#win)">
-<rect x="0.5" y="0.5" width="807" height="598" rx="10" fill="#0d1117" stroke="#30363d"/>
+<rect x="0.5" y="0.5" width="807" height="640" rx="10" fill="#0d1117" stroke="#30363d"/>
 <rect x="0.5" y="0.5" width="807" height="36" fill="#161b22"/>
 <line x1="0.5" y1="36.5" x2="807.5" y2="36.5" stroke="#30363d"/>
 <circle cx="20.0" cy="18.5" r="6" fill="#ff5f56"/>
@@ -11,7 +11,7 @@
 <text x="404.0" y="23" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="12.5" fill="#8b949e">fm350mac --help</text>
 <text x="22.0" y="66.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#3fb950" font-weight="600" xml:space="preserve">$ </text>
 <text x="39.4" y="66.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#f0f6fc" font-weight="600" xml:space="preserve">fm350mac --help</text>
-<text x="22.0" y="87.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">usage: fm350mac [-h] [--verbose]</text>
+<text x="22.0" y="87.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">usage: fm350mac [-h] [--version] [--verbose]</text>
 <text x="22.0" y="108.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">                {probe,at,status,doctor,connect,disconnect,up,async-selftest,helper} ...</text>
 <text x="22.0" y="150.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">User-space macOS data path for the FM350-GL</text>
 <text x="22.0" y="192.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">positional arguments:</text>
@@ -25,11 +25,13 @@
 <text x="22.0" y="360.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">    disconnect          deactivate the PDP context (no root)</text>
 <text x="22.0" y="381.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">    up                  run the full session: AT + RNDIS + utun + routes +</text>
 <text x="22.0" y="402.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">                        pump</text>
-<text x="22.0" y="423.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">    async-selftest      live, read-only check of the async USB transfer pools</text>
-<text x="22.0" y="444.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">                        (no SIM needed; ends with a USB reset)</text>
-<text x="22.0" y="465.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">    helper              manage the root helper LaunchDaemon (see docs/macos-</text>
-<text x="22.0" y="486.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">                        driver.md)</text>
-<text x="22.0" y="528.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">options:</text>
-<text x="22.0" y="549.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">  -h, --help            show this help message and exit</text>
-<text x="22.0" y="570.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">  --verbose             enable debug logging</text>
+<text x="22.0" y="423.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">    async-selftest      live check of the async USB transfer pools (no SIM</text>
+<text x="22.0" y="444.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">                        needed; ends with a USB reset that can kill an active</text>
+<text x="22.0" y="465.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">                        session; needs --yes or an interactive confirmation)</text>
+<text x="22.0" y="486.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">    helper              manage the root helper LaunchDaemon (see docs/macos-</text>
+<text x="22.0" y="507.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">                        driver.md)</text>
+<text x="22.0" y="549.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">options:</text>
+<text x="22.0" y="570.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">  -h, --help            show this help message and exit</text>
+<text x="22.0" y="591.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">  --version             show program's version number and exit</text>
+<text x="22.0" y="612.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace" font-size="14.0" fill="#c9d1d9" xml:space="preserve">  --verbose             enable debug logging (and tracebacks on errors)</text>
 </g></svg>

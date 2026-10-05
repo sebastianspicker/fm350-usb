@@ -1,6 +1,7 @@
 """fm350mac command-line interface.
 
-Subcommands: probe | at | status | connect | disconnect | up.
+Subcommands: probe | at | status | doctor | connect | disconnect | up |
+async-selftest | helper {install,uninstall,status}.
 See docs/macos-driver.md in the repo root for the architecture and session flow.
 
 Most command functions take keyword-only factories for their external
@@ -25,18 +26,34 @@ import struct
 import sys
 import threading
 import time
+import traceback
 
+from . import __version__, cellinfo, ethernet, helper_admin, loopback, rndis
 from . import at as at_mod
-from . import cellinfo, ethernet, helper_admin, loopback, rndis
-from .async_bridge import DEFAULT_RX_URBS, DEFAULT_TX_URBS, AsyncBridge
+from .async_bridge import DEFAULT_RX_URBS, DEFAULT_TX_URBS, AsyncBridge, clamp_max_transfer_size
 from .bridge import Bridge
-from .helper_client import HelperNetConfig
-from .helper_client import probe as probe_helper
+from .helper_client import (
+    HelperError,
+    HelperNetConfig,
+    as_probe_result,
+    helper_version_warning,
+)
+from .helper_client import is_version_mismatch as is_helper_version_mismatch
+from .helper_client import probe_with_reason as probe_helper
 from .netconfig import MAX_HOST_ROUTES, SCUTIL, NetConfig, valid_unicast_ipv4, validate_route_host
-from .redact import redact_text
+from .redact import redact_pin, redact_text
 from .rndis_device import RndisDevice
 from .supervisor import Supervisor
-from .usb_async import AsyncEndpoint, EventLoop, close_cached
+from .usb_async import (
+    LIBUSB_ERROR_ACCESS,
+    LIBUSB_ERROR_BUSY,
+    AsyncEndpoint,
+    EventLoop,
+    LibusbNotFound,
+    UsbError,
+    UsbNoDevice,
+    close_cached,
+)
 from .usb_transport import RndisUsb, find_device
 from .utun import Utun
 
@@ -47,6 +64,24 @@ DEFAULT_PDP_TYPE = "IP"
 DEFAULT_REENUM_TIMEOUT_S = 180.0
 _REENUM_POLL_INTERVAL_S = 2.0
 _REENUM_SETTLE_S = 15.0
+# A re-bring-up (after a device loss or an RNDIS-level rebuild) that fails is
+# retried with this backoff (5, 10, 20, 40, 60, 60, ... s) instead of ending
+# `up`, until _REBUILD_BUDGET_S has passed since the session was lost.
+_REBUILD_BACKOFF_INITIAL_S = 5.0
+_REBUILD_BACKOFF_MAX_S = 60.0
+_REBUILD_BUDGET_S = 600.0
+# A bridge failure with the modem still present (no device loss) gets an
+# RNDIS-level rebuild (no re-enumeration wait) at most this many times in a
+# row; a session that then stays up for _STABLE_SESSION_S resets the count.
+# Failures the supervisor's stall detector forced don't count (see below).
+_MAX_RNDIS_REBUILDS = 3
+_STABLE_SESSION_S = 600.0
+# Pause between an RNDIS-level rebuild's HALT and its re-INIT.
+_RNDIS_REBUILD_SETTLE_S = 3.0
+# A user shutdown's AT+CGACT=0 must not hold it for ACTIVATE_TIMEOUT_S (60 s).
+# Before a rebuild the full ACTIVATE_TIMEOUT_S applies instead: a late OK must
+# not be read as the reply to the rebuild's next command.
+_CLEANUP_DEACTIVATE_TIMEOUT_S = 10.0
 
 _PROBE_OIDS = [
     ("GEN_MAXIMUM_FRAME_SIZE", rndis.OID_GEN_MAXIMUM_FRAME_SIZE),
@@ -120,6 +155,13 @@ def _positive_float_arg(minimum: float = 0.0, inclusive: bool = False):
         return number
 
     return parse
+
+
+def _sha256_arg(value: str) -> str:
+    """argparse ``type=`` for ``--expect-sha256``: 64 hex digits, normalized to lowercase."""
+    if not re.fullmatch(r"[0-9A-Fa-f]{64}", value):
+        raise argparse.ArgumentTypeError(f"not a sha256 hex digest (64 hex digits): {value!r}")
+    return value.lower()
 
 
 def _maybe_redact(args: argparse.Namespace, text: str) -> str:
@@ -301,6 +343,21 @@ def _format_serving_cell(cell: cellinfo.LteCell | cellinfo.NrCell, redact: bool)
         f"Serving cell: NR {band} ARFCN={cell.arfcn} PCI={cell.pci} TAC={tac} cell_id={cell_id} "
         f"SS-RSRP={cell.ss_rsrp_dbm} dBm SS-SINR={cell.ss_sinr_db} dB"
     )
+
+
+def _sim_problem(state: str | None) -> str:
+    """User-facing text for a SIM that is not READY."""
+    if state == "SIM PIN":
+        return (
+            "SIM is PIN-locked: unlock it in a phone first (or disable the PIN there), or with "
+            'fm350mac at \'AT+CPIN="<pin>"\' -- note that the PIN then ends up in your shell history; '
+            "3 wrong PINs lock the SIM"
+        )
+    if state == "SIM PUK":
+        return "SIM is PUK-locked: unlock with the PUK in a phone"
+    if state == "NOT INSERTED":
+        return "no SIM detected: check the SIM tray"
+    return f"SIM not ready ({state})" if state else "SIM not ready"
 
 
 def _sim_text(ready: bool, state: str | None) -> str:
@@ -623,7 +680,7 @@ def cmd_connect(args: argparse.Namespace, *, at_port_factory=at_mod.AtPort) -> i
     try:
         state = at_mod.sim_state(port)
         if state != "READY":
-            print(f"SIM not ready ({state})" if state else "SIM not ready", file=sys.stderr)
+            print(_sim_problem(state), file=sys.stderr)
             return 1
         if args.pdp != DEFAULT_PDP_TYPE:
             print(
@@ -684,6 +741,16 @@ def _log_bridge_stats(bridge: Bridge | AsyncBridge) -> None:
         bridge.stats.drops,
         bridge.stats.tx_stalls,
     )
+    # Only the async bridge is instrumented. The DEBUG line is extra detail
+    # (it must never match tools/bench-throughput.sh's "stats: rx=..." parse,
+    # hence "stats-detail:"); perf: is the one-shot INFO summary for tuning.
+    perf_summary = getattr(bridge, "perf_summary", None)
+    if perf_summary is not None:
+        _log.debug(
+            "stats-detail: rx_packets=%d tx_packets=%d tx_timeouts=%d %s",
+            bridge.stats.rx_packets, bridge.stats.tx_packets, bridge.stats.tx_timeouts, perf_summary(),
+        )
+        _log.info("perf: %s", perf_summary())
 
 
 _SHUTDOWN_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
@@ -720,6 +787,9 @@ class _ShutdownGuard:
 
     def __init__(self) -> None:
         self.event = threading.Event()
+        # Set by a signal that arrives during cleanup: cleanup's own waits
+        # (the bounded AT+CGACT=0) give up at once instead of finishing.
+        self.abort = threading.Event()
         self.stop = None
         self.cleaning = False
         self._previous: dict[int, object] = {}
@@ -739,6 +809,7 @@ class _ShutdownGuard:
     def _on_signal(self, _signum, _frame) -> None:
         self.event.set()
         if self.cleaning:
+            self.abort.set()
             return
         if self.stop is not None:
             self.stop()
@@ -805,13 +876,19 @@ def _dry_run_system_commands(net) -> list[str]:
     return lines
 
 
-def _wait_for_reenumeration(find_device_factory, timeout_s: float, sleep=time.sleep, time_source=time.monotonic) -> bool:
-    """Poll ``find_device_factory`` every 2s until it succeeds or ``timeout_s`` elapses."""
+def _wait_for_reenumeration(
+    find_device_factory, timeout_s: float, sleep=time.sleep, time_source=time.monotonic, on_absent=None
+) -> bool:
+    """Poll ``find_device_factory`` every 2s until it succeeds or ``timeout_s``
+    elapses. ``on_absent()`` (if given) is called for every failed probe.
+    """
     deadline = time_source() + timeout_s
     while time_source() < deadline:
         try:
             find_device_factory()
         except Exception:
+            if on_absent is not None:
+                on_absent()
             sleep(_REENUM_POLL_INTERVAL_S)
             continue
         # Only a probe: drop the cached handle so the rebuild opens a fresh
@@ -821,10 +898,44 @@ def _wait_for_reenumeration(find_device_factory, timeout_s: float, sleep=time.sl
     return False
 
 
-def _helper_or_root_error(action: str) -> int:
+class _RebuildError(Exception):
+    """A re-bring-up step failed in a way ``up`` reports and exits on during
+    the first bring-up, but retries during a rebuild (see cmd_up).
+    """
+
+
+# Failures during a rebuild (restart_count > 0) that are retried instead of
+# ending `up`. TimeoutError covers both at.AtTimeoutError and the builtin one
+# RndisDevice._get_response raises; UsbError covers UsbNoDevice/UsbTimeout.
+_RETRYABLE_REBUILD_ERRORS = (_RebuildError, TimeoutError, at_mod.AtCommandError, UsbError, rndis.RndisError)
+
+
+def _usb_device_alive(usb_ctx) -> bool:
+    """Probe whether the modem behind ``usb_ctx`` is still on the bus (see
+    UsbDevice.is_alive). True if it can't be probed: only a positive "gone"
+    turns a bridge failure into a device loss.
+    """
+    probe = getattr(getattr(usb_ctx, "usb_device", None), "is_alive", None)
+    if probe is None:
+        return True
+    try:
+        return bool(probe())
+    except Exception:
+        _log.exception("USB liveness probe failed")
+        return True
+
+
+def _helper_or_root_error(action: str, reason: str | None = None, no_helper: bool = False) -> int:
+    if no_helper:
+        # The user already chose the direct/root path: suggesting --no-helper
+        # again would be circular.
+        print(f"{action} --no-helper needs root: re-run it with sudo.", file=sys.stderr)
+        return 1
+    if reason:
+        print(f"helper: {reason}", file=sys.stderr)
     print(
         f"{action} needs either the root helper or root. Install the helper once with "
-        "'sudo fm350mac helper install' (see 'fm350mac helper status'), or pass --no-helper "
+        "'sudo \"$(command -v fm350mac)\" helper install' (see 'fm350mac helper status'), or pass --no-helper "
         "to fall back to running this with sudo.",
         file=sys.stderr,
     )
@@ -833,25 +944,29 @@ def _helper_or_root_error(action: str) -> int:
 
 def _resolve_helper(
     args: argparse.Namespace, *, geteuid, helper_probe_factory
-) -> tuple[bool, HelperNetConfig | None]:
+) -> tuple[bool, HelperNetConfig | None, str | None]:
     """Decide whether this invocation uses the helper or the direct/root
     path, for both ``up`` and ``up --loopback``.
 
-    Returns ``(ok, helper_net)``: ``ok`` is False if neither path is usable
-    (caller should print an error and return 1); ``helper_net`` is a
+    Returns ``(ok, helper_net, reason)``: ``ok`` is False if neither path is
+    usable (caller should print an error and return 1; ``reason`` says why
+    the helper is unreachable, if known); ``helper_net`` is a
     ``HelperNetConfig`` (also usable as the NetConfig for this session) if
     the helper is in use, else None (direct/root path, or --dry-run).
     """
     if args.dry_run:
-        return True, None
+        return True, None, None
     if args.no_helper:
         if geteuid() != 0:
-            return False, None
-        return True, None
-    client = helper_probe_factory()
+            return False, None, None
+        return True, None, None
+    client, reason = as_probe_result(helper_probe_factory())
     if client is None:
-        return False, None
-    return True, HelperNetConfig(client)
+        return False, None, reason
+    warning = helper_version_warning(client)
+    if warning:
+        _log.warning("%s", warning)
+    return True, HelperNetConfig(client), None
 
 
 def cmd_up(
@@ -886,7 +1001,12 @@ def cmd_up(
     fails because the USB device disappeared, the session is torn down
     (utun/routes stay up) and rebuilt once the modem re-enumerates -- FM350
     firmware crashes and re-enumerates under real network conditions (see
-    rndis_device.py), so this isn't just a theoretical case.
+    rndis_device.py), so this isn't just a theoretical case. A bridge failure
+    with the modem still on the bus gets a bounded RNDIS-level rebuild (no
+    re-enumeration wait) instead. While rebuilding, a failed bring-up step
+    (SIM, AT, RNDIS, USB) is retried with backoff for up to
+    _REBUILD_BUDGET_S rather than ending the session; the first bring-up
+    still fails fast.
     """
     if args.loopback:
         return _cmd_up_loopback(
@@ -897,6 +1017,9 @@ def cmd_up(
             helper_probe_factory=helper_probe_factory,
         )
 
+    if args.apn is None:
+        print("fm350mac up: error: the following arguments are required: --apn", file=sys.stderr)
+        return 2
     route_hosts = list(dict.fromkeys(getattr(args, "route_host", None) or []))
     if len(route_hosts) > MAX_HOST_ROUTES:
         print(f"--route-host: at most {MAX_HOST_ROUTES} hosts are supported (got {len(route_hosts)})", file=sys.stderr)
@@ -910,9 +1033,18 @@ def cmd_up(
         )
         return 1
 
-    ok, helper_net = _resolve_helper(args, geteuid=geteuid, helper_probe_factory=helper_probe_factory)
+    if args.default_route:
+        _log.warning("--default-route is experimental and unverified on hardware")
+    if args.dns:
+        _log.warning("--dns is experimental and unverified on hardware")
+    if getattr(args, "io", "async") == "sync":
+        _log.warning("--io sync is a frozen fallback and unsupported in 0.1.0a1")
+    if not route_hosts and not args.default_route and not args.dry_run:
+        _log.warning("no routes requested: nothing will use the tunnel (use --route-host IP or --default-route)")
+
+    ok, helper_net, reason = _resolve_helper(args, geteuid=geteuid, helper_probe_factory=helper_probe_factory)
     if not ok:
-        return _helper_or_root_error("fm350mac up")
+        return _helper_or_root_error("fm350mac up", reason, no_helper=args.no_helper)
     if helper_net is not None:
         utun_factory = helper_net.open_utun
         net_config_factory = lambda dry_run: helper_net  # noqa: E731 -- dry_run is always False here
@@ -921,6 +1053,10 @@ def cmd_up(
     utun: Utun | None = None
     utun_name = "utun-dry-run"
     restart_count = 0
+    rndis_rebuilds = 0
+    rebuild_attempts = 0
+    rebuild_backoff = _REBUILD_BACKOFF_INITIAL_S
+    rebuild_deadline: float | None = None
     previous_ip: str | None = None
     pinned_imei: str | None = None
     pinned_port_path: tuple[int, tuple[int, ...]] | None = None
@@ -931,13 +1067,20 @@ def cmd_up(
         # full cleanup (see _ShutdownGuard).
         shutdown.install()
         while True:
-            at_port = at_port_factory()
+            at_port = None
             usb_ctx: RndisUsb | None = None
             bridge: Bridge | None = None
             pdp_active = False
             bridge_stopped_cleanly = True
             device_lost = False
+            # The bridge failed but the modem is still there: rebuild the
+            # session without waiting for a re-enumeration (see below).
+            rndis_rebuild = False
+            failure_reason: str | None = None
+            # Set if a rebuild (restart_count > 0) failed in a retryable way.
+            rebuild_error: Exception | None = None
             try:
+                at_port = at_port_factory()
                 # Pin the modem's identity across a USB re-enumeration: a
                 # different physical device that happens to enumerate at the
                 # same VID/PID afterwards must never be silently treated as
@@ -960,7 +1103,10 @@ def cmd_up(
 
                 state = at_mod.sim_state(at_port)
                 if state != "READY":
-                    print(f"SIM not ready ({state})" if state else "SIM not ready", file=sys.stderr)
+                    message = _sim_problem(state)
+                    if restart_count:
+                        raise _RebuildError(message)
+                    print(message, file=sys.stderr)
                     return 1
                 if args.dry_run:
                     ip = _dry_run_pdp_state(at_port, args)
@@ -972,6 +1118,8 @@ def cmd_up(
                         # unknown (the modem may still finish activating
                         # it), so deactivate it best-effort on cleanup.
                         pdp_active = isinstance(exc, at_mod.AtTimeoutError)
+                        if restart_count:
+                            raise _RebuildError(_maybe_redact(args, str(exc))) from exc
                         print(_maybe_redact(args, str(exc)), file=sys.stderr)
                         return 1
                     _log.info("%s", defined)
@@ -979,6 +1127,8 @@ def cmd_up(
                     pdp_active = True
                     ip = at_mod.ip_address(at_port, args.cid)
                     if ip is None:
+                        if restart_count:
+                            raise _RebuildError("no IP address assigned")
                         print("no IP address assigned", file=sys.stderr)
                         return 1
                     try:
@@ -1016,6 +1166,13 @@ def cmd_up(
                     device = RndisDevice(usb_ctx)
                     init = device.initialize()
                     _log.info("RNDIS initialized: v%d.%d max_transfer_size=%d", init.major, init.minor, init.max_transfer_size)
+                    try:
+                        max_transfer_size = clamp_max_transfer_size(init.max_transfer_size)
+                    except ValueError as exc:
+                        if restart_count:
+                            raise _RebuildError(f"RNDIS: {exc}") from exc
+                        print(f"RNDIS: {exc}", file=sys.stderr)
+                        return 1
                     our_mac = device.mac()
                     device.set_packet_filter()
                     _log.info("device MAC: %s", our_mac.hex(":"))
@@ -1057,16 +1214,24 @@ def cmd_up(
                     # Alignment 0: Linux rndis_host ignores it on RX, and 0 is what was verified on hardware.
                     if args.io == "async":
                         bridge = AsyncBridge(
-                            usb_ctx, utun, our_mac, our_ip, max_transfer_size=init.max_transfer_size,
+                            usb_ctx, utun, our_mac, our_ip, max_transfer_size=max_transfer_size,
                             rx_urbs=args.rx_urbs, tx_urbs=args.tx_urbs,
                             packet_alignment_factor=0,
                         )
                     else:
                         bridge = Bridge(
-                            usb_ctx, utun, our_mac, our_ip, max_transfer_size=init.max_transfer_size,
+                            usb_ctx, utun, our_mac, our_ip, max_transfer_size=max_transfer_size,
                             packet_alignment_factor=0,
                         )
                     bridge.start()
+                    session_started = reenum_time_source()
+                    if restart_count:
+                        _log.warning("session rebuilt (restart #%d); bridge running again", restart_count)
+                    # The (re)build succeeded: a later failure starts a fresh
+                    # retry budget.
+                    rebuild_attempts = 0
+                    rebuild_backoff = _REBUILD_BACKOFF_INITIAL_S
+                    rebuild_deadline = None
                     _log.info("bridge running (--io %s); Ctrl-C to stop", args.io)
 
                     if args.supervise:
@@ -1088,11 +1253,48 @@ def cmd_up(
                         if sup.current_ip is not None:
                             previous_ip = sup.current_ip
                         if sup.failure_reason:
+                            failure_reason = sup.failure_reason
                             if bridge.failed.is_set() and bridge.device_lost:
                                 device_lost = True
+                            elif not _usb_device_alive(usb_ctx):
+                                _log.warning(
+                                    "bridge failed (%s) and the modem is no longer on the bus; "
+                                    "treating it as a device loss", sup.failure_reason,
+                                )
+                                device_lost = True
                             else:
-                                print(f"bridge failed: {sup.failure_reason}", file=sys.stderr)
-                                return 2
+                                if reenum_time_source() - session_started >= _STABLE_SESSION_S:
+                                    rndis_rebuilds = 0
+                                # A stall the supervisor itself detected (it
+                                # already cycled the PDP context once) is
+                                # not the bridge breaking down: rebuild, but
+                                # don't count it toward the cap.
+                                stall = getattr(sup, "stall_failure", False)
+                                if not stall and rndis_rebuilds >= _MAX_RNDIS_REBUILDS:
+                                    print(
+                                        f"bridge failed: {sup.failure_reason} "
+                                        f"(after {rndis_rebuilds} rebuilds in a row; giving up)",
+                                        file=sys.stderr,
+                                    )
+                                    return 2
+                                rndis_rebuild = True
+                                if stall:
+                                    _log.warning(
+                                        "bridge failed (%s) but the modem is still there; rebuilding the session "
+                                        "(data-path stall: not counted toward the %d rebuilds in a row)",
+                                        sup.failure_reason, _MAX_RNDIS_REBUILDS,
+                                    )
+                                else:
+                                    rndis_rebuilds += 1
+                                    _log.warning(
+                                        "bridge failed (%s) but the modem is still there; rebuilding the session "
+                                        "(rebuild %d of at most %d in a row)",
+                                        sup.failure_reason, rndis_rebuilds, _MAX_RNDIS_REBUILDS,
+                                    )
+                            if rebuild_deadline is None:
+                                # The rebuild budget runs from the loss of
+                                # the session, re-enumeration wait included.
+                                rebuild_deadline = reenum_time_source() + _REBUILD_BUDGET_S
                     else:
                         shutdown.stop = shutdown.event.set
                         while not shutdown.event.is_set() and not bridge.failed.is_set():
@@ -1107,24 +1309,35 @@ def cmd_up(
                     _print_dry_run_plan(args, net)
                     return 0
 
-                if not device_lost:
+                if not device_lost and not rndis_rebuild:
                     return 0
-            except at_mod.AtTimeoutError as exc:
-                # A query with no final result code: the modem is wedged or
-                # gone. Fail cleanly (the finally below still tears down).
-                print(f"modem did not answer: {_maybe_redact(args, str(exc))}", file=sys.stderr)
-                return 1
+            except Exception as exc:
+                if restart_count and isinstance(exc, _RETRYABLE_REBUILD_ERRORS):
+                    # Retried below, once the finally has cleaned this
+                    # attempt up.
+                    rebuild_error = exc
+                elif isinstance(exc, at_mod.AtTimeoutError):
+                    # A query with no final result code: the modem is wedged
+                    # or gone. Fail cleanly (the finally below still tears down).
+                    print(f"modem did not answer: {_maybe_redact(args, str(exc))}", file=sys.stderr)
+                    return 1
+                else:
+                    raise
             finally:
                 # Further signals must not interrupt cleanup half-way.
                 shutdown.cleaning = True
                 shutdown.stop = None
+                # Nothing to say to a modem that is gone: PDP deactivate and
+                # RNDIS HALT would only fail (with a traceback each).
+                device_gone = device_lost or isinstance(rebuild_error, UsbNoDevice)
                 try:
                     # Order matters: stop routing traffic into the tunnel
                     # FIRST (routes/DNS), then stop the bridge, then
                     # deactivate the PDP context, and only then halt RNDIS.
-                    # If the modem is merely away (device_lost), keep the
-                    # interface and only drop what points into it.
-                    if device_lost:
+                    # If the session is about to be rebuilt (device_lost, an
+                    # RNDIS-level rebuild, or a retry), keep the interface
+                    # and only drop what points into it.
+                    if device_lost or rndis_rebuild or rebuild_error is not None:
                         _quiesce_net(net)
                     else:
                         try:
@@ -1138,38 +1351,100 @@ def cmd_up(
                             _log.exception("bridge.stop() failed")
                             bridge_stopped_cleanly = False
                         _log_bridge_stats(bridge)
-                    if pdp_active:
+                    if pdp_active and not device_gone:
+                        # Bounded short only when the session ends; before a
+                        # rebuild, wait the full activation timeout so a late
+                        # OK isn't read as the next command's reply.
+                        rebuilding = (rndis_rebuild and bridge_stopped_cleanly) or rebuild_error is not None
+                        deactivate_timeout = at_mod.ACTIVATE_TIMEOUT_S if rebuilding else _CLEANUP_DEACTIVATE_TIMEOUT_S
                         try:
-                            at_mod.deactivate(at_port, args.cid)
+                            at_mod.deactivate(at_port, args.cid, timeout=deactivate_timeout, stop_event=shutdown.abort)
+                        except at_mod.AtTimeoutError as exc:
+                            _log.warning("PDP deactivate did not finish: %s", exc)
                         except Exception:
                             _log.exception("PDP deactivate failed")
                     if usb_ctx is not None:
                         if bridge_stopped_cleanly:
-                            try:
-                                RndisDevice(usb_ctx).halt()
-                            except Exception:
-                                _log.exception("RNDIS halt failed")
+                            if not device_gone:
+                                try:
+                                    RndisDevice(usb_ctx).halt()
+                                except Exception:
+                                    _log.exception("RNDIS halt failed")
                             try:
                                 usb_ctx.close()
                             except Exception:
                                 _log.exception("usb_ctx.close() failed")
                         else:
                             _log.warning("skipping RNDIS halt/usb close: a bridge thread is still running")
-                    try:
-                        at_port.close()
-                    except Exception:
-                        _log.exception("at_port.close() failed")
+                    if at_port is not None:
+                        try:
+                            at_port.close()
+                        except Exception:
+                            _log.exception("at_port.close() failed")
                 finally:
                     shutdown.cleaning = False
 
-            # Reached only when device_lost: the USB device disappeared but
-            # --supervise is on. DNS, the default route and host routes were
+            # Reached only when the session is to be rebuilt (--supervise):
+            # after a device loss, an RNDIS-level rebuild, or a failed
+            # rebuild attempt. DNS, the default route and host routes were
             # removed above (so the Mac isn't left routing into a dead utun)
-            # and are re-added after the rebuild; the utun itself stays. Wait
-            # for the modem to re-enumerate, then rebuild AT/RNDIS/bridge.
+            # and are re-added after the rebuild; the utun itself stays.
             if shutdown.event.is_set():
                 return 0  # a signal arrived during cleanup: don't wait for the modem
+            if rndis_rebuild and not bridge_stopped_cleanly:
+                # The USB handle was leaked or marked unsafe (a bridge thread
+                # may still be using it): an RNDIS-level rebuild can't reuse it.
+                print(
+                    f"bridge failed: {failure_reason}; not rebuilding the session: the bridge did not stop "
+                    "cleanly, so its USB handle is unsafe to reuse. Replug the modem and run 'fm350mac up' again.",
+                    file=sys.stderr,
+                )
+                return 2
+            if rebuild_error is not None:
+                cause = _maybe_redact(args, f"{type(rebuild_error).__name__}: {rebuild_error}")
+                now = reenum_time_source()
+                if rebuild_deadline is None:
+                    rebuild_deadline = now + _REBUILD_BUDGET_S
+                if now + rebuild_backoff > rebuild_deadline:
+                    print(
+                        f"could not rebuild the session within {_REBUILD_BUDGET_S:.0f}s; "
+                        f"giving up (last error: {cause})",
+                        file=sys.stderr,
+                    )
+                    return 3
+                rebuild_attempts += 1
+                _log.warning(
+                    "rebuilding the session failed (attempt %d): %s; retrying in %.0fs",
+                    rebuild_attempts, cause, rebuild_backoff,
+                )
+                reenum_sleep(rebuild_backoff)
+                rebuild_backoff = min(rebuild_backoff * 2, _REBUILD_BACKOFF_MAX_S)
+                # A single probe if the modem is there; if it vanished in the
+                # meantime, wait for it to come back first.
+                absent: list[bool] = []
+                if not _wait_for_reenumeration(
+                    find_device_factory, args.reenum_timeout, reenum_sleep, reenum_time_source,
+                    on_absent=lambda: absent.append(True),
+                ):
+                    print(f"modem did not re-enumerate within {args.reenum_timeout:.0f}s; giving up", file=sys.stderr)
+                    return 3
+                if reenum_time_source() > rebuild_deadline:
+                    print(
+                        f"could not rebuild the session within {_REBUILD_BUDGET_S:.0f}s; "
+                        f"giving up (last error: {cause})",
+                        file=sys.stderr,
+                    )
+                    return 3
+                if absent:
+                    _log.info("modem re-enumerated; waiting %.0fs for its firmware to settle", _REENUM_SETTLE_S)
+                    reenum_sleep(_REENUM_SETTLE_S)
+                continue
             restart_count += 1
+            if rndis_rebuild:
+                # The modem never left: no re-enumeration to wait for, only a
+                # short pause between the HALT above and the next INIT.
+                reenum_sleep(_RNDIS_REBUILD_SETTLE_S)
+                continue
             _log.warning(
                 "modem disconnected (restart #%d); waiting up to %.0fs for it to re-enumerate...",
                 restart_count, args.reenum_timeout,
@@ -1215,9 +1490,9 @@ def _cmd_up_loopback(
     route even if --default-route was also passed. Uses the root helper by
     default, same as plain ``up`` -- see cmd_up()'s docstring.
     """
-    ok, helper_net = _resolve_helper(args, geteuid=geteuid, helper_probe_factory=helper_probe_factory)
+    ok, helper_net, reason = _resolve_helper(args, geteuid=geteuid, helper_probe_factory=helper_probe_factory)
     if not ok:
-        return _helper_or_root_error("fm350mac up --loopback")
+        return _helper_or_root_error("fm350mac up --loopback", reason, no_helper=args.no_helper)
     if helper_net is not None:
         utun_factory = helper_net.open_utun
         net_config_factory = lambda dry_run: helper_net  # noqa: E731 -- dry_run is always False here
@@ -1302,6 +1577,8 @@ def cmd_async_selftest(
     rndis_usb_factory=RndisUsb,
     reenum_sleep=time.sleep,
     reenum_time_source=time.monotonic,
+    stdin_isatty=lambda: sys.stdin.isatty(),
+    input_fn=input,
 ) -> int:
     """Live, read-only(ish) check of the async transfer pools against the
     real modem, with no SIM needed (see docs/macos-driver.md, "Verification
@@ -1318,8 +1595,21 @@ def cmd_async_selftest(
     Step 2 leaves the modem's OUT queue jammed on purpose, so this always
     ends with ``UsbDevice.reset()`` and a fresh RNDIS INIT to confirm the
     modem is healthy afterwards -- don't run this more than a couple of
-    times in a row.
+    times in a row. That reset can kill an active session, so this needs
+    ``--yes`` (or an interactive "yes" on a TTY).
     """
+    if not getattr(_args, "yes", False):
+        confirmed = False
+        if stdin_isatty():
+            answer = input_fn("async-selftest ends with a USB reset of the modem, which kills an active session. Type 'yes' to continue: ")
+            confirmed = answer.strip().lower() == "yes"
+        if not confirmed:
+            print(
+                "fm350mac: async-selftest ends with a USB reset that can kill an active session. "
+                "Re-run with --yes to confirm.",
+                file=sys.stderr,
+            )
+            return 1
     overall_ok = True
     dev = find_device_factory()
     try:
@@ -1436,7 +1726,8 @@ def cmd_async_selftest(
 def build_parser() -> argparse.ArgumentParser:
     """Build the fm350mac argparse CLI."""
     parser = argparse.ArgumentParser(prog="fm350mac", description="User-space macOS data path for the FM350-GL")
-    parser.add_argument("--verbose", action="store_true", help="enable debug logging")
+    parser.add_argument("--version", action="version", version=f"fm350mac {__version__}")
+    parser.add_argument("--verbose", action="store_true", help="enable debug logging (and tracebacks on errors)")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_probe = sub.add_parser("probe", help="RNDIS init + query OIDs, then halt (no root)")
@@ -1477,15 +1768,28 @@ def build_parser() -> argparse.ArgumentParser:
     p_disconnect.add_argument("--cid", type=_int_range_arg(1, 15), default=DEFAULT_CID)
     p_disconnect.set_defaults(func=cmd_disconnect)
 
-    p_up = sub.add_parser("up", help="run the full session: AT + RNDIS + utun + routes + pump")
-    p_up.add_argument("--apn", required=True, type=_apn_arg)
+    p_up = sub.add_parser(
+        "up",
+        help="run the full session: AT + RNDIS + utun + routes + pump",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "exit codes:\n"
+            "  0    ok\n"
+            "  1    error\n"
+            "  2    bridge failure / usage error\n"
+            "  3    modem did not come back, or rebuild budget exhausted\n"
+            "  4    modem identity changed\n"
+            "  130  interrupted"
+        ),
+    )
+    p_up.add_argument("--apn", default=None, type=_apn_arg, help="APN (required unless --loopback)")
     p_up.add_argument(
         "--pdp", default=DEFAULT_PDP_TYPE, type=_pdp_type_arg, choices=[DEFAULT_PDP_TYPE],
         help="PDP type (only IP: the data path is IPv4-only)",
     )
     p_up.add_argument("--cid", type=_int_range_arg(1, 15), default=DEFAULT_CID)
     p_up.add_argument("--redact", action="store_true", help="mask the assigned IP/DNS and IMEI in logs")
-    p_up.add_argument("--default-route", action="store_true", help="route default traffic through the tunnel")
+    p_up.add_argument("--default-route", action="store_true", help="(experimental, unverified on hardware) route default traffic through the tunnel")
     p_up.add_argument(
         "--route-host", action="append", default=None, type=_route_host_arg, metavar="IP",
         help=f"route just this IPv4 host through the tunnel (host route IP -> utunN); repeatable, max {MAX_HOST_ROUTES}. "
@@ -1493,7 +1797,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_up.add_argument(
         "--dns", action="store_true",
-        help="publish the modem's DNS servers via scutil (requires --default-route; the DNS servers are always "
+        help="(experimental, unverified on hardware) publish the modem's DNS servers via scutil (requires --default-route; the DNS servers are always "
         "queried and logged either way)",
     )
     p_up.add_argument(
@@ -1522,8 +1826,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_up.add_argument(
         "--io", choices=("sync", "async"), default="async",
-        help="data-path implementation: async keeps several USB transfers in flight per "
-        "direction (default), sync is the one-transfer-per-packet fallback",
+        help="async (default) or sync (frozen fallback, unsupported in 0.1.0a1)",
     )
     p_up.add_argument(
         "--rx-urbs", type=_int_range_arg(1, 64), default=DEFAULT_RX_URBS,
@@ -1537,8 +1840,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_selftest = sub.add_parser(
         "async-selftest",
-        help="live, read-only check of the async USB transfer pools (no SIM needed; ends with a USB reset)",
+        help="live check of the async USB transfer pools (no SIM needed; ends with a USB reset that can kill "
+        "an active session; needs --yes or an interactive confirmation)",
     )
+    p_selftest.add_argument("--yes", action="store_true", help="confirm that the modem may be USB-reset at the end")
     p_selftest.set_defaults(func=cmd_async_selftest)
 
     p_helper = sub.add_parser("helper", help="manage the root helper LaunchDaemon (see docs/macos-driver.md)")
@@ -1549,6 +1854,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_helper_install.add_argument(
         "--allowed-uid", type=int, default=None,
         help="uid allowed to use the helper (default: $SUDO_UID, i.e. the user who ran sudo)",
+    )
+    p_helper_install.add_argument(
+        "--expect-sha256", type=_sha256_arg, default=None, metavar="HEX",
+        help="refuse to install unless the helper file's sha256 is HEX (printed by --dry-run)",
     )
     p_helper_install.set_defaults(func=helper_admin.cmd_helper_install)
 
@@ -1562,12 +1871,57 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _expected_failure_message(exc: BaseException, args: argparse.Namespace) -> str | None:
+    """Map an expected failure to ``<cause>. <next step>`` (without the
+    ``fm350mac: `` prefix), or None if it is not an expected failure.
+    """
+    if isinstance(exc, LibusbNotFound):
+        return "libusb not found. Install it: brew install libusb"
+    if isinstance(exc, UsbNoDevice):
+        return (
+            "FM350 (0e8d:7126/7127) not found. Check the USB cable/adapter and power; "
+            "`system_profiler SPUSBDataType` must list it. Another VID/PID means the module is in a "
+            "different USB mode (see docs/dell-dw5931e-usb.md)"
+        )
+    if isinstance(exc, UsbError):
+        if exc.code in (LIBUSB_ERROR_BUSY, LIBUSB_ERROR_ACCESS):
+            return (
+                "the modem is in use by another process (close fm350_diag/other modem tools "
+                "or a second `fm350mac up`)"
+            )
+        return f"USB error: {exc}. Replug the modem and retry; run with --verbose for details"
+    if isinstance(exc, at_mod.UnknownAtInterface):
+        return f"{exc}. The modem is in an unsupported USB mode; pass --iface N to `fm350mac at` to override"
+    if isinstance(exc, HelperError):
+        if not is_helper_version_mismatch(exc):
+            return f"helper error: {exc}"  # an operational refusal: reinstalling wouldn't change it
+        return f"helper error: {exc}. Check `fm350mac helper status`; reinstall with sudo \"$(command -v fm350mac)\" helper install"
+    if isinstance(exc, at_mod.AtTimeoutError):
+        return f"the modem did not answer ({_maybe_redact(args, str(exc))}). Unplug/replug the modem and retry"
+    if isinstance(exc, (rndis.RndisError, TimeoutError)):
+        return "RNDIS control channel did not respond; unplug/replug the modem"
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point (console script: fm350mac)."""
     parser = build_parser()
     args = parser.parse_args(argv)
     _setup_logging(args.verbose, redact=getattr(args, "redact", False))
-    return args.func(args)
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        return 130
+    except Exception as exc:
+        message = _expected_failure_message(exc, args)
+        if message is None:
+            raise  # not an expected failure: a bug, keep the traceback
+        # A SIM PIN is masked always; everything else only with --redact.
+        mask = redact_text if getattr(args, "redact", False) else redact_pin
+        print(f"fm350mac: {mask(message)}", file=sys.stderr)
+        if args.verbose:
+            print(mask(traceback.format_exc()), end="", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

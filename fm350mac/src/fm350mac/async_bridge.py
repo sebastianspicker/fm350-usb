@@ -10,6 +10,7 @@ either. See docs/macos-driver.md, "New data path AsyncBridge", for the design.
 from __future__ import annotations
 
 import logging
+import queue
 import socket
 import threading
 import time
@@ -45,6 +46,49 @@ _MAX_PENDING_RESPONSES = 8  # cap on queued RESPONSE_AVAILABLE notifications
 # the bound keeps a stalled modem (no data session) from wedging the thread.
 _TX_SLOT_WAIT_S = 1.0
 _TX_SLOT_POLL_S = 0.05
+# Keepalive watchdog: the FM350 answers each of our keepalives (every
+# _KEEPALIVE_INTERVAL_S) with a KEEPALIVE_CMPLT, delivered through the normal
+# RESPONSE_AVAILABLE -> GET_ENCAPSULATED_RESPONSE flow. If none arrives for
+# this many intervals the device's control side is wedged (a data session
+# that silently stopped passing traffic), so the bridge fails and the
+# caller's rebuild path takes over. Only timestamps: never an extra GET.
+_KEEPALIVE_MISSED_LIMIT = 3
+# ARP replies that found every OUT slot busy, waiting for the tx thread (see
+# _handle_arp). A handful is plenty: the modem asks for one MAC.
+_CONTROL_TX_QUEUE_MAX = 4
+
+# Sane range for the device-reported max_transfer_size (INIT_CMPLT): the FM350
+# reports 2048. Out-of-range values are clamped (with a warning); one too
+# small to carry an MTU-1500 frame is refused (see clamp_max_transfer_size).
+MIN_MAX_TRANSFER_SIZE = 1600
+MAX_MAX_TRANSFER_SIZE = 0x4000
+_MTU = 1500
+# PACKET_MSG header + Ethernet header + a full-MTU IP packet.
+_MTU_FRAME_TRANSFER_SIZE = len(rndis.pack_packet(b"\x00" * (14 + _MTU)))
+
+
+def clamp_max_transfer_size(reported: int) -> int:
+    """Clamp a device-reported max_transfer_size into
+    [MIN_MAX_TRANSFER_SIZE, MAX_MAX_TRANSFER_SIZE], warning when it had to.
+
+    Raises ValueError if ``reported`` can't even carry one MTU-1500 frame:
+    the data path would silently drop every full-size packet. Clamping up
+    to MIN_MAX_TRANSFER_SIZE is safe otherwise, since nothing larger than
+    an MTU-1500 frame is ever sent.
+    """
+    if reported < _MTU_FRAME_TRANSFER_SIZE:
+        raise ValueError(
+            f"device max_transfer_size {reported} is too small for an MTU-{_MTU} frame "
+            f"({_MTU_FRAME_TRANSFER_SIZE} bytes needed)"
+        )
+    if reported < MIN_MAX_TRANSFER_SIZE or reported > MAX_MAX_TRANSFER_SIZE:
+        clamped = min(max(reported, MIN_MAX_TRANSFER_SIZE), MAX_MAX_TRANSFER_SIZE)
+        _log.warning(
+            "device reported max_transfer_size=%d, outside [%d, %d]; using %d",
+            reported, MIN_MAX_TRANSFER_SIZE, MAX_MAX_TRANSFER_SIZE, clamped,
+        )
+        return clamped
+    return reported
 
 
 def _is_device_gone(exc: UsbError) -> bool:
@@ -62,6 +106,13 @@ class AsyncBridgeStats:
     drops: int = 0
     tx_stalls: int = 0  # genuine OUT timeouts plus pool-full drops
     tx_timeouts: int = 0  # genuine OUT timeouts/failures only (not pool-full drops)
+    # Instrumentation (see AsyncBridge.perf_snapshot). Each is written by a
+    # single thread, so none needs _stats_lock.
+    tx_slot_waits: int = 0  # times the tx thread found every OUT slot busy and had to wait (tx thread)
+    tx_slot_wait_ns: int = 0  # total time spent in those waits (tx thread)
+    rx_urbs: int = 0  # completed RX bulk transfers (event thread)
+    rx_urb_frames: int = 0  # Ethernet frames across them, so frames/URB = rx_urb_frames / rx_urbs (event thread)
+    rx_urb_frames_max: int = 0  # most frames seen in one RX URB (event thread)
 
 
 class AsyncBridge:
@@ -86,6 +137,7 @@ class AsyncBridge:
         self.our_mac = our_mac
         self._our_ip_lock = threading.Lock()
         self._our_ip = our_ip
+        max_transfer_size = clamp_max_transfer_size(max_transfer_size)
         self.max_transfer_size = max_transfer_size
         self.rx_urbs = rx_urbs
         self.tx_urbs = tx_urbs
@@ -115,6 +167,13 @@ class AsyncBridge:
         self._utun_write_log = RateLimiter(_LOG_INTERVAL_S)
         self._malformed_log = RateLimiter(_LOG_INTERVAL_S)
         self._utun_read_log = RateLimiter(_LOG_INTERVAL_S)
+        self._control_log = RateLimiter(_LOG_INTERVAL_S)
+        # ARP replies handed from the EventLoop thread to the tx thread when
+        # no OUT slot was free (see _handle_arp).
+        self._control_tx: queue.Queue[bytes] = queue.Queue(maxsize=_CONTROL_TX_QUEUE_MAX)
+        # monotonic time of the last successful KEEPALIVE_CMPLT (or of start()), only
+        # touched by the control thread: see _KEEPALIVE_MISSED_LIMIT.
+        self._last_keepalive_ack = time.monotonic()
         # stats are touched from both the tx thread
         # (_send_frame's pool-exhausted path) and the EventLoop thread
         # (_on_rx_complete/_handle_arp, _on_tx_result): a bare += is not
@@ -123,7 +182,7 @@ class AsyncBridge:
         self._stats_lock = threading.Lock()
 
         device = rndis_usb.usb_device
-        self._event_loop = EventLoop(device.libusb, device.ctx, usb_device=device)
+        self._event_loop = EventLoop(device.libusb, device.ctx, usb_device=device, on_fatal=self._on_pool_fatal)
         self._rx_pool = AsyncEndpoint(
             device.libusb, device.handle, rndis_usb.ep_bulk_in, "in", "bulk",
             count=rx_urbs, buffer_size=_RX_BUFFER_SIZE, timeout_ms=0,
@@ -160,9 +219,15 @@ class AsyncBridge:
         self.failed.clear()
         self.failure_reason = None
         self.device_lost = False
-        self.utun.settimeout(_UTUN_TIMEOUT_S)
+        # Non-blocking reads (recv first, poll only when idle) rather than a
+        # socket timeout, whose recv() polls before every packet.
+        self.utun.set_read_wait(_UTUN_TIMEOUT_S)
+        self.utun.tune_buffers()
         with self._notify_cond:
             self._pending_responses = 0
+        while not self._control_tx.empty():
+            self._control_tx.get_nowait()
+        self._last_keepalive_ack = time.monotonic()
         self._event_loop.start()
         # A failed initial submit marks the pool fatal, which fails the bridge
         # (via _on_pool_fatal) so the caller sees it instead of a dead pump.
@@ -204,6 +269,13 @@ class AsyncBridge:
         drained = self._event_loop.stop()
         return all_stopped and drained
 
+    def fail(self, reason: str) -> None:
+        """Fail the bridge from outside (e.g. the supervisor's stall
+        detector), exactly like an internal fatal error: ``failed`` is set,
+        both threads stop, and the caller's rebuild path takes over.
+        """
+        self._mark_failed(reason)
+
     def _run_guarded(self, target, name: str) -> None:
         try:
             target()
@@ -238,6 +310,11 @@ class AsyncBridge:
 
     def _on_rx_complete(self, data: bytes) -> None:
         frames, malformed = rndis.unpack_packets_counted(data, self.packet_alignment_factor)
+        stats = self.stats
+        stats.rx_urbs += 1
+        stats.rx_urb_frames += len(frames)
+        if len(frames) > stats.rx_urb_frames_max:
+            stats.rx_urb_frames_max = len(frames)
         if malformed:
             self._incr_stat("drops")
             if self._malformed_log.allow():
@@ -293,13 +370,38 @@ class AsyncBridge:
             return
         reply_payload = ethernet.build_arp_reply(arp, self.our_mac, self.our_ip)
         frame = ethernet.wrap(reply_payload, ethernet.ETH_P_ARP, dst=arp.sha, src=self.our_mac)
-        self._send_frame(frame)
+        msg = self._out_msg(frame)
+        if msg is None or self._tx_pool.submit_out(msg):
+            return
+        # Every OUT slot is busy (e.g. under upload load): this runs on the
+        # EventLoop thread, which must never wait for a slot, so hand the
+        # reply to the tx thread, which sends it before its next utun packet.
+        # A small queue rather than an OUT slot reserved for control frames:
+        # reserving one would shrink the data pool (to nothing with
+        # --tx-urbs 1) and needs a pool API change, while the queue leaves
+        # the pool alone and costs at most one utun read timeout of latency.
+        try:
+            self._control_tx.put_nowait(msg)
+        except queue.Full:
+            # Not a tx_stall: those count data packets the modem didn't take.
+            self._incr_stat("drops")
 
     # --- tx: utun -> async OUT pool ------------------------------------------
+
+    def _drain_control_tx(self) -> None:
+        """Send queued ARP replies (tx thread only, see _handle_arp)."""
+        while not self._stop.is_set():
+            try:
+                msg = self._control_tx.get_nowait()
+            except queue.Empty:
+                return
+            if not self._submit_waiting(msg, None) and not self._stop.is_set():
+                self._incr_stat("drops")  # an ARP reply, not a data packet: no tx_stall
 
     def _tx_loop(self) -> None:
         read_errors = 0
         while not self._stop.is_set():
+            self._drain_control_tx()
             try:
                 payload = self.utun.read()
             except (socket.timeout, TimeoutError):
@@ -332,13 +434,68 @@ class AsyncBridge:
 
     def _send_frame(self, frame: bytes, ip_len: int | None = None, wait_for_slot: bool = False) -> None:
         """Submit one Ethernet ``frame``; ``ip_len`` (the IP packet's length)
-        is what tx stats count once it completes -- None for our ARP replies.
+        is what tx stats count once it completes -- None for a frame that
+        isn't counted. (ARP replies don't come through here: see _handle_arp.)
 
         ``wait_for_slot`` (tx thread only): if every OUT transfer is in
         flight, wait up to _TX_SLOT_WAIT_S for one to retire instead of
         dropping at once (backpressure; see _TX_SLOT_WAIT_S). Never on the
         EventLoop thread -- that's the thread that retires transfers, so
         waiting there could only time out.
+        """
+        msg = self._out_msg(frame)
+        if msg is None:
+            return
+        if wait_for_slot:
+            if self._submit_waiting(msg, ip_len):
+                return
+        elif self._tx_pool.submit_out(msg, metadata=ip_len):
+            return
+        if self._stop.is_set():
+            return  # shutting down: not a stall, nothing to count
+        # Every OUT transfer is (still) in flight: the modem's queue (or our
+        # own pool) is full. Not fatal -- counted and rate-limited, same as a
+        # sync bulk_write timeout (see bridge.py).
+        self._incr_stat("tx_stalls")
+        self._incr_stat("drops")
+        self._warn_tx_stall_rate_limited()
+
+    def perf_snapshot(self) -> dict:
+        """Instrumentation for tuning the pools (see docs/macos-driver.md,
+        "Performance and tuning"): OUT submit->completion latency histogram,
+        max OUT transfers in flight, tx slot waits, and frames per RX URB.
+        A cheap read of counters written by other threads: values can be a
+        packet behind each other, which is fine for a log line.
+        """
+        stats = self.stats
+        return {
+            "out_latency": self._tx_pool.out_latency(),
+            "tx_inflight_max": self._tx_pool.out_inflight_max,
+            "tx_urbs": self.tx_urbs,
+            "tx_slot_waits": stats.tx_slot_waits,
+            "tx_slot_wait_ms": stats.tx_slot_wait_ns / 1e6,
+            "rx_urbs": stats.rx_urbs,
+            "rx_frames_per_urb_mean": (stats.rx_urb_frames / stats.rx_urbs) if stats.rx_urbs else 0.0,
+            "rx_frames_per_urb_max": stats.rx_urb_frames_max,
+        }
+
+    def perf_summary(self) -> str:
+        """``perf_snapshot()`` as one log-friendly ``key=value`` line body."""
+        snap = self.perf_snapshot()
+        lat = snap["out_latency"]
+        labels = [f"<{us}us" for us in lat["bounds_us"]] + [f">={lat['bounds_us'][-1]}us"]
+        hist = ",".join(f"{label}:{n}" for label, n in zip(labels, lat["buckets"]))
+        return (
+            f"out_latency[n={lat['count']} mean={lat['mean_us']:.0f}us max={lat['max_us']:.0f}us {hist}] "
+            f"tx_inflight_max={snap['tx_inflight_max']}/{snap['tx_urbs']} "
+            f"tx_slot_waits={snap['tx_slot_waits']} tx_slot_wait={snap['tx_slot_wait_ms']:.1f}ms "
+            f"rx_urbs={snap['rx_urbs']} rx_frames_per_urb mean={snap['rx_frames_per_urb_mean']:.2f} "
+            f"max={snap['rx_frames_per_urb_max']}"
+        )
+
+    def _out_msg(self, frame: bytes) -> bytes | None:
+        """Wrap ``frame`` in a PACKET_MSG ready for the OUT pool, or count a
+        drop and return None if it exceeds max_transfer_size.
         """
         msg = rndis.pack_packet(frame)
         if len(msg) > self.max_transfer_size:
@@ -347,14 +504,23 @@ class AsyncBridge:
                 "dropping oversized frame: PACKET_MSG %d bytes > max_transfer_size %d",
                 len(msg), self.max_transfer_size,
             )
-            return
+            return None
         if len(msg) % self.usb.bulk_out_max_packet == 0:
             msg = msg + b"\x00"  # see usb_transport.RndisUsb.bulk_write for why
+        return msg
+
+    def _submit_waiting(self, msg: bytes, ip_len: int | None) -> bool:
+        """Submit ``msg``, waiting up to _TX_SLOT_WAIT_S for a free OUT slot
+        (tx thread only, see _send_frame). False if none freed up in time or
+        the bridge is stopping.
+        """
         with self._tx_slot_freed:
             seen = self._tx_slots_freed
         if self._tx_pool.submit_out(msg, metadata=ip_len):
-            return
-        if wait_for_slot:
+            return True
+        wait_start_ns = time.perf_counter_ns()
+        self.stats.tx_slot_waits += 1
+        try:
             deadline = time.monotonic() + _TX_SLOT_WAIT_S
             while not self._stop.is_set() and time.monotonic() < deadline:
                 with self._tx_slot_freed:
@@ -364,13 +530,10 @@ class AsyncBridge:
                         self._tx_slot_freed.wait(_TX_SLOT_POLL_S)
                     seen = self._tx_slots_freed
                 if self._tx_pool.submit_out(msg, metadata=ip_len):
-                    return
-        # Every OUT transfer is (still) in flight: the modem's queue (or our
-        # own pool) is full. Not fatal -- counted and rate-limited, same as a
-        # sync bulk_write timeout (see bridge.py).
-        self._incr_stat("tx_stalls")
-        self._incr_stat("drops")
-        self._warn_tx_stall_rate_limited()
+                    return True
+            return False
+        finally:
+            self.stats.tx_slot_wait_ns += time.perf_counter_ns() - wait_start_ns
 
     def _on_tx_result(self, ok: bool, _actual_length: int, ip_len: int | None) -> None:
         """Called on the EventLoop thread when a submitted OUT transfer
@@ -444,6 +607,13 @@ class AsyncBridge:
         last_keepalive = 0.0
         while not self._stop.is_set():
             now = time.monotonic()
+            silent_s = now - self._last_keepalive_ack
+            if silent_s > _KEEPALIVE_MISSED_LIMIT * _KEEPALIVE_INTERVAL_S:
+                self._mark_failed(
+                    f"control: no successful KEEPALIVE_CMPLT for {silent_s:.0f}s "
+                    f"({_KEEPALIVE_MISSED_LIMIT} keepalive intervals): device control path unresponsive"
+                )
+                return
             if now - last_keepalive >= _KEEPALIVE_INTERVAL_S:
                 self._send_keepalive()
                 last_keepalive = now
@@ -459,7 +629,8 @@ class AsyncBridge:
                 if _is_device_gone(exc):
                     self._mark_failed(f"control: get_encapsulated: device disconnected ({exc})", device_lost=True)
                     return
-                _log.exception("control: get_encapsulated failed")
+                if self._control_log.allow():
+                    _log.exception("control: get_encapsulated failed (further failures rate-limited)")
                 continue
             if rndis.is_empty_response(msg):
                 # RNDIS spec: a 1-byte 0x00 reply means "no response available".
@@ -467,8 +638,15 @@ class AsyncBridge:
                 continue
             try:
                 self._handle_control_msg(msg)
-            except (UsbError, rndis.RndisError, ValueError):
-                _log.exception("control: failed to handle message")
+            except UsbError as exc:
+                if _is_device_gone(exc):
+                    self._mark_failed(f"control: send_encapsulated: device disconnected ({exc})", device_lost=True)
+                    return
+                if self._control_log.allow():
+                    _log.exception("control: failed to handle message (further failures rate-limited)")
+            except (rndis.RndisError, ValueError):
+                if self._control_log.allow():
+                    _log.exception("control: failed to handle message (further failures rate-limited)")
 
     def _send_keepalive(self) -> None:
         self._keepalive_request_id += 1
@@ -477,8 +655,8 @@ class AsyncBridge:
         except UsbError as exc:
             if _is_device_gone(exc):
                 self._mark_failed(f"control: keepalive send: device disconnected ({exc})", device_lost=True)
-            else:
-                _log.exception("control: keepalive send failed")
+            elif self._control_log.allow():
+                _log.exception("control: keepalive send failed (further failures rate-limited)")
 
     def _handle_control_msg(self, msg: bytes) -> None:
         msg_type = rndis.message_type(msg)
@@ -489,4 +667,15 @@ class AsyncBridge:
             status = rndis.parse_indicate_status(msg)
             _log.info("RNDIS INDICATE_STATUS status=%#x", status.status)
         elif msg_type == rndis.KEEPALIVE_CMPLT:
+            cmplt = rndis.parse_keepalive_cmplt(msg)
+            if cmplt.status != 0:
+                # Not an ack: the keepalive watchdog fails the bridge only if
+                # no successful one arrives within its limit, so a single
+                # error status doesn't tear the session down.
+                _log.warning(
+                    "control: KEEPALIVE_CMPLT status=%#x: device reports an error; not counted as an ack",
+                    cmplt.status,
+                )
+                return
+            self._last_keepalive_ack = time.monotonic()
             _log.debug("our keepalive was acknowledged")

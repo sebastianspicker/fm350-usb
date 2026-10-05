@@ -25,7 +25,7 @@ STATE_DIR=/etc/fm350-usb
 # Pinned to the mrhaav/openwrt commit we tested against (master as of
 # 2026-09-25; unchanged since 2026-05-18), and verified by SHA-256 before
 # anything is installed. The .ipk of atc-fib-fm350_gl is byte-identical to the
-# one openwrt/tests/atc-test.sh runs. To move to a newer release: pick the new
+# one tested against a fake modem. To move to a newer release: pick the new
 # commit and file names, download the files, check them, and update the URLs
 # and hashes together.
 MRHAAV_COMMIT="0d56d844cc49906285c9181a008186f4af515c85"
@@ -48,7 +48,7 @@ dry_run=0
 no_mwan3=0
 no_watchdog=0
 install_extras=0
-skip_packages=0 # hidden: for openwrt/tests/docker-test.sh only, no packages/downloads
+skip_packages=0 # hidden: for local Docker testing only, no packages/downloads
 
 usage() {
 	cat <<'EOF'
@@ -706,7 +706,7 @@ else
 		cp "$FILES_DIR/etc/init.d/fm350-watchdog" /etc/init.d/fm350-watchdog
 		chmod 0755 /etc/init.d/fm350-watchdog
 		# Only enable (symlink for boot), never start here: install.sh may be
-		# running where procd isn't up yet (e.g. tests/docker-test.sh's plain
+		# running where procd isn't up yet (e.g. a plain Docker
 		# rootfs container), and mwan3/network/firewall aren't reloaded by
 		# install.sh either - see the final log message below for the same
 		# "you reload/start it" convention used for those. `enable` itself

@@ -8,8 +8,7 @@
 # + return). Any other +CME ERROR seen during activation is only logged
 # (atc_debug>=1) and otherwise silently ignored, so proto_atc_setup is left
 # blocked reading URCs off the tty that will never arrive - see
-# docs/compatibility-and-risks.md and tests/atc-test.sh's "cgact_error"
-# scenario comment for the traced detail. netifd then reports the interface
+# docs/compatibility-and-risks.md for the traced detail. netifd then reports the interface
 # as "pending"/"connecting" indefinitely, mwan3 never marks it up, and
 # failover to 5G silently never becomes available. On the bench, `ifup
 # wwan` (after an `ifdown`) unsticks it; this script automates exactly that.
@@ -83,8 +82,8 @@
 # touch their arguments/globals plus interface_up()/interface_errors()/
 # restart_interface()/should_manage()/device_missing()/paused()/now()/log() -
 # each a thin, one-line wrapper around a single external command
-# (ifstatus/ifup+ifdown/uci/date/logger respectively). tests/watchdog-test.sh
-# and tests/watchdog-unit-test.sh source this file (FM350_WATCHDOG_TEST=1
+# (ifstatus/ifup+ifdown/uci/date/logger respectively). The local
+# watchdog tests source this file (FM350_WATCHDOG_TEST=1
 # skips the "$@"-driven main() call at the bottom) and override those wrapper
 # functions with fakes before calling tick() directly, so the whole decision
 # state machine runs without procd, netifd, or a real modem. POSIX sh/ash

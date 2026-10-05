@@ -15,6 +15,14 @@ from .usb_transport import RndisUsb
 
 _log = logging.getLogger(__name__)
 
+# The only GET_ENCAPSULATED_RESPONSEs ever sent without a notification (see
+# _get_response). Kept on purpose: they run on every bring-up on hardware
+# without crashing the firmware, unlike the unbounded polling that did (see
+# _get_response's docstring). They're safe because they're bounded twice:
+# at most _MAX_FALLBACK_POLLS per request, each at least
+# _FALLBACK_POLL_INTERVAL after the previous fetch -- a handful of spaced
+# control transfers per INIT/QUERY/SET, never a tight loop. The async data
+# path (async_bridge.py) never polls at all.
 _MAX_FALLBACK_POLLS = 3
 _FALLBACK_POLL_INTERVAL = 0.1
 

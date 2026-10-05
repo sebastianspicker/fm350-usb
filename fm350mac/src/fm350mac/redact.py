@@ -1,5 +1,6 @@
 """Mask identifying data (phone numbers, IMSI/IMEI/ICCID, IP addresses,
-TAC/cell ID) in AT response text and log lines, for pasting into bug reports.
+TAC/cell ID, SIM PINs) in AT response text and log lines, for pasting into
+bug reports.
 
 Pure string functions, no I/O.
 """
@@ -33,7 +34,22 @@ _DOTTED_ADDRESS_PARTS = frozenset({8, 16, 32})
 # +CREG/+CGREG/+CEREG/+C5GREG with <n>=2/3 (or as a URC) carry the TAC/LAC
 # and cell ID as quoted hex strings after <stat>.
 _REG_LOCATION_RE = re.compile(r'(\+C(?:G|E|5G)?REG:[ \t]*\d+(?:[ \t]*,[ \t]*\d+)?[ \t]*,[ \t]*)"[0-9A-Fa-f]*"([ \t]*,[ \t]*)"[0-9A-Fa-f]*"')
+# AT+CPIN=<pin>[,<newpin>] (also a bare "+CPIN=..." echo fragment): every
+# argument, quoted or not, is a PIN or PUK.
+_CPIN_SET_RE = re.compile(r'(?i)((?:AT)?\+CPIN[ \t]*=[ \t]*)(?:"[^"\r\n]*"?|\d+)(?:[ \t]*,[ \t]*(?:"[^"\r\n]*"?|\d+))*')
+# A PIN echoed back as a +CPIN: value (the state names like READY/SIM PIN
+# are words, never digits).
+_CPIN_ECHO_RE = re.compile(r'(\+CPIN:[ \t]*)"?\d{4,8}"?(?![\w"])')
 _IPV6_RE = re.compile(r"(?<![0-9A-Fa-f:.])(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}(?![0-9A-Fa-f:.])")
+
+
+def redact_pin(text: str) -> str:
+    """Mask SIM PIN/PUK arguments: ``AT+CPIN="1234"`` -> ``AT+CPIN="REDACTED"``
+    and a PIN echoed as a ``+CPIN:`` value. Applied always, not only with
+    ``--redact`` (see at.AtTimeoutError and cli.main).
+    """
+    text = _CPIN_SET_RE.sub(rf'\1"{REDACTED}"', text)
+    return _CPIN_ECHO_RE.sub(rf"\1{REDACTED}", text)
 
 
 def redact_gtccinfo(text: str) -> str:
@@ -67,13 +83,14 @@ def _dotted_replacement(match: re.Match, private_hint: bool) -> str:
 def redact_text(text: str, *, private_hint: bool = False) -> str:
     """Return ``text`` with identifying values masked as ``REDACTED``.
 
-    Masks +CNUM numbers, +CIMI/+CGSN/+GSN/+ICCID/+CCID values, ICCIDs
+    Masks SIM PINs (see redact_pin), +CNUM numbers, +CIMI/+CGSN/+GSN/+ICCID/+CCID values, ICCIDs
     anywhere, bare 14-16 digit IMEI/IMSI lines, TAC/cell ID in +GTCCINFO
     rows and +C(E|G|5G)REG location fields, and IPv4/IPv6 addresses
     (including 27.007's dotted IPv6 and address+mask forms; ``0.0.0.0``/``::``
     are kept). With ``private_hint`` an address in a private/link-local
     range is masked as ``REDACTED(private)`` instead.
     """
+    text = redact_pin(text)
     text = _CNUM_RE.sub(rf"\1{REDACTED}\2", text)
     text = _ID_PREFIX_RE.sub(rf"\1{REDACTED}", text)
     text = _ICCID_RE.sub(REDACTED, text)

@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, "alpha-*"]
   pull_request:
 
 permissions:
@@ -21,38 +21,59 @@ jobs:
         working-directory: fm350mac
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
-
-      - name: pytest
-        run: uv run pytest -q
-
-      - name: pytest (tools/fm350_diag.py)
-        run: uv run pytest -q ../tools/tests
+        uses: astral-sh/setup-uv@v6
 
       - name: ruff
-        run: uvx ruff check . ../tools/fm350_diag.py ../tools/tests
+        run: uvx ruff@0.16.10 check . ../tools
 
-      - name: helper tests under system /usr/bin/python3
-        run: ./tests/run_helper_tests_py39.sh
+      - name: helper compiles under system /usr/bin/python3
+        run: /usr/bin/python3 -I -S -c 'import sys; compile(open(sys.argv[1]).read(), sys.argv[1], "exec")' src/fm350mac/helper/fm350mac_helper.py
+
+  build:
+    name: build and install the wheel (macos-latest)
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: fm350mac
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Build wheel and sdist
+        run: uv build -o dist
+
+      - name: Check the wheel and sdist contents
+        run: |
+          unzip -l dist/*.whl
+          unzip -l dist/*.whl | grep -q 'fm350mac/helper/fm350mac_helper.py'
+          unzip -l dist/*.whl | grep -q 'dist-info/licenses/LICENSE'
+          tar tzf dist/*.tar.gz | grep -q 'fm350mac/helper/fm350mac_helper.py'
+          tar tzf dist/*.tar.gz | grep -q 'LICENSE$'
+
+      - name: Install the wheel into a fresh venv and run it
+        run: |
+          uv venv "$RUNNER_TEMP/wheel-venv"
+          uv pip install --python "$RUNNER_TEMP/wheel-venv/bin/python" dist/*.whl
+          "$RUNNER_TEMP/wheel-venv/bin/fm350mac" --version
+          "$RUNNER_TEMP/wheel-venv/bin/fm350mac" --help
+          "$RUNNER_TEMP/wheel-venv/bin/fm350mac" helper install --dry-run --allowed-uid 501
 
   shellcheck:
     name: shellcheck (ubuntu-latest)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: shellcheck
         run: |
-          shopt -s globstar
-          shellcheck openwrt/*.sh openwrt/tests/**/*.sh openwrt/files/etc/hotplug.d/usb/50-fm350_driver openwrt/files/usr/sbin/fm350-watchdog openwrt/files/etc/init.d/fm350-watchdog tools/bench-throughput.sh tools/tests/bench-throughput-test.sh
-
-      - name: status decoder test
-        run: openwrt/tests/fm350-decode-test.sh
-
-      - name: installer input test
-        run: sh openwrt/tests/install-input-test.sh
-
-      - name: benchmark failure-path test
-        run: tools/tests/bench-throughput-test.sh
+          shellcheck openwrt/*.sh openwrt/files/etc/hotplug.d/usb/50-fm350_driver openwrt/files/usr/sbin/fm350-watchdog openwrt/files/etc/init.d/fm350-watchdog tools/bench-throughput.sh

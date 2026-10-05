@@ -53,6 +53,8 @@ import tempfile
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 PROTOCOL_VERSION = 1
+# Release version of this file; must equal fm350mac.__version__ (a test checks).
+HELPER_VERSION = "0.1.0a1"
 DEFAULT_SOCKET_PATH = "/var/run/fm350mac-helper.sock"
 MAX_MESSAGE_BYTES = 4096
 
@@ -662,7 +664,7 @@ class ConnectionHandler:
         version = req["version"]
         if version != PROTOCOL_VERSION:
             raise HelperProtocolError(f"unsupported protocol version {version!r} (helper is {PROTOCOL_VERSION})")
-        self._send({"ok": True, "version": PROTOCOL_VERSION, "pid": os.getpid()})
+        self._send({"ok": True, "version": PROTOCOL_VERSION, "helper_version": HELPER_VERSION, "pid": os.getpid()})
 
     def _op_open_utun(self) -> None:
         if self._utun_opened:

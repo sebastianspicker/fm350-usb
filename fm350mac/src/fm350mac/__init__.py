@@ -5,4 +5,4 @@ macOS utun interface. See docs/macos-driver.md in the repo root for the
 architecture.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.0a1"

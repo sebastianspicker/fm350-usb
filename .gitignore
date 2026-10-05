@@ -10,9 +10,14 @@ __pycache__/
 *.egg-info/
 /dist/
 /build/
+/fm350mac/dist/
+*.whl
+*.tar.gz
 
-# Downloaded OpenWrt images and packages for the router tests (hundreds of MB)
-/openwrt/tests/.cache/
+# Test suites are kept local, not published
+/fm350mac/tests/
+/tools/tests/
+/openwrt/tests/
 
 # Captured modem logs (may contain IMEI, ICCID, cell IDs)
 *.nma
@@ -37,3 +42,6 @@ __pycache__/
 
 # fm350_diag.py run output (reports/transcripts/journals may hold operator or cell data)
 /fm350-diag-*/
+
+# Untracked scratch rewrite of the tree; never commit
+/rewritten/

@@ -32,9 +32,9 @@ unit, that was the answer.
 | Entry | What we learned | Where it's used elsewhere |
 |---|---|---|
 | Dongle on MacBook, no SIM | USB enumeration, firmware version and basic module state are all fine; no FCC lock; macOS has no RNDIS driver | README status table; Hardware (USB layout); Compatibility (FCC lock) |
-| No-SIM RNDIS experiments | Measured USB/codec throughput ceilings; the modem's TX queue only accepts 3 writes without a bearer; polling the control channel without a notification crashes the modem firmware | macOS design (Async USB I/O); fm350mac README (`--io async/sync`) |
-| `up --loopback` live (fake modem) | The utun/route/ping path works end to end against an in-process fake modem; a busy-spin bug caused high latency and was fixed | macOS design (GIL note); fm350mac README (`--loopback`) |
-| Privilege separation live | The root-helper split works, including automatic cleanup when the unprivileged process is killed with `SIGKILL` | macOS design (Privilege separation); fm350mac README (Setup, `kill -9` section) |
+| No-SIM RNDIS experiments | Measured USB/codec throughput ceilings; the modem's TX queue only accepts 3 writes without a bearer; polling the control channel without a notification crashes the modem firmware | macOS design (Async USB I/O); fm350mac README (`up` options, `--io`) |
+| `up --loopback` live (fake modem) | The utun/route/ping path works end to end against an in-process fake modem; a busy-spin bug caused high latency and was fixed | macOS design (Architecture); fm350mac README (`up` options, `--loopback`) |
+| Privilege separation live | The root-helper split works, including automatic cleanup when the unprivileged process is killed with `SIGKILL` | macOS design (Privilege separation); fm350mac README (Install the root helper; If `up` is killed (`kill -9`)) |
 | First test with a SIM | SIM detected and radio on, but no cell measured on any RAT; DIPC mode found locked in an OEM "PCIe Advance Mode"; FCC lock ruled out | Dell guide; Compatibility (FCC lock, DIPC) |
 | Deep dive, Dell DW5931e | Took a full ADB root-shell backup; changed and then ruled out DIPC mode as the cause; ruled out the Dell FCC challenge/response; corrected an earlier reading of `AT+ERAT` persistence | Dell guide (DIPC background, ADB backup); Diagnostics (backup, DIPC edit); AT commands (`ERAT`) |
 | Outdoor test (open sky) | Even outdoors, with a clear view of the sky, no cell and no GNSS fix; the GNSS receiver's AGC barely changes with location | Dell guide (troubleshooting, "no cells" ruled-out table) |
@@ -42,8 +42,8 @@ unit, that was the answer.
 
 ## How to read this log
 
-Entries are in the order we actually ran them, on 2026-09-25, not
-reorganised by topic. That matters here: several early conclusions in this
+Entries are in the order we actually ran them, on 2026-09-25 (with one
+later entry from 2026-10-05 at the end), not reorganised by topic. That matters here: several early conclusions in this
 log were provisional, and later entries either confirm, refine or correct
 them. Two are worth knowing before you read on:
 
@@ -433,6 +433,46 @@ We replaced the antenna pigtails with new ones; module, adapter, SIM and config 
 | `AT+GTCCINFO?` | serving LTE cell 262-02, EARFCN 100 (B1), PCI 42; **9 neighbour cells** on EARFCN 3200/3600/6300/9460 (B7/B8/B20/B28) |
 
 **Conclusion:** the "RF receive path defective" diagnosis was right, but the fault was in the **old pigtails**, not the module. The module and Waveshare adapter are fine. Next: data SIM (T-Mobile eSIM), `connect`/`up` with fm350mac, iperf3 sync vs async. GNSS was not re-tested.
+
+### macOS data path with a SIM (2026-10-05)
+
+*What this entry showed: `fm350mac up` carries real traffic on a Telekom DE*
+*SIM (LTE B3/B7, macOS 27, Apple Silicon), and two bugs found along the way*
+*were fixed. Everything here ran on a weak cell with short, capped transfers.*
+
+**Functional runs** (`up --route-host`, so only the routed hosts used the SIM): ping, HTTPS requests and a 1 MB download all worked, and Ctrl-C tore the session down cleanly (routes removed, PDP context deactivated). `helper install` and `helper status` were checked on the same day.
+
+**Interleaved async/sync runs** (`tools/bench-throughput.sh`, `iperf3 -n 5M`, TCP, one session per mode, SIM usage counted by the driver's `stats:` line):
+
+| Rounds | Async | Sync |
+|---|---|---|
+| 4 rounds, download and upload, before the fixes below | down 10.2-20.4 Mbit/s, up 2.8-8.3 Mbit/s | down 8.2-20.4 Mbit/s, one download ended in an iperf3 idle timeout (the tail never reached the driver); up 5.2-13.8 Mbit/s |
+| 3 rounds, upload only, after the fixes | up 15.2, 9.1 and 7.2 Mbit/s | one run ended with "the server has terminated" (driver clean), then 6.7 and 7.7 Mbit/s |
+
+Driver CPU stayed at about 3-8% in all runs, and a session with a 5 MB download and a 5 MB upload used about 10.8 MB of SIM data (the driver's `stats:` IP bytes); an upload-only session used about 5.4 MB. The spread between runs on the same cell is as large as the difference between the modes, so these numbers say "radio-limited", not "async is faster". Sync had one unexplained download stall in 6 downloads, which is why it stays a frozen, unsupported fallback.
+
+**Upload lost-wakeup fix.** The async tx thread waits up to 1 s for a free OUT slot (backpressure instead of tail-drop). A slot that retired between the failed submit and the wait signalled nobody, so the thread slept the whole 50 ms poll with a slot free. The wait now uses a generation counter. A test reproduces it: about 55 ms before the fix, immediate after. The three upload-only rounds above ran with the fix.
+
+**Bench timing fix.** The `iperf3 -n` runs ended on whole-second report boundaries, so the printed rates were quantised (for example 40.9 divided by an integer). `tools/bench-throughput.sh` now passes `-i 0.1`.
+
+### 0.1.0a1 hardware validation (2026-10-05, 17:34-17:52)
+
+*What this entry showed: the 0.1.0a1 async driver survives a 10-minute idle*
+*session and an unplug/replug without user action, and moves 50 MB each way*
+*at about 40 Mbit/s with the default 8 OUT transfers.*
+
+Cell: LTE B8, EARFCN 3749, RSRP -94 dBm, RSRQ -12 dB. `up --route-host` for the iperf3 server and 1.1.1.1 only; helper 0.1.0a1 (sha256 checked at install).
+
+| Test | Result |
+|---|---|
+| 10-minute idle soak, ping every 15 s | 40/40 pings, 122 keepalive acknowledgements (one per ~5 s), no watchdog false alarm, 0 drops; clean teardown |
+| Unplug, wait 10 s, replug | loss detected in about 1 s (classified as device loss, routes removed); modem back on USB after the replug; 15 s settle; session rebuilt automatically 57 s after the unplug; traffic through the utun verified |
+| 3 x 20 MB down + up | down 37.2 and 18.0 Mbit/s (one run ended by the server at about 100 Mbit/s, driver clean); up 18.3, 27.4, 30.4 Mbit/s; 0 retransmits |
+| 50 MB down + up | 42.1 Mbit/s down, 34.7 Mbit/s up, 0 retransmits, driver CPU 13% / 22.5% |
+
+`perf:` line of the 50 MB session: 42,243 OUT transfers, latency mean 184 µs, max 2.3 ms (92% under 500 µs); all 8 OUT transfers in flight at the peak; 1,736 slot waits totalling 0.2 s; RX up to 17 frames per bulk-IN transfer (mean 3.9). With N=8 and L=184 µs the TX ceiling is about 43k packets/s, so 8 OUT transfers stay the default. About 220 MB of SIM data in total.
+
+Not covered: `--default-route`, `--dns`, sessions longer than 10 minutes, the watchdog/stall detection/rebuild retry actually firing, the RNDIS-level rebuild, Intel Macs. See [macos-driver.md](macos-driver.md#whats-not-proven-yet).
 
 ## Glossary
 

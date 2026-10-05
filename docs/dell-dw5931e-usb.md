@@ -9,7 +9,7 @@ Tested on one unit on 2026-09-25, in a Waveshare USB TO M.2 B KEY (SKU 23252) co
 - **A DW5931e in a USB adapter works over USB out of the box** (`0e8d:7127`) — no flashing, unlock or reconfiguration needed. Dell's "PCIe Advance Mode" only turns USB off when the module has a live PCIe link, and a USB adapter never provides one.
 - The module's interface setting (**DIPC mode**) can't be changed by AT command on this unit (`AT+GTDIPCMODE=...` fails with `+CME ERROR: phone failure`), but it's stored in a plain text file on the module's internal Linux system. You edit it over a root shell reached through ADB (Android Debug Bridge) — see [Step 4](#step-4-optional-switch-from-pcie-advance-mode-to-dual-mode). You don't need to do this just to use the module over USB.
 - **If the modem sees no cells at all, check the antenna cables (pigtails) first.** We spent a day ruling out every firmware and configuration cause before finding a pair of defective pigtails. After swapping them, the module registered within 30 s and saw 10 cells.
-- Biggest caveat: this is one unit, tested once, and a real data session hasn't been tried yet (we're waiting for a data SIM).
+- Biggest caveat: this is one unit, tested once, and a data session was only verified later (macOS, `fm350mac`, Telekom DE SIM, 2026-10-05; see the [bench log](bench-log.md)).
 
 ## Is this your module?
 
@@ -187,7 +187,7 @@ Our result after the cable swap (Vodafone DE SIM, indoors): `+CEREG: 0,1`, `+COP
 
 On macOS, `fm350mac doctor` runs the checks from this guide in one go, and `fm350mac status --redact` gives a readable version of the above. On the router, `fm350-status -x` does the same.
 
-The data session (the cellular connection that gives you an IP address) over RNDIS is covered in [setup-guide.md](setup-guide.md) (OpenWrt: `xmm-modem` or `atc-fib-fm350_gl`) and [macos-driver.md](macos-driver.md) (macOS: `fm350mac`). **We haven't verified a data session on this unit yet** because we're waiting for a data SIM.
+The data session (the cellular connection that gives you an IP address) over RNDIS is covered in [setup-guide.md](setup-guide.md) (OpenWrt: `xmm-modem` or `atc-fib-fm350_gl`) and [macos-driver.md](macos-driver.md) (macOS: `fm350mac`). A data session was verified later, on macOS with `fm350mac` and a Telekom DE SIM on 2026-10-05 (ping, HTTPS and a 1 MB download; see the [bench log](bench-log.md) and [macos-driver.md](macos-driver.md)). It has not been run on OpenWrt on this unit.
 
 ## Troubleshooting
 

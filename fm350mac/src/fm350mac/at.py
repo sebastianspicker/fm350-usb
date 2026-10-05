@@ -10,8 +10,10 @@ from __future__ import annotations
 import ipaddress
 import logging
 import re
+import threading
 import time
 
+from .redact import redact_pin
 from .usb_async import UsbDevice, UsbTimeout, open_device
 
 PIDS = {0x7127: 6, 0x7126: 4}  # USB product id -> AT interface number
@@ -33,11 +35,15 @@ ACTIVATE_TIMEOUT_S = 60.0
 
 
 class AtTimeoutError(TimeoutError):
-    """No final result code arrived before the deadline; ``response`` holds what did."""
+    """No final result code arrived before the deadline; ``response`` holds what did.
+
+    A SIM PIN in either (the command, or the modem's echo of it) is always
+    masked: this text ends up in error messages and logs.
+    """
 
     def __init__(self, message: str, response: str = "") -> None:
-        super().__init__(message)
-        self.response = response
+        super().__init__(redact_pin(message))
+        self.response = redact_pin(response)
 
 
 class AtCommandError(RuntimeError):
@@ -46,6 +52,10 @@ class AtCommandError(RuntimeError):
     def __init__(self, message: str, response: str = "") -> None:
         super().__init__(message)
         self.response = response
+
+
+class UnknownAtInterface(RuntimeError):
+    """The device's USB product id has no known AT interface and none was given."""
 
 
 class AtPort:
@@ -63,21 +73,28 @@ class AtPort:
         self.usb_device = usb_device if usb_device is not None else open_device()
         default_iface = PIDS.get(self.usb_device.pid)
         if default_iface is None and iface_override is None:
-            raise RuntimeError(f"unknown AT interface for pid {self.usb_device.pid:#06x}")
+            raise UnknownAtInterface(
+                f"unknown AT interface for USB product id {self.usb_device.pid:#06x}"
+            )
         self.iface_num = default_iface if iface_override is None else iface_override
         self.usb_device.claim_interface(self.iface_num)
         self.ep_out, _ = self.usb_device.find_endpoint(self.iface_num, "out")
         self.ep_in, self.ep_in_max_packet = self.usb_device.find_endpoint(self.iface_num, "in", "bulk")
         self._drain(200)  # discard unsolicited output left over from boot
 
-    def _drain(self, timeout_ms: int = 200, deadline: float | None = None) -> str:
-        """Read until a read times out, or ``deadline`` (time.monotonic) passes.
+    def _drain(
+        self, timeout_ms: int = 200, deadline: float | None = None, stop_event: threading.Event | None = None
+    ) -> str:
+        """Read until a read times out, ``deadline`` (time.monotonic) passes,
+        or ``stop_event`` is set.
 
-        The deadline is checked between reads, so a stream of unsolicited
-        output can't keep this running past it.
+        The deadline and stop event are checked between reads, so a stream of
+        unsolicited output can't keep this running past them.
         """
         out = b""
         while True:
+            if stop_event is not None and stop_event.is_set():
+                break
             read_timeout_ms = timeout_ms
             if deadline is not None:
                 remaining_ms = int((deadline - time.monotonic()) * 1000)
@@ -90,7 +107,7 @@ class AtPort:
                 break
         return out.decode(errors="replace")
 
-    def command(self, cmd: str, timeout: float = 240.0) -> str:
+    def command(self, cmd: str, timeout: float = 240.0, stop_event: threading.Event | None = None) -> str:
         """Send an AT command and return the response text.
 
         Stale bytes (URCs queued since the last command) are drained first
@@ -104,7 +121,14 @@ class AtPort:
         in the same drain (a URC such as ``+CGEV: ...``) is not part of this
         command's response and is dropped, so ``is_ok()``/``check_ok()``
         still see the result code as the last line.
+
+        ``stop_event`` (optional): checked before sending and between reads,
+        so a shutdown never has to sit out a long (e.g. 60 s CGACT) timeout.
+        Once it is set the command is abandoned with AtTimeoutError -- the
+        modem's state is then as unknown as after a real timeout.
         """
+        if stop_event is not None and stop_event.is_set():
+            raise AtTimeoutError(f"{cmd!r} not sent: stop requested")
         stale = self._drain(_STALE_DRAIN_TIMEOUT_MS, deadline=time.monotonic() + 0.05)
         if stale.strip():
             _log.debug("discarded stale AT output before %r: %r", cmd, stale)
@@ -112,13 +136,15 @@ class AtPort:
         buf = ""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            buf += self._drain(_DRAIN_TIMEOUT_MS, deadline=deadline)
+            buf += self._drain(_DRAIN_TIMEOUT_MS, deadline=deadline, stop_event=stop_event)
             final = _FINAL_RESULT_RE.search(buf)
             if final:
                 trailing = buf[final.end():]
                 if trailing.strip():
                     _log.debug("discarded AT output after %r's final result code: %r", cmd, trailing)
                 return buf[: final.end()].strip()
+            if stop_event is not None and stop_event.is_set():
+                raise AtTimeoutError(f"{cmd!r} abandoned: stop requested", buf.strip())
         raise AtTimeoutError(f"no final result code for {cmd!r} within {timeout:g}s", buf.strip())
 
     def close(self) -> None:
@@ -307,9 +333,17 @@ def activate(port: AtPort, cid: int) -> str:
     return port.command(f"AT+CGACT=1,{cid}", timeout=ACTIVATE_TIMEOUT_S)
 
 
-def deactivate(port: AtPort, cid: int) -> str:
-    """Send AT+CGACT=0,<cid> to deactivate a PDP context."""
-    return port.command(f"AT+CGACT=0,{cid}", timeout=ACTIVATE_TIMEOUT_S)
+def deactivate(
+    port: AtPort, cid: int, timeout: float = ACTIVATE_TIMEOUT_S, stop_event: threading.Event | None = None
+) -> str:
+    """Send AT+CGACT=0,<cid> to deactivate a PDP context.
+
+    ``timeout``/``stop_event`` let a shutdown bound the wait (see
+    ``AtPort.command``); ``stop_event`` is only passed on when given.
+    """
+    if stop_event is None:
+        return port.command(f"AT+CGACT=0,{cid}", timeout=timeout)
+    return port.command(f"AT+CGACT=0,{cid}", timeout=timeout, stop_event=stop_event)
 
 
 def is_active(port: AtPort, cid: int) -> bool:

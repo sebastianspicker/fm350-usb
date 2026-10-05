@@ -1,0 +1,122 @@
+name: Release
+
+# Pushing a tag like v0.1.0a1 builds the wheel and sdist and publishes them,
+# with SHA256SUMS, as a GitHub pre-release. Nothing is uploaded to PyPI.
+#
+# Two jobs: `build` runs with read-only permissions and does everything that
+# executes project code; `publish` has write access but only downloads the
+# build's artifact and creates the release.
+#
+# TODO before the first release: pin every action below to a full commit SHA
+# (keep the tag as a trailing comment, e.g. `uses: actions/checkout@<sha> # v4`).
+# Look the SHAs up on GitHub (needs network); do not guess them.
+#   - actions/checkout@v4          (build job; also in ci.yml)
+#   - astral-sh/setup-uv@v6        (build job; also in ci.yml)
+#   - actions/upload-artifact@v4   (build job)
+#   - actions/download-artifact@v4 (publish job)
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build the wheel and sdist
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: fm350mac
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check the tagged commit is on main or an alpha-* branch
+        working-directory: .
+        run: |
+          commit="$(git rev-parse "refs/tags/${TAG}^{commit}")"
+          for ref in refs/remotes/origin/main refs/remotes/origin/alpha-*; do
+            if git rev-parse --verify --quiet "$ref" >/dev/null && git merge-base --is-ancestor "$commit" "$ref"; then
+              echo "tagged commit ${commit} is an ancestor of ${ref}"
+              exit 0
+            fi
+          done
+          echo "tagged commit ${commit} is not an ancestor of origin/main or an origin/alpha-* branch" >&2
+          exit 1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.17"
+
+      - name: Check the tag matches the package version
+        run: |
+          version="$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' src/fm350mac/__init__.py)"
+          test "v${version}" = "${TAG}" || { echo "tag ${TAG} does not match version ${version}" >&2; exit 1; }
+
+      - name: Build wheel and sdist
+        run: uv build -o dist
+
+      - name: Check the wheel and sdist contents
+        run: |
+          version="$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' src/fm350mac/__init__.py)"
+          ls dist/*"${version}"*.whl dist/*"${version}"*.tar.gz
+          unzip -l dist/*.whl | grep -q 'fm350mac/helper/fm350mac_helper.py'
+          unzip -l dist/*.whl | grep -q 'dist-info/licenses/LICENSE'
+
+      - name: Write SHA256SUMS and the release notes
+        run: |
+          (cd dist && sha256sum -- *.whl *.tar.gz | tee SHA256SUMS)
+          helper_sha="$(sha256sum src/fm350mac/helper/fm350mac_helper.py | cut -d' ' -f1)"
+          grep -q "${helper_sha}" ../CHANGELOG.md || { echo "helper sha256 ${helper_sha} is not in CHANGELOG.md: fill it in before tagging" >&2; exit 1; }
+          {
+            echo "Alpha release. See CHANGELOG.md for what is in it and what is not verified, and the fm350mac README for the trust model before installing the root helper."
+            echo
+            echo "Helper sha256: ${helper_sha}"
+            echo
+            echo "Compare it with the \`helper sha256:\` printed by \`fm350mac helper install --dry-run\` and install with \`--expect-sha256\`. Verify downloads against SHA256SUMS."
+          } > dist/release-notes.md
+
+      - name: Upload the artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: |
+            fm350mac/dist/*.whl
+            fm350mac/dist/*.tar.gz
+            fm350mac/dist/SHA256SUMS
+            fm350mac/dist/release-notes.md
+          if-no-files-found: error
+
+  publish:
+    name: publish a pre-release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Download the artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Create the GitHub pre-release
+        run: |
+          gh release create "${TAG}" \
+            --verify-tag \
+            --prerelease \
+            --title "fm350mac ${TAG}" \
+            --notes-file dist/release-notes.md \
+            dist/*.whl dist/*.tar.gz dist/SHA256SUMS

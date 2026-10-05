@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import errno
+import hashlib
 import os
 import pwd
 import stat
@@ -75,9 +76,39 @@ _BOOTSTRAP_RETRY_INTERVAL_S = 1.0
 
 _UID_NO_CHANGE = 2**32 - 1  # (uid_t)-1
 
+# launchctl bootout's ways of saying "nothing was loaded": exit 3 (ESRCH,
+# "No such process") and 113 ("Could not find specified service").
+_BOOTOUT_NOT_LOADED_CODES = (3, 113)
+_BOOTOUT_NOT_LOADED_TEXTS = ("No such process", "Could not find service", "Could not find specified service")
+
 
 def _print_step(msg: str) -> None:
     print(f"-> {msg}")
+
+
+def _sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _user_owned_path_component(executable: str) -> Optional[tuple[str, int]]:
+    """The first non-root-owned component of ``executable``'s real path (the
+    file itself, then each directory up to ``/``) as ``(path, owner uid)``,
+    or None if all of them are root-owned (or can't be inspected).
+    """
+    real = Path(os.path.realpath(executable))
+    for component in (real, *real.parents):
+        try:
+            owner = os.stat(component).st_uid
+        except OSError:
+            continue
+        if owner != 0:
+            return str(component), owner
+    return None
+
+
+def _bootout_not_loaded(result: subprocess.CompletedProcess) -> bool:
+    text = f"{result.stderr or ''} {result.stdout or ''}"
+    return result.returncode in _BOOTOUT_NOT_LOADED_CODES or any(t in text for t in _BOOTOUT_NOT_LOADED_TEXTS)
 
 
 def _resolve_allowed_uid(explicit: Optional[int]) -> int:
@@ -299,12 +330,18 @@ def cmd_helper_install(
     owner_uid: int = 0,
     owner_gid: int = 0,
     sleep: Callable[[float], None] = time.sleep,
+    executable: Optional[str] = None,
 ) -> int:
     """Copy the helper file to ``install_path``, write the LaunchDaemon
     plist, and bootstrap it. Needs sudo; ``--dry-run`` prints the plan
     without touching anything and needs neither sudo nor root (every safety
     check below is still performed, so a bad --dry-run reports exactly why
     a real install would be refused).
+
+    Both print the sha256 of the exact bytes that get installed;
+    ``--expect-sha256`` refuses (before anything is written) unless they
+    match. Run as root from a user-owned Python (``executable``, default
+    ``sys.executable``), it warns: that user can change what runs as root.
 
     ``install_dir``/``install_path``/``plist_path`` default to the real
     system paths; tests point them at a temporary root instead.
@@ -325,6 +362,17 @@ def cmd_helper_install(
     if not dry_run and geteuid() != 0:
         print("fm350mac helper install must be run with sudo.", file=sys.stderr)
         return 1
+    if geteuid() == 0:
+        user_owned = _user_owned_path_component(executable if executable is not None else sys.executable)
+        if user_owned is not None:
+            path, owner = user_owned
+            print(
+                f"WARNING: running user-owned code as root ({path} is owned by uid {owner}): whoever can write "
+                "there controls what this install runs and writes as root. Compare the printed helper sha256 with "
+                "a trusted copy and pass --expect-sha256; see 'Privilege separation and the trust model' in "
+                "fm350mac/README.md.",
+                file=sys.stderr,
+            )
 
     try:
         allowed_uid = _resolve_allowed_uid(args.allowed_uid)
@@ -348,6 +396,13 @@ def cmd_helper_install(
         data = _read_helper_source(helper_source)
         if after_source_read_hook is not None:
             after_source_read_hook()
+        digest = _sha256_hex(data)
+        print(f"helper sha256: {digest}")
+        expected = getattr(args, "expect_sha256", None)
+        if expected is not None and expected.lower() != digest:
+            raise HelperInstallError(
+                f"helper sha256 mismatch: expected {expected.lower()}, got {digest}; refusing to install"
+            )
 
         _print_step(f"checking {helper_source.name} compiles under {PYTHON3} -I -S")
         with tempfile.TemporaryDirectory(prefix="fm350mac-helper-check-") as check_dir:
@@ -357,6 +412,10 @@ def cmd_helper_install(
                 f.write(data)
             check = compile_runner([PYTHON3, "-I", "-S", "-m", "py_compile", check_copy], capture_output=True, text=True)
         if check.returncode != 0:
+            if "xcode-select" in (check.stderr or ""):
+                raise HelperInstallError(
+                    f"{PYTHON3} is the Command Line Tools stub, not a real Python: run xcode-select --install first"
+                )
             raise HelperInstallError(f"helper failed to compile under {PYTHON3} -I -S:\n{check.stderr}")
     except HelperInstallError as exc:
         print(str(exc), file=sys.stderr)
@@ -411,14 +470,21 @@ def cmd_helper_uninstall(
     install_path: Optional[Path] = None,
     plist_path: Optional[Path] = None,
     log_path: Optional[Path] = None,
+    socket_path: Optional[Path] = None,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> int:
     """Reverse ``install``: ``launchctl bootout``, then remove the plist, the
-    installed helper binary and the helper's log file. Needs sudo;
-    ``--dry-run`` needs neither.
+    installed helper binary and the helper's log file, then verify the job
+    is really gone. Needs sudo; ``--dry-run`` needs neither.
+
+    A bootout that fails for any reason other than "not loaded" still
+    removes the files, but is reported and exits 1, as does a job that
+    ``launchctl print`` still finds afterwards.
     """
     install_path = Path(install_path) if install_path is not None else INSTALL_PATH
     plist_path = Path(plist_path) if plist_path is not None else PLIST_PATH
     log_path = Path(log_path) if log_path is not None else Path(_LOG_PATH)
+    socket_path = Path(socket_path) if socket_path is not None else Path(SOCKET_PATH)
     dry_run = args.dry_run
     if not dry_run and geteuid() != 0:
         print("fm350mac helper uninstall must be run with sudo.", file=sys.stderr)
@@ -433,9 +499,12 @@ def cmd_helper_uninstall(
         print("(dry run: nothing was changed)")
         return 0
 
+    failed = False
     result = launchctl_runner([LAUNCHCTL, "bootout", f"system/{PLIST_LABEL}"], capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"launchctl bootout: {result.stderr.strip()} (continuing to remove files anyway)", file=sys.stderr)
+    if result.returncode != 0 and not _bootout_not_loaded(result):
+        failed = True
+        detail = (result.stderr or result.stdout or "").strip() or f"exit status {result.returncode}"
+        print(f"launchctl bootout failed: {detail} (removing the files anyway)", file=sys.stderr)
 
     for path in (plist_path, install_path, log_path):
         try:
@@ -443,6 +512,25 @@ def cmd_helper_uninstall(
         except FileNotFoundError:
             pass
 
+    # bootout is asynchronous (see cmd_helper_install): give launchd a moment.
+    for _ in range(_BOOTOUT_WAIT_POLLS):
+        probe = launchctl_runner([LAUNCHCTL, "print", f"system/{PLIST_LABEL}"], capture_output=True, text=True)
+        if probe.returncode != 0:
+            break
+        sleep(_BOOTOUT_WAIT_INTERVAL_S)
+    else:
+        failed = True
+        print(
+            f"launchctl print system/{PLIST_LABEL} still finds the helper job: it is still loaded. "
+            f"Run 'sudo {LAUNCHCTL} bootout system/{PLIST_LABEL}' or reboot.",
+            file=sys.stderr,
+        )
+    if os.path.lexists(socket_path):
+        print(f"WARNING: the helper socket {socket_path} still exists", file=sys.stderr)
+
+    if failed:
+        print("uninstall incomplete: the files were removed, but see the errors above.", file=sys.stderr)
+        return 1
     print("uninstalled.")
     return 0
 
@@ -459,7 +547,7 @@ def _describe_path(path: Path) -> str:
 def cmd_helper_status(
     _args: argparse.Namespace,
     *,
-    helper_probe=helper_client.probe,
+    helper_probe=helper_client.probe_with_reason,
     install_path: Optional[Path] = None,
     plist_path: Optional[Path] = None,
     helper_source: Path = _HELPER_SOURCE,
@@ -475,17 +563,24 @@ def cmd_helper_status(
     print(f"socket        : {SOCKET_PATH}: {_describe_path(Path(SOCKET_PATH))}")
     try:
         installed_bytes = install_path.read_bytes()
+    except OSError:
+        installed_bytes = None  # not installed (already reported above) or unreadable
+    else:
+        print(f"helper sha256 : {_sha256_hex(installed_bytes)}")
+    try:
         packaged_bytes = Path(helper_source).read_bytes()
     except OSError:
-        pass  # not installed (already reported above) or source unreadable: nothing to compare
-    else:
-        if installed_bytes != packaged_bytes:
-            print("installed helper is out of date — run `fm350mac helper install`")
+        packaged_bytes = None  # source unreadable: nothing to compare
+    if installed_bytes is not None and packaged_bytes is not None and installed_bytes != packaged_bytes:
+        print("installed helper is out of date — run `fm350mac helper install`")
 
-    client = helper_probe()
+    client, reason = helper_client.as_probe_result(helper_probe())
     if client is None:
-        print("helper        : not reachable (not installed, not running, or a protocol mismatch)")
+        print(f"helper        : {reason}")
         return 1
-    print(f"helper        : reachable (pid {client.pid})")
+    print(f"helper        : reachable (pid {client.pid}, version {getattr(client, 'helper_version', None) or 'unknown'})")
+    warning = helper_client.helper_version_warning(client)
+    if warning:
+        print(f"WARNING: {warning}")
     client.close()
     return 0

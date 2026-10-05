@@ -19,7 +19,7 @@ The repo has three parts:
 
 - A DW5931e / FM350-GL enumerates over USB in the Waveshare adapter with no flashing or unlock needed — that's what we found on the one unit tested, 2026-09-25 [Dell guide, TL;DR].
 - If the modem hears no cells at all, check the antenna pigtails before anything else. We lost a day chasing firmware causes; the pigtails were the actual problem [Bench log].
-- What's proven vs not: USB enumeration, AT access, ADB, SIM detection and LTE registration are verified on real hardware; a real cellular data session works on macOS (`fm350mac up`, Telekom DE, 2026-10-05: ping, HTTPS and a 1 MB download, routed per host with `--route-host`); router failover is verified only in emulation (Docker, a modem emulator, QEMU); throughput hasn't been benchmarked yet.
+- What's proven vs not: USB enumeration, AT access, ADB, SIM detection and LTE registration are verified on real hardware; a real cellular data session works on macOS (`fm350mac up`, Telekom DE, 2026-10-05: ping, HTTPS and capped `iperf3` runs, routed per host with `--route-host`); router failover is verified only in emulation (Docker, a modem emulator, QEMU); throughput has only been measured in short, capped runs on a weak cell (see the status table).
 - Not sure where to start? See "Start here" below.
 
 ## Start here: pick your goal
@@ -34,16 +34,17 @@ The repo has three parts:
 
 ## Status
 
-We tested this on one module on 2026-09-25.
+We tested this on one module: the OpenWrt side and the first USB checks on 2026-09-25, the macOS data path on 2026-10-05. `fm350mac` is at release 0.1.0a1, an alpha; see its [limitations](fm350mac/README.md#limitations).
 
 | What | Status |
 |---|---|
 | USB 3 enumeration through the adapter, AT access, ADB | Verified on hardware |
 | SIM detection, LTE registration (Vodafone DE, band 1) | Verified on hardware |
 | Router scripts (install, uninstall, failover, failback) | Verified in Docker, a modem emulator, and OpenWrt 24.10.8 under QEMU |
-| `fm350mac` data path | Verified in loopback mode (fake modem); 327 unit tests (2026-09-26) |
-| Cellular data session (macOS, `fm350mac up`) | Verified on hardware 2026-10-05 (Telekom DE, LTE B3): ping, HTTPS, 1 MB download over `--route-host` routes |
-| Throughput (iperf3, macOS) | First capped runs 2026-10-05 (LTE B7, RSRP −102 dBm, 5 MB per test): 20.4 Mbit/s down, 13.8 Mbit/s up (peak 26 Mbit/s), driver at ~9% CPU. Short runs, dominated by TCP slow start, not a capacity figure |
+| `fm350mac` 0.1.0a1 data path | Verified on hardware 2026-10-05: `up --route-host`, a 10-minute idle soak, automatic recovery after unplugging and replugging the modem (57 s), 50 MB transfers at 42 Mbit/s down / 35 Mbit/s up. Not verified on hardware: `--default-route`, `--dns`, sessions longer than 10 minutes, the keepalive watchdog and stall detection actually firing, rebuild retry after a failed bring-up, the RNDIS-level rebuild, and Intel Macs |
+| Cellular data session (macOS, `fm350mac up`) | Verified on hardware 2026-10-05 (Telekom DE, LTE B3/B7): ping, HTTPS, 1 MB download over `--route-host` routes |
+| Throughput (iperf3, macOS) | Short, capped runs on a weak LTE B3/B7 cell, 2026-10-05: roughly 10-20 Mbit/s down and 7-15 Mbit/s up, driver CPU 3-8%. Radio-limited, dominated by TCP slow start, not a capacity figure |
+| Platform support (macOS) | Apple Silicon, macOS 27 only so far. The libusb loader also looks in `/usr/local` (Intel Homebrew), but Intel Macs are untested. IPv4 only; one modem only |
 | 5G NR | The cell offers EN-DC (5G NSA) and the modem measures an NR carrier; no NR data yet |
 
 ## What's in the repo
@@ -62,7 +63,7 @@ cd /root/openwrt
 
 This installs the FM350 protocol handler (mrhaav's `atc`, or modemfeed's `xmm` with `--proto xmm`), adds a `wwan` interface, and sets up an `mwan3` failover policy. It keeps your existing mwan3 settings: the stock catch-all rules get pointed at the failover policy, and `uninstall.sh` puts them back. It also installs a small watchdog that restarts `wwan` if the protocol handler gets stuck (a known `atc.sh` bug); `--no-watchdog` skips it. `fm350-status` shows decoded signal and cell info on the router.
 
-In the QEMU test (with the earlier, more aggressive mwan3 settings: `wan` down/up 3/3), traffic moved to the modem 5 s after the wired link dropped and came back 4 s after it returned. When the link stayed up but the upstream died, it took 13 s and 16 s — the [openwrt README](openwrt/README.md#failover-end-to-end-testsqemu-failover-testsh) gives a tighter bound of 12–13 s for the same test; the difference is rounding, not a second measurement. The current defaults (`wan` down 5 / up 10) trade speed for fewer false failovers onto a metered SIM: expect roughly 25 s to fail over and 50 s to fail back on a dead upstream (calculated, not yet re-measured).
+In the QEMU test (with the earlier, more aggressive mwan3 settings: `wan` down/up 3/3), traffic moved to the modem 5 s after the wired link dropped and came back 4 s after it returned. When the link stayed up but the upstream died, it took 13 s and 16 s — the [openwrt README](openwrt/README.md#failover-measured-under-qemu) gives a tighter bound of 12–13 s for the same test; the difference is rounding, not a second measurement. The current defaults (`wan` down 5 / up 10) trade speed for fewer false failovers onto a metered SIM: expect roughly 25 s to fail over and 50 s to fail back on a dead upstream (calculated, not yet re-measured).
 
 We built it for a GL.iNet Flint 2 (GL-MT6000). Nothing in it is specific to that router, but we haven't tried it on others. GL.iNet's stock firmware doesn't recognise the FM350; see [docs/compatibility-and-risks.md](docs/compatibility-and-risks.md). Full walkthrough: [docs/setup-guide.md](docs/setup-guide.md).
 
@@ -70,13 +71,13 @@ We built it for a GL.iNet Flint 2 (GL-MT6000). Nothing in it is specific to that
 
 ```sh
 brew install libusb
-cd fm350mac && uv sync
-uv run fm350mac status --redact        # SIM, registration, signal, cells (no root)
-uv run fm350mac doctor                 # read-only checks for OEM/Dell modules
-uv run fm350mac at 'AT+GTPKGVER?'      # raw AT commands (no root)
+uv tool install "git+https://github.com/sebastianspicker/fm350-usb@v0.1.0a1#subdirectory=fm350mac"
+fm350mac status --redact        # SIM, registration, signal, cells (no root)
+fm350mac doctor                 # read-only checks for OEM/Dell modules
+fm350mac at 'AT+GTPKGVER?'      # raw AT commands (no root)
 ```
 
-It's pure Python with a small ctypes binding to libusb, and has no kext or system extension. The part that needs root (creating the `utun` interface and routes) runs in a separate helper installed as a LaunchDaemon, so the driver itself runs as your user. See [fm350mac/README.md](fm350mac/README.md) and the design notes in [docs/macos-driver.md](docs/macos-driver.md).
+It's pure Python with a small ctypes binding to libusb, and has no kext or system extension. The part that needs root (creating the `utun` interface and routes) runs in a separate helper installed as a LaunchDaemon, so the driver itself runs as your user. This is alpha software with a [stated trust model](fm350mac/README.md#privilege-separation-and-the-trust-model); read it before installing the helper. The `v0.1.0a1` tag is created at release; until then use `@alpha-0.1` instead. See [fm350mac/README.md](fm350mac/README.md), the [changelog](CHANGELOG.md) and the design notes in [docs/macos-driver.md](docs/macos-driver.md).
 
 If you only want an AT prompt, [`tools/fm350_at.py`](tools/fm350_at.py) works on its own:
 
@@ -125,7 +126,7 @@ Every image is real output from our bench, rendered to SVG by [`tools/screenshot
 
 ![install.sh dry run](docs/assets/screenshots/install-dry-run.svg)
 
-**`qemu-failover-test.sh`**: OpenWrt 24.10.8 under QEMU with real mwan3. It fails over when the wired link drops or the upstream dies, fails back, and handles both links down.
+**Failover under QEMU**: OpenWrt 24.10.8 under QEMU with real mwan3. It fails over when the wired link drops or the upstream dies, fails back, and handles both links down.
 
 ![QEMU failover test](docs/assets/screenshots/qemu-failover-summary.svg)
 
@@ -163,12 +164,8 @@ Specs, power budget and band support are in [docs/hardware.md](docs/hardware.md)
 ## Development
 
 ```sh
-cd fm350mac && uv run pytest -q && uvx ruff check .     # macOS driver
-shellcheck openwrt/*.sh openwrt/tests/*.sh               # router scripts
-tools/tests/bench-throughput-test.sh                     # benchmark failure handling (no hardware)
-openwrt/tests/docker-test.sh                             # install/uninstall in an OpenWrt rootfs (Docker)
-openwrt/tests/atc-test.sh                                # protocol handler against a fake FM350
-openwrt/tests/qemu-failover-test.sh                      # real mwan3 failover in OpenWrt under QEMU
+cd fm350mac && uvx ruff check . ../tools                 # macOS driver
+shellcheck openwrt/*.sh                                  # router scripts
 python3 tools/screenshots.py                             # regenerate the README screenshots
 ```
 

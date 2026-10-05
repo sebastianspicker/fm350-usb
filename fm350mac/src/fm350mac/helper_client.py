@@ -17,17 +17,21 @@ implement here.
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
+import os
 import socket
 import struct
 from typing import Any
 
+from . import __version__
 from .utun import Utun
 
 _log = logging.getLogger(__name__)
 
 HELPER_SOCKET_PATH = "/var/run/fm350mac-helper.sock"
+HELPER_LOG_PATH = "/var/log/fm350mac-helper.log"
 PROTOCOL_VERSION = 1
 _MAX_MESSAGE_BYTES = 4096
 _FD_CMSG_SPACE = socket.CMSG_LEN(struct.calcsize("i"))
@@ -35,6 +39,26 @@ _FD_CMSG_SPACE = socket.CMSG_LEN(struct.calcsize("i"))
 
 class HelperError(Exception):
     """The helper rejected a request, or the connection failed/closed."""
+
+
+# Error texts that mean this driver and the installed helper don't speak the
+# same protocol (client- or helper-side), as opposed to an operational
+# refusal like "at most 8 host routes per connection".
+_MISMATCH_MARKERS = (
+    "protocol version mismatch",
+    "unsupported protocol version",
+    "unknown op:",
+    "unknown field(s)",
+    "missing field(s)",
+)
+
+
+def is_version_mismatch(exc: BaseException) -> bool:
+    """True if ``exc`` says the installed helper doesn't match this driver
+    (so reinstalling it is the fix), False for any other helper error.
+    """
+    text = str(exc)
+    return any(marker in text for marker in _MISMATCH_MARKERS)
 
 
 class _LineReader:
@@ -67,6 +91,7 @@ class HelperClient:
         self._sock = sock
         self._reader = _LineReader(sock)
         self.pid: int | None = None
+        self.helper_version: str | None = None  # None: not yet said hello, or an older helper without it
 
     @classmethod
     def connect(cls, path: str = HELPER_SOCKET_PATH, timeout: float = 5.0) -> "HelperClient":
@@ -104,6 +129,8 @@ class HelperClient:
         if resp.get("version") != PROTOCOL_VERSION:
             raise HelperError(f"helper protocol version mismatch: {resp.get('version')!r} (expected {PROTOCOL_VERSION})")
         self.pid = resp.get("pid")
+        version = resp.get("helper_version")
+        self.helper_version = version if isinstance(version, str) else None
         return resp
 
     def open_utun(self) -> Utun:
@@ -212,6 +239,89 @@ class HelperNetConfig:
 # /usr/bin/python3 measured >2s on macOS 27 (hello timed out, a retry seconds
 # later succeeded), so allow generously for it.
 PROBE_TIMEOUT_S = 10.0
+
+
+def helper_version_warning(client: Any) -> str | None:
+    """A warning text if the helper's reported version is missing (an older
+    helper) or differs from this driver's, else None. Warn-only: callers
+    never refuse on a mismatch.
+    """
+    reported = getattr(client, "helper_version", None)
+    if reported == __version__:
+        return None
+    shown = reported if reported else "older than 0.1.0a1 (no version reported)"
+    return (
+        f"installed helper is {shown}, driver is {__version__}: "
+        'run sudo "$(command -v fm350mac)" helper install'
+    )
+
+
+_REASON_UNREACHABLE = "not reachable (not installed, not running, or a protocol mismatch)"
+
+
+def as_probe_result(result: Any) -> tuple[Any, str | None]:
+    """Normalize a probe factory's return value to ``(client | None, reason)``.
+    Accepts both ``probe()``'s ``client | None`` and ``probe_with_reason()``'s tuple.
+    """
+    if isinstance(result, tuple):
+        return result
+    if result is None:
+        return None, _REASON_UNREACHABLE
+    return result, None
+
+
+def _permission_denied_reason(path: str) -> str:
+    """Why connecting to the helper socket at ``path`` was refused: report
+    its owner uid and ours. A differing owner means the helper was installed
+    for another user (reinstall); a matching one means something else -- a
+    sandbox or privacy setting -- blocked the connection.
+    """
+    uid = os.getuid()
+    try:
+        owner: int | None = os.stat(path).st_uid
+    except OSError:
+        owner = None
+    shown = "unknown" if owner is None else str(owner)
+    reason = (
+        f"permission denied connecting to {path} (socket owner uid {shown}, your uid {uid}); "
+        "if the uids match, the connection was blocked by a sandbox/privacy setting"
+    )
+    if owner is not None and owner != uid:
+        reason += '; the helper was installed for another user: reinstall it as this user with sudo "$(command -v fm350mac)" helper install'
+    return reason
+
+
+def probe_with_reason(
+    path: str = HELPER_SOCKET_PATH, timeout: float = PROBE_TIMEOUT_S
+) -> tuple[HelperClient | None, str | None]:
+    """Like ``probe()``, but returns ``(client, None)`` or ``(None, reason)``
+    with a human-readable reason the helper is unreachable.
+    """
+    try:
+        client = HelperClient.connect(path, timeout=timeout)
+    except socket.timeout:
+        return None, f"the helper is not running (connect timed out); see {HELPER_LOG_PATH}"
+    except OSError as exc:
+        code = exc.errno
+        if code == errno.ENOENT:
+            return None, "the helper is not installed (no socket); run: sudo \"$(command -v fm350mac)\" helper install"
+        if code in (errno.EACCES, errno.EPERM):
+            return None, _permission_denied_reason(path)
+        if code == errno.ECONNREFUSED:
+            return None, f"the helper is not running (connection refused); see {HELPER_LOG_PATH}"
+        return None, f"cannot connect to the helper: {exc}"
+    try:
+        client.hello()
+    except HelperError as exc:
+        client.close()
+        return None, f"helper protocol mismatch: {exc}; reinstall the helper"
+    except socket.timeout:
+        client.close()
+        return None, f"the helper is not running (hello timed out); see {HELPER_LOG_PATH}"
+    except (OSError, ValueError) as exc:
+        client.close()
+        return None, f"the helper did not answer correctly: {exc}; see {HELPER_LOG_PATH}"
+    return client, None
 
 
 def probe(path: str = HELPER_SOCKET_PATH, timeout: float = PROBE_TIMEOUT_S) -> HelperClient | None:

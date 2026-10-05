@@ -267,6 +267,17 @@ def parse_keepalive(msg: bytes) -> int:
     return request_id
 
 
+def parse_keepalive_cmplt(msg: bytes) -> KeepaliveCmplt:
+    """Decode a REMOTE_NDIS_KEEPALIVE_CMPLT (the device's answer to our own
+    keepalive). Unlike the other ``parse_*_cmplt`` helpers a non-zero Status
+    is returned, not raised: the caller decides what a failed keepalive
+    means. Raises RndisError on a too-short message.
+    """
+    _require_len(msg, 16, "KEEPALIVE_CMPLT")
+    _msg_type, _length, request_id, status = struct.unpack_from("<IIII", msg)
+    return KeepaliveCmplt(request_id=request_id, status=status)
+
+
 def parse_indicate_status(msg: bytes) -> IndicateStatus:
     """Decode a REMOTE_NDIS_INDICATE_STATUS_MSG (no RequestID field). Raises
     RndisError on a too-short message or a buffer offset/length outside ``msg``.
@@ -338,7 +349,10 @@ def unpack_packets_counted(buf: bytes, alignment_factor: int = 0) -> tuple[list[
     while pos + _PACKET_HEADER_LEN <= n:
         msg_type = struct.unpack_from("<I", buf, pos)[0]
         if msg_type == 0:
-            return frames, 0  # zero padding
+            # Zero padding -- but only if *everything* from here on is zero;
+            # a zero word followed by garbage is a malformed trailer. count()
+            # scans in C without copying the tail (any(buf[pos:]) did both).
+            return frames, int(buf.count(0, pos) != n - pos)
         if msg_type != PACKET:
             return frames, 1  # malformed trailer
         msg_length, data_offset, data_length = struct.unpack_from("<III", buf, pos + 4)
