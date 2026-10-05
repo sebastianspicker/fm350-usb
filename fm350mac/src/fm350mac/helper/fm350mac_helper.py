@@ -72,19 +72,29 @@ _MINIMAL_ENV = {"PATH": "/usr/bin:/usr/sbin:/bin:/sbin"}
 
 _DNS_KEY = "State:/Network/Service/fm350mac/DNS"
 
-# add_host_route is only ever used for `up --loopback`'s smoke-test host
-# route (see loopback.py): restrict it to that one /24 (RFC 5737 TEST-NET-2)
-# rather than accepting an arbitrary destination from the main process.
-_LOOPBACK_HOST_NET = ipaddress.ip_network("198.51.100.0/24")
+# add_host_route serves both `up --loopback`'s smoke-test host route (see
+# loopback.py) and `up --route-host`: any validated unicast IPv4 host, at
+# most this many per connection.
+MAX_HOST_ROUTES = 8
+
+# Until a connection has opened its utun, a client that goes silent for this
+# long is dropped, so it can't block the (strictly one-at-a-time) listen
+# queue. `up` connects early and only sends open_utun after SIM/PDP/RNDIS
+# bring-up (AT+CGACT alone may take up to 60s on a slow attach), so this must
+# comfortably exceed a whole bring-up. Once the utun exists the connection is
+# a live session and may legitimately stay idle for hours, so the timeout is
+# lifted.
+CONNECTION_IDLE_TIMEOUT_S = 300
 
 _log = logging.getLogger("fm350mac-helper")
 
-# The in-flight connection's handler, if any -- read only by the SIGTERM
-# handler below, so a `helper uninstall` (launchctl bootout -> SIGTERM)
-# during an active `up` session still tears down its routes/DNS rather than
-# just dropping them. Ordinary disconnects need no signal at all: closing
-# the JSON socket already drives ConnectionHandler.handle()'s cleanup.
-_active_handler: Optional["ConnectionHandler"] = None
+# SIGTERM (e.g. `helper uninstall` -> launchctl bootout) during an active
+# `up` session: the handler only raises SystemExit (unwinding through
+# ConnectionHandler.handle()'s ``finally``, which runs teardown exactly
+# once) -- unless a teardown is already running, in which case it just
+# records the request so that teardown isn't interrupted half-way.
+_in_teardown = False
+_shutdown_requested = False
 
 
 class HelperProtocolError(Exception):
@@ -93,13 +103,17 @@ class HelperProtocolError(Exception):
 
 # --- IPv4 validation (copy of fm350mac.at.valid_assigned_ipv4) --------------
 
+_BROADCAST = ipaddress.IPv4Address("255.255.255.255")
+_THIS_NETWORK = ipaddress.ip_network("0.0.0.0/8")
+
 
 def valid_assigned_ipv4(value: Any) -> Optional[str]:
-    """True-ish (returns the address) if ``value`` is a plausible unicast
-    IPv4 address suitable for ``ifconfig``: rejects anything that isn't a
-    string, isn't parseable, or is unspecified/multicast/loopback/link-local
-    (in particular this is what rejects "0.0.0.0" and malformed octets like
-    "999.1.1.1").
+    """The normalized address (``str(IPv4Address)``) if ``value`` is a
+    plausible unicast IPv4 address suitable for ``ifconfig``/``route``:
+    rejects anything that isn't a string, isn't parseable, or is
+    0/8 (incl. unspecified), 127/8, 169.254/16, multicast, or reserved
+    240/4 (incl. the 255.255.255.255 broadcast) -- in particular this is what
+    rejects "0.0.0.0" and malformed octets like "999.1.1.1".
     """
     if not isinstance(value, str):
         return None
@@ -107,9 +121,12 @@ def valid_assigned_ipv4(value: Any) -> Optional[str]:
         addr = ipaddress.IPv4Address(value)
     except ValueError:
         return None
-    if addr.is_unspecified or addr.is_multicast or addr.is_loopback or addr.is_link_local:
+    if (
+        addr.is_unspecified or addr.is_multicast or addr.is_loopback or addr.is_link_local
+        or addr.is_reserved or addr == _BROADCAST or addr in _THIS_NETWORK
+    ):
         return None
-    return value
+    return str(addr)
 
 
 # --- utun creation (copy of fm350mac.utun.Utun.open()'s ioctl logic) --------
@@ -268,7 +285,7 @@ class NetState:
         self._runner = runner
         self.commands: List[List[str]] = []  # every argv run, in order (tests only)
         self._configured_ip: Optional[str] = None
-        self._host_route: Optional[str] = None
+        self._host_routes: List[str] = []
         self._default_route_added = False
         self._default_route_restore_pending = False
         self._prev_default_restore_cmd: Optional[List[str]] = None
@@ -294,10 +311,13 @@ class NetState:
         self._configured_ip = new_ip
 
     def add_host_route(self, dest: str) -> None:
-        if self._host_route is not None:
-            raise HelperProtocolError("a host route is already installed on this connection")
+        if dest in self._host_routes:
+            return  # idempotent, like NetConfig.add_host_route
+        if len(self._host_routes) >= MAX_HOST_ROUTES:
+            raise HelperProtocolError(f"at most {MAX_HOST_ROUTES} host routes per connection")
         self._run([ROUTE, "add", "-host", dest, "-interface", self.ifname])
-        self._host_route = dest
+        self._host_routes.append(dest)
+        _log.info("host route %s -> %s added", dest, self.ifname)
 
     def enable_default_route(self) -> None:
         """See fm350mac.netconfig.NetConfig.add_default_route()'s docstring
@@ -414,14 +434,20 @@ class NetState:
         except Exception:
             _log.exception("failed to remove DNS key")
 
-    def remove_host_route(self) -> None:
-        if self._host_route is None:
-            return
-        host_ip, self._host_route = self._host_route, None
-        try:
-            self._run([ROUTE, "delete", "-host", host_ip])
-        except Exception:
-            _log.exception("failed to remove host route to %s", host_ip)
+    def remove_host_routes(self) -> None:
+        """Delete every host route this connection added, newest first."""
+        # Only forget a route once its delete succeeded, so a failed delete
+        # stays pending for a later teardown/clear_host_routes retry.
+        for host_ip in list(reversed(self._host_routes)):
+            try:
+                self._run([ROUTE, "delete", "-host", host_ip])
+            except Exception as exc:
+                if "not in table" in str(getattr(exc, "stderr", "") or ""):
+                    _log.info("host route to %s already gone", host_ip)
+                else:
+                    _log.exception("failed to remove host route to %s", host_ip)
+                    continue
+            self._host_routes.remove(host_ip)
 
     def bring_down(self) -> None:
         if self._configured_ip is None:
@@ -434,13 +460,19 @@ class NetState:
 
     def teardown(self) -> None:
         """Undo everything, in reverse order: DNS, default route, host
-        route, then the interface itself. Completed steps are idempotent;
-        failed route cleanup stays pending for a later retry. Never raises.
+        routes (newest first), then the interface itself. Completed steps are
+        idempotent; failed route cleanup stays pending for a later retry.
+        Never raises.
         """
-        self.clear_dns()
-        self.disable_default_route()
-        self.remove_host_route()
-        self.bring_down()
+        global _in_teardown
+        _in_teardown = True
+        try:
+            self.clear_dns()
+            self.disable_default_route()
+            self.remove_host_routes()
+            self.bring_down()
+        finally:
+            _in_teardown = False
 
 
 # --- request schema ----------------------------------------------------
@@ -451,6 +483,7 @@ _OP_SCHEMAS: Dict[str, set] = {
     "set_address": {"ip"},
     "reconfigure_address": {"old_ip", "new_ip"},
     "add_host_route": {"dest"},
+    "clear_host_routes": set(),
     "set_default_route": {"enable"},
     "set_dns": {"servers"},
     "clear_dns": set(),
@@ -518,8 +551,10 @@ class ConnectionHandler:
         open_utun_fn: Callable[[], Tuple[int, str]] = open_utun,
         runner: Callable[..., Any] = subprocess.run,
         log: Optional[logging.Logger] = None,
+        idle_timeout_s: Optional[float] = CONNECTION_IDLE_TIMEOUT_S,
     ) -> None:
         self._conn = conn
+        self._conn.settimeout(idle_timeout_s)
         self._reader = _LineReader(conn)
         self._open_utun_fn = open_utun_fn
         self._runner = runner
@@ -541,6 +576,8 @@ class ConnectionHandler:
                 if line is None:
                     break
                 self._handle_line(line)
+        except socket.timeout:
+            self._log.warning("client idle for too long before opening a utun; dropping the connection")
         finally:
             if self.net is not None:
                 self.net.teardown()
@@ -584,8 +621,12 @@ class ConnectionHandler:
             self._send_ok()
         elif op == "add_host_route":
             self._require_utun()
-            dest = self._require_loopback_host(req["dest"])
+            dest = self._require_valid_ip(req["dest"], "dest")
             self.net.add_host_route(dest)
+            self._send_ok()
+        elif op == "clear_host_routes":
+            self._require_utun()
+            self.net.remove_host_routes()
             self._send_ok()
         elif op == "set_default_route":
             self._require_utun()
@@ -596,11 +637,13 @@ class ConnectionHandler:
                 self.net.enable_default_route()
             else:
                 self.net.disable_default_route()
+            self._log.info("default route via %s %s", self.net.ifname, "enabled" if enable else "disabled")
             self._send_ok()
         elif op == "set_dns":
             self._require_utun()
             servers = self._require_dns_servers(req["servers"])
             self.net.set_dns(servers)
+            self._log.info("system DNS set to %s", " ".join(servers))
             self._send_ok()
         elif op == "clear_dns":
             self._require_utun()
@@ -627,6 +670,9 @@ class ConnectionHandler:
         fd, ifname = self._open_utun_fn()
         self._utun_opened = True
         self.net = NetState(ifname, runner=self._runner)
+        # From here on this is a live session, which is idle for long
+        # stretches by design -- see CONNECTION_IDLE_TIMEOUT_S.
+        self._conn.settimeout(None)
         try:
             line = (json.dumps({"ok": True, "ifname": ifname}) + "\n").encode()
             self._conn.sendmsg([line], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, struct.pack("i", fd))])
@@ -649,24 +695,16 @@ class ConnectionHandler:
             raise HelperProtocolError(f"invalid {field}: {value!r}")
         return ip
 
-    def _require_loopback_host(self, value: Any) -> str:
-        if not isinstance(value, str):
-            raise HelperProtocolError("dest must be a string")
-        try:
-            addr = ipaddress.IPv4Address(value)
-        except ValueError:
-            raise HelperProtocolError(f"invalid dest: {value!r}") from None
-        if addr not in _LOOPBACK_HOST_NET:
-            raise HelperProtocolError(f"dest must be within {_LOOPBACK_HOST_NET} (loopback mode only): {value!r}")
-        return value
-
     def _require_dns_servers(self, value: Any) -> List[str]:
         if not isinstance(value, list) or not (1 <= len(value) <= 3):
             raise HelperProtocolError("servers must be a list of 1-3 IPv4 addresses")
+        servers = []
         for server in value:
-            if valid_assigned_ipv4(server) is None:
+            normalized = valid_assigned_ipv4(server)
+            if normalized is None:
                 raise HelperProtocolError(f"invalid DNS server: {server!r}")
-        return value
+            servers.append(normalized)
+        return servers
 
     # --- responses --------------------------------------------------------
 
@@ -711,15 +749,10 @@ def handle_one_connection(
         log.warning("rejecting connection from uid %d (allowed: %d)", peer_uid, allowed_uid)
         _send_reject(conn, "unauthorized")
         return
-    log.info("connection accepted from uid %d", peer_uid)
-    global _active_handler
+    log.debug("connection accepted from uid %d", peer_uid)
     handler = ConnectionHandler(conn, open_utun_fn=open_utun_fn, runner=runner, log=log)
-    _active_handler = handler
-    try:
-        handler.handle()
-    finally:
-        _active_handler = None
-    log.info("connection closed; teardown complete")
+    handler.handle()
+    log.debug("connection closed; teardown complete")
 
 
 def serve_forever(
@@ -751,6 +784,8 @@ def serve_forever(
             log.exception("connection handler crashed")
         finally:
             conn.close()
+        if _shutdown_requested:
+            return
 
 
 # --- entry point -----------------------------------------------------------
@@ -772,6 +807,20 @@ def _setup_logging() -> None:
     # No syslog socket dependency: launchd captures stderr on its own
     # (see the plist's StandardErrorPath, or the unified log by default).
     logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="fm350mac-helper[%(process)d] %(levelname)s %(message)s")
+
+
+def _on_term(_signum: int, _frame: Any) -> None:
+    """SIGTERM (e.g. an operator runs `helper uninstall` while `up` is
+    running): unwind through the active connection's ``finally`` -- which
+    tears down its routes/DNS exactly once -- rather than tearing down in
+    the handler itself, which could race a teardown already in progress.
+    """
+    global _shutdown_requested
+    _shutdown_requested = True
+    if _in_teardown:
+        return  # let the running teardown finish; serve_forever() exits afterwards
+    _log.warning("received SIGTERM; tearing down the active connection (if any) and exiting")
+    raise SystemExit(0)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -801,17 +850,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
 
     _log.info("fm350mac-helper started: pid=%d allowed_uid=%d", os.getpid(), args.allowed_uid)
-
-    # Best-effort: if we're killed while a connection is mid-flight (e.g. an
-    # operator runs `helper uninstall` while `up` is running), still try to
-    # undo whatever that connection had configured rather than leaving
-    # routes/DNS behind. Not a substitute for the per-connection cleanup on
-    # ordinary disconnect, which needs no signal at all.
-    def _on_term(_signum, _frame):
-        _log.warning("received SIGTERM; tearing down the active connection (if any) and exiting")
-        if _active_handler is not None and _active_handler.net is not None:
-            _active_handler.net.teardown()
-        sys.exit(0)
 
     signal.signal(signal.SIGTERM, _on_term)
 

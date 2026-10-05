@@ -32,10 +32,11 @@ from .async_bridge import DEFAULT_RX_URBS, DEFAULT_TX_URBS, AsyncBridge
 from .bridge import Bridge
 from .helper_client import HelperNetConfig
 from .helper_client import probe as probe_helper
-from .netconfig import NetConfig
+from .netconfig import MAX_HOST_ROUTES, SCUTIL, NetConfig, valid_unicast_ipv4, validate_route_host
+from .redact import redact_text
 from .rndis_device import RndisDevice
 from .supervisor import Supervisor
-from .usb_async import AsyncEndpoint, EventLoop
+from .usb_async import AsyncEndpoint, EventLoop, close_cached
 from .usb_transport import RndisUsb, find_device
 from .utun import Utun
 
@@ -58,11 +59,21 @@ _PROBE_OIDS = [
 ]
 
 
-def _setup_logging(verbose: bool) -> None:
-    logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+class _RedactingFormatter(logging.Formatter):
+    """``--redact``: mask identifiers (see redact.py) in every log line,
+    tracebacks included -- not just the lines cli.py itself builds (e.g. the
+    supervisor's IP-change warning, netconfig's dry-run command log).
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        return redact_text(super().format(record))
+
+
+def _setup_logging(verbose: bool, redact: bool = False) -> None:
+    handler = logging.StreamHandler()
+    formatter_cls = _RedactingFormatter if redact else logging.Formatter
+    handler.setFormatter(formatter_cls("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO, handlers=[handler])
 
 
 def _apn_arg(value: str) -> str:
@@ -81,6 +92,40 @@ def _pdp_type_arg(value: str) -> str:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
+def _int_range_arg(lo: int, hi: int):
+    """argparse ``type=`` factory: an int in the inclusive range lo..hi."""
+
+    def parse(value: str) -> int:
+        try:
+            number = int(value)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"invalid int value: {value!r}") from None
+        if not lo <= number <= hi:
+            raise argparse.ArgumentTypeError(f"{number} is out of range ({lo}..{hi})")
+        return number
+
+    return parse
+
+
+def _positive_float_arg(minimum: float = 0.0, inclusive: bool = False):
+    """argparse ``type=`` factory: a finite float > minimum (>= if inclusive)."""
+
+    def parse(value: str) -> float:
+        try:
+            number = float(value)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"invalid float value: {value!r}") from None
+        if not (number >= minimum if inclusive else number > minimum) or number == float("inf"):
+            raise argparse.ArgumentTypeError(f"{value} must be {'>=' if inclusive else '>'} {minimum:g}")
+        return number
+
+    return parse
+
+
+def _maybe_redact(args: argparse.Namespace, text: str) -> str:
+    return redact_text(text) if getattr(args, "redact", False) else text
+
+
 def _validate_ipv4(value: str, context: str) -> str:
     """Validate ``value`` as an IPv4 address before it reaches netconfig. Raises ValueError."""
     try:
@@ -90,16 +135,25 @@ def _validate_ipv4(value: str, context: str) -> str:
     return value
 
 
+def _route_host_arg(value: str) -> str:
+    """argparse ``type=`` for ``--route-host``: a unicast IPv4 address."""
+    try:
+        return validate_route_host(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
 def _filter_valid_ips(servers: list[str]) -> list[str]:
-    """Drop anything that isn't a valid IP address (v4 or v6) before it reaches netconfig."""
+    """Drop anything that isn't a usable unicast IPv4 address (the only kind
+    netconfig/the helper accept) before it reaches netconfig.
+    """
     valid = []
     for server in servers:
-        try:
-            ipaddress.ip_address(server)
-        except ValueError:
+        normalized = valid_unicast_ipv4(server)
+        if normalized is None:
             _log.warning("ignoring invalid DNS server address from modem: %r", server)
             continue
-        valid.append(server)
+        valid.append(normalized)
     return valid
 
 
@@ -147,7 +201,13 @@ def cmd_at(args: argparse.Namespace, *, at_port_factory=None) -> int:
     try:
         for cmd in args.commands:
             print(f">>> {cmd}")
-            print(port.command(cmd))
+            try:
+                print(_maybe_redact(args, port.command(cmd)))
+            except at_mod.AtTimeoutError as exc:
+                if exc.response:
+                    print(_maybe_redact(args, exc.response))
+                print(f"{cmd}: timed out waiting for a final result code", file=sys.stderr)
+                return 1
     finally:
         port.close()
     return 0
@@ -191,17 +251,6 @@ _STATUS_COMMANDS = (
     ("gtsenrdtemp", "AT+GTSENRDTEMP=0"),
 )
 
-# +GTCCINFO row fields are always ``<IsServiceCell>,<rat>,<mcc>,<mnc>,<tac>,
-# <cellid>,...`` (see cellinfo.py's field tables), so TAC/cell ID are always
-# the 5th/6th comma-separated values on any cell row -- this masks them in
-# the *raw* AT text for --redact --raw, without needing to reparse it.
-_GTCCINFO_ROW_RE = re.compile(r"^(\d+,\d+,[^,]*,[^,]*,)[^,]*(,)[^,]*(,)")
-
-
-def _redact_gtccinfo_raw(text: str) -> str:
-    return "\n".join(_GTCCINFO_ROW_RE.sub(r"\1REDACTED\2REDACTED\3", line) for line in text.splitlines())
-
-
 def _collect_status(port) -> dict[str, str]:
     """Send the read-only AT queries status/doctor share, and return the raw responses."""
     return _query_all(port, _STATUS_COMMANDS)
@@ -214,6 +263,7 @@ def _build_status_report(responses: dict[str, str]) -> dict:
     cells = cellinfo.parse_gtccinfo(responses["gtccinfo"])
     return {
         "sim_ready": at_mod.parse_cpin(responses["cpin"]),
+        "sim_state": at_mod.parse_cpin_state(responses["cpin"]),
         "cereg_stat": cereg_stat,
         "c5greg_stat": c5greg_stat,
         "lte_registered": at_mod.is_registered(cereg_stat),
@@ -253,9 +303,15 @@ def _format_serving_cell(cell: cellinfo.LteCell | cellinfo.NrCell, redact: bool)
     )
 
 
+def _sim_text(ready: bool, state: str | None) -> str:
+    if ready:
+        return "ready"
+    return f"not ready ({state})" if state else "not ready"
+
+
 def _format_status(report: dict, redact: bool) -> str:
     lines = [
-        f"SIM: {'ready' if report['sim_ready'] else 'not ready'}",
+        f"SIM: {_sim_text(report['sim_ready'], report['sim_state'])}",
         "Registration: LTE {} ({}), NR {} ({})".format(
             "yes" if report["lte_registered"] else "no",
             _REG_STAT_NAMES.get(report["cereg_stat"], f"stat={report['cereg_stat']}"),
@@ -304,6 +360,7 @@ def _serialize_report(report: dict, redact: bool) -> dict:
     serving = report["serving_cell"]
     return {
         "sim_ready": report["sim_ready"],
+        "sim_state": report["sim_state"],
         "cereg_stat": report["cereg_stat"],
         "c5greg_stat": report["c5greg_stat"],
         "lte_registered": report["lte_registered"],
@@ -337,8 +394,8 @@ def _print_status_once(port, args: argparse.Namespace) -> dict:
         for label, cmd in _STATUS_COMMANDS:
             print(f">>> {cmd}")
             text = responses[label]
-            if args.redact and label == "gtccinfo":
-                text = _redact_gtccinfo_raw(text)
+            if args.redact:
+                text = redact_text(text)
             print(text)
         print()
     print(_format_status(report, args.redact))
@@ -349,7 +406,13 @@ def _watch_status(port, args: argparse.Namespace, *, sleep=time.sleep) -> int:
     try:
         while True:
             sys.stdout.write("\x1b[2J\x1b[H")  # clear screen, cursor home
-            report = _print_status_once(port, args)
+            try:
+                report = _print_status_once(port, args)
+            except at_mod.AtTimeoutError as exc:
+                print(f"status: {exc}; retrying", file=sys.stderr)
+                sys.stdout.flush()
+                sleep(args.watch)
+                continue
             power_dbm, quality_db, quality_label = _serving_signal(report["serving_cell"])
             print(f"RSRP {_signal_bar(power_dbm)}")
             if quality_db is not None:
@@ -366,14 +429,23 @@ def cmd_status(args: argparse.Namespace, *, at_port_factory=at_mod.AtPort, sleep
 
     Human-readable by default; ``--json`` for machine-readable output,
     ``--raw`` to also print the underlying AT responses, ``--redact`` to
-    mask cell ID/TAC, and ``--watch [SECONDS]`` to keep refreshing (for
+    mask cell ID/TAC (and, in ``--raw`` output, every identifier), and ``--watch [SECONDS]`` to keep refreshing (for
     antenna aiming) instead of printing once.
     """
+    if args.json and args.watch is not None:
+        # --watch redraws the screen and appends a signal bar every round,
+        # which would corrupt the machine-readable output.
+        print("status: --json can't be combined with --watch", file=sys.stderr)
+        return 2
     port = at_port_factory()
     try:
         if args.watch is not None:
             return _watch_status(port, args, sleep=sleep)
-        _print_status_once(port, args)
+        try:
+            _print_status_once(port, args)
+        except at_mod.AtTimeoutError as exc:
+            print(f"status: {exc}", file=sys.stderr)
+            return 1
         return 0
     finally:
         port.close()
@@ -444,7 +516,7 @@ def _doctor_checks(responses: dict[str, str]) -> list[DoctorCheck]:
 
     dipc = _parse_int_tuple(responses["dipcmode"])
     if dipc is None:
-        checks.append(DoctorCheck("WARN", f"GTDIPCMODE?: unparseable response {responses['dipcmode']!r}"))
+        checks.append(DoctorCheck("WARN", f"GTDIPCMODE?: unparseable response {redact_text(responses['dipcmode'])!r}"))
     elif dipc[0] == 1:
         checks.append(DoctorCheck("INFO", f"DIPC mode {dipc[0]} (PCIe Advance: USB only works without a PCIe link)"))
     elif dipc[0] == 3:
@@ -454,7 +526,7 @@ def _doctor_checks(responses: dict[str, str]) -> list[DoctorCheck]:
 
     fcc = _parse_int_tuple(responses["fcceffstatus"])
     if fcc is None or len(fcc) < 2:
-        checks.append(DoctorCheck("WARN", f"GTFCCEFFSTATUS?: unparseable response {responses['fcceffstatus']!r}"))
+        checks.append(DoctorCheck("WARN", f"GTFCCEFFSTATUS?: unparseable response {redact_text(responses['fcceffstatus'])!r}"))
     elif fcc[1] == 1:
         checks.append(DoctorCheck("OK", f"FCC lock: unlocked (mode={fcc[0]}, status={fcc[1]})"))
     else:
@@ -462,7 +534,7 @@ def _doctor_checks(responses: dict[str, str]) -> list[DoctorCheck]:
 
     fmode = _parse_int_tuple(responses["fmode"])
     if fmode is None or len(fmode) < 2:
-        checks.append(DoctorCheck("WARN", f"GTFMODE?: unparseable response {responses['fmode']!r}"))
+        checks.append(DoctorCheck("WARN", f"GTFMODE?: unparseable response {redact_text(responses['fmode'])!r}"))
     else:
         n, m = fmode[0], fmode[1]
         checks.append(DoctorCheck(
@@ -473,14 +545,14 @@ def _doctor_checks(responses: dict[str, str]) -> list[DoctorCheck]:
 
     usbmode = _parse_int_tuple(responses["usbmode"])
     if usbmode is None:
-        checks.append(DoctorCheck("WARN", f"GTUSBMODE?: unparseable response {responses['usbmode']!r}"))
+        checks.append(DoctorCheck("WARN", f"GTUSBMODE?: unparseable response {redact_text(responses['usbmode'])!r}"))
     else:
         note = " (RNDIS + serial + ADB)" if usbmode[0] == 41 else ""
         checks.append(DoctorCheck("INFO", f"USB mode {usbmode[0]}{note}"))
 
     erat = cellinfo.parse_erat(responses["erat"])
     if erat is None:
-        checks.append(DoctorCheck("WARN", f"ERAT?: unparseable response {responses['erat']!r}"))
+        checks.append(DoctorCheck("WARN", f"ERAT?: unparseable response {redact_text(responses['erat'])!r}"))
     else:
         # ERAT's <Act> uses MediaTek numbering that doesn't match what +COPS
         # reports on this firmware, so only the configured mode is shown here;
@@ -489,7 +561,7 @@ def _doctor_checks(responses: dict[str, str]) -> list[DoctorCheck]:
 
     anttuningen = _parse_int_tuple(responses["anttuningen"])
     if anttuningen is None:
-        checks.append(DoctorCheck("WARN", f"GTANTTUNINGEN?: unparseable response {responses['anttuningen']!r}"))
+        checks.append(DoctorCheck("WARN", f"GTANTTUNINGEN?: unparseable response {redact_text(responses['anttuningen'])!r}"))
     elif anttuningen[0] == 0:
         checks.append(DoctorCheck("WARN", "antenna tuner disabled (GTANTTUNINGEN=0; should be 1)"))
     else:
@@ -497,14 +569,15 @@ def _doctor_checks(responses: dict[str, str]) -> list[DoctorCheck]:
 
     cfun = _parse_int_tuple(responses["cfun"])
     if cfun is None:
-        checks.append(DoctorCheck("WARN", f"CFUN?: unparseable response {responses['cfun']!r}"))
+        checks.append(DoctorCheck("WARN", f"CFUN?: unparseable response {redact_text(responses['cfun'])!r}"))
     elif cfun[0] == 1:
         checks.append(DoctorCheck("OK", f"radio functionality: on (CFUN={cfun[0]})"))
     else:
         checks.append(DoctorCheck("WARN", f"radio functionality: CFUN={cfun[0]} (not full functionality)"))
 
     sim_ready = at_mod.parse_cpin(responses["cpin"])
-    checks.append(DoctorCheck("OK" if sim_ready else "WARN", f"SIM: {'ready' if sim_ready else 'not ready'}"))
+    sim_text = _sim_text(sim_ready, at_mod.parse_cpin_state(responses["cpin"]))
+    checks.append(DoctorCheck("OK" if sim_ready else "WARN", f"SIM: {sim_text}"))
 
     cesq = cellinfo.parse_cesq(responses["cesq"])
     cells = cellinfo.parse_gtccinfo(responses["gtccinfo"])
@@ -531,7 +604,11 @@ def cmd_doctor(_args: argparse.Namespace, *, at_port_factory=at_mod.AtPort) -> i
     """
     port = at_port_factory()
     try:
-        responses = _query_all(port, _DOCTOR_COMMANDS)
+        try:
+            responses = _query_all(port, _DOCTOR_COMMANDS)
+        except at_mod.AtTimeoutError as exc:
+            print(f"doctor: {exc}", file=sys.stderr)
+            return 1
         checks = _doctor_checks(responses)
         for check in checks:
             print(f"[{check.level}] {check.message}")
@@ -544,15 +621,37 @@ def cmd_connect(args: argparse.Namespace, *, at_port_factory=at_mod.AtPort) -> i
     """Define and activate a PDP context, print the assigned IP and DNS. No root needed."""
     port = at_port_factory()
     try:
-        if not at_mod.sim_ready(port):
-            print("SIM not ready", file=sys.stderr)
+        state = at_mod.sim_state(port)
+        if state != "READY":
+            print(f"SIM not ready ({state})" if state else "SIM not ready", file=sys.stderr)
             return 1
-        print(at_mod.define_pdp(port, args.cid, args.pdp, args.apn))
-        print(at_mod.activate(port, args.cid))
-        ip = at_mod.ip_address(port, args.cid)
-        print(f"IP: {ip}")
+        if args.pdp != DEFAULT_PDP_TYPE:
+            print(
+                f"warning: PDP type {args.pdp} requested, but the macOS data path only uses IPv4 "
+                "(the IPv6 side of this context is not routed)",
+                file=sys.stderr,
+            )
+        try:
+            defined, activated = at_mod.setup_pdp(port, args.cid, args.pdp, args.apn)
+        except (at_mod.AtCommandError, at_mod.AtTimeoutError) as exc:
+            print(_maybe_redact(args, str(exc)), file=sys.stderr)
+            return 1
+        print(defined)
+        print(activated)
+        cgpaddr = port.command(f"AT+CGPADDR={args.cid}", timeout=at_mod.QUERY_TIMEOUT_S)
+        ip = at_mod.valid_assigned_ipv4(at_mod.parse_cgpaddr(cgpaddr))
+        if ip is None:
+            if at_mod.cgpaddr_is_ipv6_only(cgpaddr):
+                print("no IPv4 address assigned (IPv6-only context; the macOS data path needs IPv4)", file=sys.stderr)
+            else:
+                print("no IP address assigned", file=sys.stderr)
+            return 1
+        print(_maybe_redact(args, f"IP: {ip}"))
         servers = at_mod.dns(port, args.cid)
-        print(f"DNS: {servers}")
+        print(_maybe_redact(args, f"DNS: {servers}"))
+    except at_mod.AtTimeoutError as exc:
+        print(f"connect: {_maybe_redact(args, str(exc))}", file=sys.stderr)
+        return 1
     finally:
         port.close()
     return 0
@@ -562,7 +661,14 @@ def cmd_disconnect(args: argparse.Namespace, *, at_port_factory=at_mod.AtPort) -
     """Deactivate the PDP context. No root needed."""
     port = at_port_factory()
     try:
-        print(at_mod.deactivate(port, args.cid))
+        try:
+            response = at_mod.deactivate(port, args.cid)
+        except at_mod.AtTimeoutError as exc:
+            print(f"disconnect: {exc}", file=sys.stderr)
+            return 1
+        print(response)
+        if not at_mod.is_ok(response):
+            return 1
     finally:
         port.close()
     return 0
@@ -580,18 +686,123 @@ def _log_bridge_stats(bridge: Bridge | AsyncBridge) -> None:
     )
 
 
+_SHUTDOWN_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+
+
 def _run_signal_guarded(stop) -> None:
-    """Install SIGINT/SIGTERM handlers that call ``stop()``, for the
+    """Install SIGINT/SIGTERM/SIGHUP handlers that call ``stop()``, for the
     duration of the caller's blocking wait. Handlers are process-global in
-    Python, so this is only safe to call once per ``up`` invocation (true
-    here: cmd_up only reaches this after a session is fully up).
+    Python, so this is only safe to call once per invocation (used by
+    ``up --loopback``; ``up`` itself uses ``_ShutdownGuard``).
     """
 
     def _on_signal(_signum, _frame):
         stop()
 
-    signal.signal(signal.SIGINT, _on_signal)
-    signal.signal(signal.SIGTERM, _on_signal)
+    for sig in _SHUTDOWN_SIGNALS:
+        signal.signal(sig, _on_signal)
+
+
+class _ShutdownGuard:
+    """SIGINT/SIGTERM/SIGHUP handling for ``up``, installed before the first
+    network change so a signal at any point still runs the full cleanup
+    (without it, SIGTERM/SIGHUP would just kill the process and leave routes
+    and DNS behind on the direct/root path).
+
+    From the pump's start until cleanup begins ``stop`` is set to its stop
+    callable and a signal just calls it; at any other time (bring-up,
+    waiting for a re-enumeration) the signal raises ``KeyboardInterrupt`` so
+    the blocking call unwinds into cmd_up's ``finally`` blocks. Once cleanup
+    has started (``cleaning``, set before ``stop`` is cleared) further
+    signals are only recorded, never raised, so they can't interrupt a
+    teardown half-way.
+    """
+
+    def __init__(self) -> None:
+        self.event = threading.Event()
+        self.stop = None
+        self.cleaning = False
+        self._previous: dict[int, object] = {}
+
+    def install(self) -> None:
+        try:
+            for sig in _SHUTDOWN_SIGNALS:
+                self._previous[sig] = signal.signal(sig, self._on_signal)
+        except ValueError:  # not the main thread: signals can't be installed (e.g. some test runners)
+            self.restore()
+
+    def restore(self) -> None:
+        for sig, handler in self._previous.items():
+            signal.signal(sig, handler)
+        self._previous.clear()
+
+    def _on_signal(self, _signum, _frame) -> None:
+        self.event.set()
+        if self.cleaning:
+            return
+        if self.stop is not None:
+            self.stop()
+            return
+        raise KeyboardInterrupt
+
+
+def _quiesce_net(net) -> None:
+    """Remove DNS, the default route and host routes (in that order) but keep
+    the interface itself, best-effort. Used while the modem is away: they'd
+    otherwise keep pointing into a utun with nothing behind it.
+    """
+    for name in ("clear_dns", "remove_default_route", "remove_host_routes"):
+        try:
+            getattr(net, name)()
+        except Exception:
+            _log.exception("net.%s() failed", name)
+
+
+_DRY_RUN_PLACEHOLDER_IP = "192.0.2.2"  # TEST-NET-1: stands in for the address a real activation would assign
+
+
+def _dry_run_pdp_state(at_port, args: argparse.Namespace) -> str:
+    """``up --dry-run``'s only talking to the modem: read-only queries (the
+    PDP context's activation state and assigned address; the caller also
+    reads the DNS servers). Returns the address to plan the system commands
+    with -- the real one if the context is already active, else a placeholder.
+    """
+    print("dry-run: only read-only AT queries are sent (CPIN?, CGSN, CGACT?, CGPADDR, GTDNS); nothing is written to the modem")
+    _log.info("%s", at_port.command("AT+CGACT?", timeout=at_mod.QUERY_TIMEOUT_S))
+    ip = at_mod.ip_address(at_port, args.cid)
+    if ip is None:
+        print(
+            f"dry-run: PDP context {args.cid} is not active (no address from AT+CGPADDR); "
+            f"planning with the placeholder {_DRY_RUN_PLACEHOLDER_IP}"
+        )
+        return _DRY_RUN_PLACEHOLDER_IP
+    return ip
+
+
+def _print_dry_run_plan(args: argparse.Namespace, net) -> None:
+    """Print what ``up`` would run for real: AT writes, RNDIS steps and (from
+    what the recording NetConfig captured) the system commands, in order,
+    including teardown.
+    """
+    print("dry-run: AT commands that WOULD be sent (none were):")
+    print(f'  AT+CGDCONT={args.cid},"{args.pdp}","{args.apn}"')
+    print(f"  AT+CGACT=1,{args.cid}")
+    print(f"  AT+CGACT=0,{args.cid}   (on shutdown)")
+    print("dry-run: RNDIS steps that WOULD run (none did): initialize, query MAC, set packet filter; halt on shutdown")
+    print("dry-run: system commands that WOULD run, in order, including teardown (none were run):")
+    for line in _dry_run_system_commands(net):
+        print(f"  {_maybe_redact(args, line)}")
+    print("dry-run: skipping utun/bridge pump")
+
+
+def _dry_run_system_commands(net) -> list[str]:
+    lines = []
+    for argv in getattr(net, "commands", []):
+        if argv and argv[0] == SCUTIL:
+            lines.append(f"{SCUTIL} <<< {'; '.join(argv[1:])}")
+        else:
+            lines.append(" ".join(argv))
+    return lines
 
 
 def _wait_for_reenumeration(find_device_factory, timeout_s: float, sleep=time.sleep, time_source=time.monotonic) -> bool:
@@ -600,10 +811,13 @@ def _wait_for_reenumeration(find_device_factory, timeout_s: float, sleep=time.sl
     while time_source() < deadline:
         try:
             find_device_factory()
-            return True
         except Exception:
-            pass
-        sleep(_REENUM_POLL_INTERVAL_S)
+            sleep(_REENUM_POLL_INTERVAL_S)
+            continue
+        # Only a probe: drop the cached handle so the rebuild opens a fresh
+        # one instead of reusing a handle a second re-enumeration made stale.
+        close_cached()
+        return True
     return False
 
 
@@ -661,7 +875,9 @@ def cmd_up(
     installed and reachable, so ``up`` itself doesn't need root; otherwise
     it prints how to install the helper, or fall back with ``--no-helper``
     (the direct/root path, same as before privilege separation). Skipped
-    entirely with ``--dry-run``, which never needs root or the helper. With
+    entirely with ``--dry-run``, which never needs root or the helper and has
+    no side effects: only read-only AT queries (no PDP define/activate, no
+    RNDIS init/halt), and the AT/system commands it would run are printed. With
     ``--loopback``, skips AT/USB entirely and uses an in-process fake modem
     instead (see loopback.py).
 
@@ -681,6 +897,19 @@ def cmd_up(
             helper_probe_factory=helper_probe_factory,
         )
 
+    route_hosts = list(dict.fromkeys(getattr(args, "route_host", None) or []))
+    if len(route_hosts) > MAX_HOST_ROUTES:
+        print(f"--route-host: at most {MAX_HOST_ROUTES} hosts are supported (got {len(route_hosts)})", file=sys.stderr)
+        return 1
+    if args.dns and not args.default_route:
+        print(
+            "--dns requires --default-route: without it the carrier's resolver would be queried over the "
+            "normal uplink, not the tunnel. Add --default-route, or drop --dns (use --route-host to test "
+            "individual hosts through the tunnel).",
+            file=sys.stderr,
+        )
+        return 1
+
     ok, helper_net = _resolve_helper(args, geteuid=geteuid, helper_probe_factory=helper_probe_factory)
     if not ok:
         return _helper_or_root_error("fm350mac up")
@@ -695,8 +924,12 @@ def cmd_up(
     previous_ip: str | None = None
     pinned_imei: str | None = None
     pinned_port_path: tuple[int, tuple[int, ...]] | None = None
+    shutdown = _ShutdownGuard()
 
     try:
+        # Before the first network change: a signal from here on runs the
+        # full cleanup (see _ShutdownGuard).
+        shutdown.install()
         while True:
             at_port = at_port_factory()
             usb_ctx: RndisUsb | None = None
@@ -718,51 +951,74 @@ def cmd_up(
                         _log.warning("could not read the modem's IMEI (AT+CGSN); identity pinning across re-enumeration is disabled")
                 elif current_imei is not None and current_imei != pinned_imei:
                     print(
-                        f"modem identity changed: expected IMEI {pinned_imei}, now AT+CGSN reports {current_imei!r} "
+                        f"modem identity changed: expected IMEI {_maybe_redact(args, pinned_imei)}, "
+                        f"now AT+CGSN reports {_maybe_redact(args, current_imei)!r} "
                         "-- refusing to rebuild the session on what may be a different device",
                         file=sys.stderr,
                     )
                     return 4
 
-                if not at_mod.sim_ready(at_port):
-                    print("SIM not ready", file=sys.stderr)
+                state = at_mod.sim_state(at_port)
+                if state != "READY":
+                    print(f"SIM not ready ({state})" if state else "SIM not ready", file=sys.stderr)
                     return 1
-                _log.info("%s", at_mod.define_pdp(at_port, args.cid, args.pdp, args.apn))
-                _log.info("%s", at_mod.activate(at_port, args.cid))
-                pdp_active = True
-                ip = at_mod.ip_address(at_port, args.cid)
-                if ip is None:
-                    print("no IP address assigned", file=sys.stderr)
-                    return 1
+                if args.dry_run:
+                    ip = _dry_run_pdp_state(at_port, args)
+                else:
+                    try:
+                        defined, activated = at_mod.setup_pdp(at_port, args.cid, args.pdp, args.apn)
+                    except (at_mod.AtCommandError, at_mod.AtTimeoutError) as exc:
+                        # No final result code: the context's state is
+                        # unknown (the modem may still finish activating
+                        # it), so deactivate it best-effort on cleanup.
+                        pdp_active = isinstance(exc, at_mod.AtTimeoutError)
+                        print(_maybe_redact(args, str(exc)), file=sys.stderr)
+                        return 1
+                    _log.info("%s", defined)
+                    _log.info("%s", activated)
+                    pdp_active = True
+                    ip = at_mod.ip_address(at_port, args.cid)
+                    if ip is None:
+                        print("no IP address assigned", file=sys.stderr)
+                        return 1
+                    try:
+                        ip = _validate_ipv4(ip, "IP address from AT+CGPADDR")
+                    except ValueError as exc:
+                        print(exc, file=sys.stderr)
+                        return 1
+                # Always query DNS (read-only) so the log shows what the
+                # carrier handed out; it is only *applied* with --dns.
                 try:
-                    ip = _validate_ipv4(ip, "IP address from AT+CGPADDR")
-                except ValueError as exc:
-                    print(exc, file=sys.stderr)
-                    return 1
-                dns_servers = _filter_valid_ips(at_mod.dns(at_port, args.cid)) if args.dns else []
-                _log.info("IP=%s DNS=%s", ip, dns_servers)
+                    dns_servers = _filter_valid_ips(at_mod.dns(at_port, args.cid))
+                except at_mod.AtTimeoutError as exc:
+                    _log.warning("AT+GTDNS timed out (%s); treating as no DNS returned", exc)
+                    dns_servers = []
+                _log.info("%s", _maybe_redact(args, f"IP={ip} DNS={dns_servers if dns_servers else '<none returned>'}"))
+                if args.dns and not dns_servers:
+                    _log.warning("--dns was requested but the modem returned no usable DNS servers; DNS is left unchanged")
 
-                dev = find_device_factory()
-                try:
-                    current_port_path = dev.port_path()
-                except Exception:
-                    current_port_path = None  # e.g. a fake device in tests; nothing to compare
-                if pinned_port_path is None:
-                    pinned_port_path = current_port_path
-                elif current_port_path is not None and current_port_path != pinned_port_path:
-                    _log.warning(
-                        "modem re-enumerated on a different USB port (bus/ports %s -> %s); "
-                        "continuing anyway (unlike an IMEI mismatch, replugging into another port is not an error)",
-                        pinned_port_path, current_port_path,
-                    )
-                    pinned_port_path = current_port_path
-                usb_ctx = rndis_usb_factory(dev)
-                device = RndisDevice(usb_ctx)
-                init = device.initialize()
-                _log.info("RNDIS initialized: v%d.%d max_transfer_size=%d", init.major, init.minor, init.max_transfer_size)
-                our_mac = device.mac()
-                device.set_packet_filter()
-                _log.info("device MAC: %s", our_mac.hex(":"))
+                if not args.dry_run:
+                    dev = find_device_factory()
+                    try:
+                        current_port_path = dev.port_path()
+                    except Exception:
+                        current_port_path = None  # e.g. a fake device in tests; nothing to compare
+                    if pinned_port_path is None:
+                        pinned_port_path = current_port_path
+                    elif current_port_path is not None and current_port_path != pinned_port_path:
+                        _log.warning(
+                            "modem re-enumerated on a different USB port (bus/ports %s -> %s); "
+                            "continuing anyway (unlike an IMEI mismatch, replugging into another port is not an error)",
+                            pinned_port_path, current_port_path,
+                        )
+                        pinned_port_path = current_port_path
+                    usb_ctx = rndis_usb_factory(dev)
+                    device = RndisDevice(usb_ctx)
+                    init = device.initialize()
+                    _log.info("RNDIS initialized: v%d.%d max_transfer_size=%d", init.major, init.minor, init.max_transfer_size)
+                    our_mac = device.mac()
+                    device.set_packet_filter()
+                    _log.info("device MAC: %s", our_mac.hex(":"))
 
                 if args.dry_run:
                     utun_name = "utun-dry-run"
@@ -783,6 +1039,10 @@ def cmd_up(
                 # interface is already configured correctly.
                 previous_ip = ip
 
+                # Re-added on every (re)build: they're removed while the modem
+                # is away (see the cleanup below), and adding is idempotent.
+                for host in route_hosts:
+                    net.add_host_route(utun_name, host)
                 if args.default_route:
                     # Idempotent: a no-op if our route for this interface is
                     # already installed (true on every restart), so it never
@@ -794,20 +1054,39 @@ def cmd_up(
 
                 if not args.dry_run and utun is not None:
                     our_ip = socket.inet_aton(ip)
+                    # Alignment 0: Linux rndis_host ignores it on RX, and 0 is what was verified on hardware.
                     if args.io == "async":
                         bridge = AsyncBridge(
                             usb_ctx, utun, our_mac, our_ip, max_transfer_size=init.max_transfer_size,
                             rx_urbs=args.rx_urbs, tx_urbs=args.tx_urbs,
+                            packet_alignment_factor=0,
                         )
                     else:
-                        bridge = Bridge(usb_ctx, utun, our_mac, our_ip, max_transfer_size=init.max_transfer_size)
+                        bridge = Bridge(
+                            usb_ctx, utun, our_mac, our_ip, max_transfer_size=init.max_transfer_size,
+                            packet_alignment_factor=0,
+                        )
                     bridge.start()
                     _log.info("bridge running (--io %s); Ctrl-C to stop", args.io)
 
                     if args.supervise:
-                        sup = supervisor_factory(at_port, bridge, net, utun_name, args.cid, initial_ip=ip)
-                        _run_signal_guarded(sup.stop)
+                        sup_kwargs = {}
+                        if args.dns:
+                            def _refresh_dns(_new_ip, _port=at_port):
+                                servers = _filter_valid_ips(at_mod.dns(_port, args.cid))
+                                if servers:
+                                    net.set_dns(servers)
+                            sup_kwargs["refresh_dns"] = _refresh_dns
+                        sup = supervisor_factory(at_port, bridge, net, utun_name, args.cid, initial_ip=ip, **sup_kwargs)
+                        # Stays set until the cleanup below has started, so a
+                        # signal in between never raises KeyboardInterrupt
+                        # into it (see _ShutdownGuard).
+                        shutdown.stop = sup.stop
                         sup.run()
+                        # A reconnect may have moved the utun to a new
+                        # address; a rebuild must replace that one.
+                        if sup.current_ip is not None:
+                            previous_ip = sup.current_ip
                         if sup.failure_reason:
                             if bridge.failed.is_set() and bridge.device_lost:
                                 device_lost = True
@@ -815,52 +1094,81 @@ def cmd_up(
                                 print(f"bridge failed: {sup.failure_reason}", file=sys.stderr)
                                 return 2
                     else:
-                        stop_flag = threading.Event()
-                        _run_signal_guarded(stop_flag.set)
-                        while not stop_flag.is_set() and not bridge.failed.is_set():
+                        shutdown.stop = shutdown.event.set
+                        while not shutdown.event.is_set() and not bridge.failed.is_set():
                             time.sleep(0.5)
                         if bridge.failed.is_set():
                             print(f"bridge failed: {bridge.failure_reason}", file=sys.stderr)
                             return 2
                 else:
-                    print("dry-run: skipping utun/bridge pump")
+                    # Nothing above touched the system (commands were only
+                    # recorded): record the teardown too, then show the plan.
+                    net.teardown()
+                    _print_dry_run_plan(args, net)
                     return 0
 
                 if not device_lost:
                     return 0
+            except at_mod.AtTimeoutError as exc:
+                # A query with no final result code: the modem is wedged or
+                # gone. Fail cleanly (the finally below still tears down).
+                print(f"modem did not answer: {_maybe_redact(args, str(exc))}", file=sys.stderr)
+                return 1
             finally:
-                if bridge is not None:
-                    try:
-                        bridge_stopped_cleanly = bridge.stop()
-                    except Exception:
-                        _log.exception("bridge.stop() failed")
-                        bridge_stopped_cleanly = False
-                    _log_bridge_stats(bridge)
-                if usb_ctx is not None:
-                    if bridge_stopped_cleanly:
-                        try:
-                            RndisDevice(usb_ctx).halt()
-                        except Exception:
-                            _log.exception("RNDIS halt failed")
-                        try:
-                            usb_ctx.close()
-                        except Exception:
-                            _log.exception("usb_ctx.close() failed")
-                    else:
-                        _log.warning("skipping RNDIS halt/usb close: a bridge thread is still running")
-                if pdp_active:
-                    try:
-                        at_mod.deactivate(at_port, args.cid)
-                    except Exception:
-                        _log.exception("PDP deactivate failed")
+                # Further signals must not interrupt cleanup half-way.
+                shutdown.cleaning = True
+                shutdown.stop = None
                 try:
-                    at_port.close()
-                except Exception:
-                    _log.exception("at_port.close() failed")
+                    # Order matters: stop routing traffic into the tunnel
+                    # FIRST (routes/DNS), then stop the bridge, then
+                    # deactivate the PDP context, and only then halt RNDIS.
+                    # If the modem is merely away (device_lost), keep the
+                    # interface and only drop what points into it.
+                    if device_lost:
+                        _quiesce_net(net)
+                    else:
+                        try:
+                            net.teardown()
+                        except Exception:
+                            _log.exception("net.teardown() failed")
+                    if bridge is not None:
+                        try:
+                            bridge_stopped_cleanly = bridge.stop()
+                        except Exception:
+                            _log.exception("bridge.stop() failed")
+                            bridge_stopped_cleanly = False
+                        _log_bridge_stats(bridge)
+                    if pdp_active:
+                        try:
+                            at_mod.deactivate(at_port, args.cid)
+                        except Exception:
+                            _log.exception("PDP deactivate failed")
+                    if usb_ctx is not None:
+                        if bridge_stopped_cleanly:
+                            try:
+                                RndisDevice(usb_ctx).halt()
+                            except Exception:
+                                _log.exception("RNDIS halt failed")
+                            try:
+                                usb_ctx.close()
+                            except Exception:
+                                _log.exception("usb_ctx.close() failed")
+                        else:
+                            _log.warning("skipping RNDIS halt/usb close: a bridge thread is still running")
+                    try:
+                        at_port.close()
+                    except Exception:
+                        _log.exception("at_port.close() failed")
+                finally:
+                    shutdown.cleaning = False
 
             # Reached only when device_lost: the USB device disappeared but
-            # --supervise is on. utun/routes are left as-is; wait for the
-            # modem to re-enumerate, then rebuild AT/RNDIS/bridge from scratch.
+            # --supervise is on. DNS, the default route and host routes were
+            # removed above (so the Mac isn't left routing into a dead utun)
+            # and are re-added after the rebuild; the utun itself stays. Wait
+            # for the modem to re-enumerate, then rebuild AT/RNDIS/bridge.
+            if shutdown.event.is_set():
+                return 0  # a signal arrived during cleanup: don't wait for the modem
             restart_count += 1
             _log.warning(
                 "modem disconnected (restart #%d); waiting up to %.0fs for it to re-enumerate...",
@@ -872,7 +1180,13 @@ def cmd_up(
             _log.info("modem re-enumerated; waiting %.0fs for its firmware to settle", _REENUM_SETTLE_S)
             reenum_sleep(_REENUM_SETTLE_S)
             # loop back around and rebuild the session
+    except KeyboardInterrupt:
+        # SIGINT/SIGTERM/SIGHUP during bring-up or the re-enumeration wait
+        # (see _ShutdownGuard); the finally below runs the cleanup.
+        print("interrupted; shutting down", file=sys.stderr)
+        return 130
     finally:
+        shutdown.cleaning = True
         try:
             net.teardown()
         except Exception:
@@ -884,6 +1198,7 @@ def cmd_up(
                 _log.exception("utun.close() failed")
         if helper_net is not None:
             helper_net.close()
+        shutdown.restore()
 
 
 def _cmd_up_loopback(
@@ -907,8 +1222,8 @@ def _cmd_up_loopback(
         utun_factory = helper_net.open_utun
         net_config_factory = lambda dry_run: helper_net  # noqa: E731 -- dry_run is always False here
 
-    if args.default_route:
-        print("--loopback ignores --default-route: only a host route to 198.51.100.1 is added", file=sys.stderr)
+    if args.default_route or getattr(args, "route_host", None):
+        print("--loopback ignores --default-route/--route-host: only a host route to 198.51.100.1 is added", file=sys.stderr)
 
     net = net_config_factory(dry_run=args.dry_run)
     utun: Utun | None = None
@@ -1128,16 +1443,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_probe.set_defaults(func=cmd_probe)
 
     p_at = sub.add_parser("at", help="send raw AT commands (no root)")
-    p_at.add_argument("--iface", type=int, help="override AT interface number")
+    p_at.add_argument("--iface", type=_int_range_arg(0, 31), help="override AT interface number (0..31)")
+    p_at.add_argument("--redact", action="store_true", help="mask phone numbers, IMSI/IMEI/ICCID, IP addresses and TAC/cell ID in the output")
     p_at.add_argument("commands", nargs="+")
     p_at.set_defaults(func=cmd_at)
 
     p_status = sub.add_parser("status", help="SIM/registration/cell/thermal status (no root)")
     p_status.add_argument("--raw", action="store_true", help="also print the underlying raw AT responses")
     p_status.add_argument("--json", action="store_true", help="machine-readable JSON output instead of a summary")
-    p_status.add_argument("--redact", action="store_true", help="mask cell ID/TAC (and IMSI/ICCID/IMEI, if ever printed)")
+    p_status.add_argument("--redact", action="store_true", help="mask cell ID/TAC in the summary/JSON; with --raw also masks "
+        "phone numbers, IMSI/IMEI/ICCID, IP addresses and TAC/cell ID in the raw AT text")
     p_status.add_argument(
-        "--watch", nargs="?", type=float, const=DEFAULT_WATCH_INTERVAL_S, default=None, metavar="SECONDS",
+        "--watch", nargs="?", type=_positive_float_arg(1.0, inclusive=True), const=DEFAULT_WATCH_INTERVAL_S, default=None, metavar="SECONDS",
         help=f"keep refreshing every SECONDS (default {DEFAULT_WATCH_INTERVAL_S:.0f}) instead of printing once; "
         "for antenna aiming, Ctrl-C to stop",
     )
@@ -1148,21 +1465,42 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_connect = sub.add_parser("connect", help="define + activate a PDP context (no root)")
     p_connect.add_argument("--apn", required=True, type=_apn_arg)
-    p_connect.add_argument("--pdp", default=DEFAULT_PDP_TYPE, type=_pdp_type_arg, help="PDP type (default: IP)")
-    p_connect.add_argument("--cid", type=int, default=DEFAULT_CID)
+    p_connect.add_argument(
+        "--pdp", default=DEFAULT_PDP_TYPE, type=_pdp_type_arg,
+        help="PDP type (default: IP; IPV6/IPV4V6 are accepted but the macOS data path only uses IPv4)",
+    )
+    p_connect.add_argument("--cid", type=_int_range_arg(1, 15), default=DEFAULT_CID)
+    p_connect.add_argument("--redact", action="store_true", help="mask the assigned IP/DNS in the output")
     p_connect.set_defaults(func=cmd_connect)
 
     p_disconnect = sub.add_parser("disconnect", help="deactivate the PDP context (no root)")
-    p_disconnect.add_argument("--cid", type=int, default=DEFAULT_CID)
+    p_disconnect.add_argument("--cid", type=_int_range_arg(1, 15), default=DEFAULT_CID)
     p_disconnect.set_defaults(func=cmd_disconnect)
 
     p_up = sub.add_parser("up", help="run the full session: AT + RNDIS + utun + routes + pump")
     p_up.add_argument("--apn", required=True, type=_apn_arg)
-    p_up.add_argument("--pdp", default=DEFAULT_PDP_TYPE, type=_pdp_type_arg, help="PDP type (default: IP)")
-    p_up.add_argument("--cid", type=int, default=DEFAULT_CID)
+    p_up.add_argument(
+        "--pdp", default=DEFAULT_PDP_TYPE, type=_pdp_type_arg, choices=[DEFAULT_PDP_TYPE],
+        help="PDP type (only IP: the data path is IPv4-only)",
+    )
+    p_up.add_argument("--cid", type=_int_range_arg(1, 15), default=DEFAULT_CID)
+    p_up.add_argument("--redact", action="store_true", help="mask the assigned IP/DNS and IMEI in logs")
     p_up.add_argument("--default-route", action="store_true", help="route default traffic through the tunnel")
-    p_up.add_argument("--dns", action="store_true", help="publish the modem's DNS servers via scutil")
-    p_up.add_argument("--dry-run", action="store_true", help="record commands without touching the system; no root needed")
+    p_up.add_argument(
+        "--route-host", action="append", default=None, type=_route_host_arg, metavar="IP",
+        help=f"route just this IPv4 host through the tunnel (host route IP -> utunN); repeatable, max {MAX_HOST_ROUTES}. "
+        "The safe way to test on a metered SIM without --default-route",
+    )
+    p_up.add_argument(
+        "--dns", action="store_true",
+        help="publish the modem's DNS servers via scutil (requires --default-route; the DNS servers are always "
+        "queried and logged either way)",
+    )
+    p_up.add_argument(
+        "--dry-run", action="store_true",
+        help="no side effects at all: only read-only AT queries (no CGDCONT/CGACT, no RNDIS init), nothing "
+        "run on the system; prints the AT and system commands it WOULD run; no root needed",
+    )
     p_up.add_argument(
         "--no-helper", action="store_true",
         help="don't use the root helper: run the direct/root path instead (needs sudo). "
@@ -1179,7 +1517,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_up.add_argument("--no-supervise", dest="supervise", action="store_false", help="just sleep until Ctrl-C/failure")
     p_up.add_argument(
-        "--reenum-timeout", type=float, default=DEFAULT_REENUM_TIMEOUT_S,
+        "--reenum-timeout", type=_positive_float_arg(0.0), default=DEFAULT_REENUM_TIMEOUT_S,
         help=f"seconds to wait for the modem to re-enumerate after a USB disconnect (default: {DEFAULT_REENUM_TIMEOUT_S:.0f})",
     )
     p_up.add_argument(
@@ -1188,11 +1526,11 @@ def build_parser() -> argparse.ArgumentParser:
         "direction (default), sync is the one-transfer-per-packet fallback",
     )
     p_up.add_argument(
-        "--rx-urbs", type=int, default=DEFAULT_RX_URBS,
+        "--rx-urbs", type=_int_range_arg(1, 64), default=DEFAULT_RX_URBS,
         help=f"number of bulk-IN transfers to keep in flight with --io async (default: {DEFAULT_RX_URBS})",
     )
     p_up.add_argument(
-        "--tx-urbs", type=int, default=DEFAULT_TX_URBS,
+        "--tx-urbs", type=_int_range_arg(1, 64), default=DEFAULT_TX_URBS,
         help=f"number of bulk-OUT transfers to keep in flight with --io async (default: {DEFAULT_TX_URBS})",
     )
     p_up.set_defaults(func=cmd_up)
@@ -1228,7 +1566,7 @@ def main(argv: list[str] | None = None) -> int:
     """CLI entry point (console script: fm350mac)."""
     parser = build_parser()
     args = parser.parse_args(argv)
-    _setup_logging(args.verbose)
+    _setup_logging(args.verbose, redact=getattr(args, "redact", False))
     return args.func(args)
 
 

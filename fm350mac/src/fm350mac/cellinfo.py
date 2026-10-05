@@ -304,28 +304,38 @@ _LTE_BAND_RANGES: tuple[tuple[int, int, int], ...] = (
     (1, 0, 599),
     (2, 600, 1199),
     (3, 1200, 1949),
+    (4, 1950, 2399),
+    (5, 2400, 2649),
     (7, 2750, 3449),
     (8, 3450, 3799),
+    (12, 5010, 5179),
+    (13, 5180, 5279),
+    (17, 5730, 5849),
     (20, 6150, 6449),
+    (25, 8040, 8689),
+    (26, 8690, 9039),
     (28, 9210, 9659),
     (30, 9770, 9869),
     (32, 9920, 10359),
     (38, 37750, 38249),
     (40, 38650, 39649),
+    (41, 39650, 41589),
     (42, 41590, 43589),
     (43, 43590, 45589),
+    (66, 66436, 67335),
 )
 
 # n77 (620000-680000) and n78 (620000-653333) overlap -- n78 is a subset of
 # n77 -- and there's no way to tell them apart from the ARFCN alone. n78 is
 # listed first so a channel in the shared range is reported as n78 (the far
 # more common deployment); this is a heuristic, not a real disambiguation.
-# n41 (499200-537999) also overlaps n7/n38's ranges in reality (adjacent
-# mid-bands); same caveat applies.
+# n41 (499200-537999) overlaps n38 (514000-524000) and n7 (524000-538000):
+# n41 comes after both, so a channel in those ranges is reported as n38/n7
+# and only 499200-513999 as n41; same heuristic caveat applies.
 _NR_BAND_RANGES: tuple[tuple[str, int, int], ...] = (
     ("n1", 422000, 434000),
     ("n3", 361000, 376000),
-    ("n7", 500000, 514000),
+    ("n7", 524000, 538000),
     ("n8", 185000, 192000),
     ("n20", 158200, 164200),
     ("n28", 151600, 160600),

@@ -145,7 +145,8 @@ class HelperClient:
 class HelperNetConfig:
     """Implements the same interface as ``fm350mac.netconfig.NetConfig``
     (``configure_interface``, ``reconfigure_address``, ``add_host_route``,
-    ``add_default_route``, ``set_dns``, ``teardown``), by forwarding every
+    ``add_default_route``, ``set_dns``, ``teardown``, plus the ``remove_*``/
+    ``clear_dns`` calls used while waiting for a re-enumeration), by forwarding every
     call to the helper over ``client``. ``ifname`` parameters are accepted
     for interface compatibility but not sent: the helper always acts on the
     one utun it created for this connection, never on an interface name
@@ -170,7 +171,14 @@ class HelperNetConfig:
         self._client.request("reconfigure_address", old_ip=old_ip, new_ip=new_ip)
 
     def add_host_route(self, ifname: str, host_ip: str) -> None:
+        """Up to 8 per connection (loopback's smoke-test route and
+        ``up --route-host`` share the limit); the helper deletes them, newest
+        first, on teardown.
+        """
         self._client.request("add_host_route", dest=host_ip)
+
+    def remove_host_routes(self) -> None:
+        self._client.request("clear_host_routes")
 
     def add_default_route(self, ifname: str) -> None:
         self._client.request("set_default_route", enable=True)
@@ -200,7 +208,13 @@ class HelperNetConfig:
         self._client.close()
 
 
-def probe(path: str = HELPER_SOCKET_PATH, timeout: float = 2.0) -> HelperClient | None:
+# launchd starts the helper on the first connection; a cold start of
+# /usr/bin/python3 measured >2s on macOS 27 (hello timed out, a retry seconds
+# later succeeded), so allow generously for it.
+PROBE_TIMEOUT_S = 10.0
+
+
+def probe(path: str = HELPER_SOCKET_PATH, timeout: float = PROBE_TIMEOUT_S) -> HelperClient | None:
     """Try to connect to the helper and complete a `hello` round trip.
     Returns a ready-to-use, hello-verified HelperClient, or None if the
     helper isn't installed, isn't running, or doesn't answer -- the caller

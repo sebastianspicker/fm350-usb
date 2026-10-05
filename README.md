@@ -19,7 +19,7 @@ The repo has three parts:
 
 - A DW5931e / FM350-GL enumerates over USB in the Waveshare adapter with no flashing or unlock needed — that's what we found on the one unit tested, 2026-09-25 [Dell guide, TL;DR].
 - If the modem hears no cells at all, check the antenna pigtails before anything else. We lost a day chasing firmware causes; the pigtails were the actual problem [Bench log].
-- What's proven vs not: USB enumeration, AT access, ADB, SIM detection and LTE registration are verified on real hardware; router failover is verified only in emulation (Docker, a modem emulator, QEMU); no real cellular data session has been tested yet, on any host.
+- What's proven vs not: USB enumeration, AT access, ADB, SIM detection and LTE registration are verified on real hardware; a real cellular data session works on macOS (`fm350mac up`, Telekom DE, 2026-10-05: ping, HTTPS and a 1 MB download, routed per host with `--route-host`); router failover is verified only in emulation (Docker, a modem emulator, QEMU); throughput hasn't been benchmarked yet.
 - Not sure where to start? See "Start here" below.
 
 ## Start here: pick your goal
@@ -42,7 +42,8 @@ We tested this on one module on 2026-09-25.
 | SIM detection, LTE registration (Vodafone DE, band 1) | Verified on hardware |
 | Router scripts (install, uninstall, failover, failback) | Verified in Docker, a modem emulator, and OpenWrt 24.10.8 under QEMU |
 | `fm350mac` data path | Verified in loopback mode (fake modem); 327 unit tests (2026-09-26) |
-| Cellular data session, throughput | **Not tested yet** (waiting for a data SIM) |
+| Cellular data session (macOS, `fm350mac up`) | Verified on hardware 2026-10-05 (Telekom DE, LTE B3): ping, HTTPS, 1 MB download over `--route-host` routes |
+| Throughput (iperf3, macOS) | First capped runs 2026-10-05 (LTE B7, RSRP −102 dBm, 5 MB per test): 20.4 Mbit/s down, 13.8 Mbit/s up (peak 26 Mbit/s), driver at ~9% CPU. Short runs, dominated by TCP slow start, not a capacity figure |
 | 5G NR | The cell offers EN-DC (5G NSA) and the modem measures an NR carrier; no NR data yet |
 
 ## What's in the repo
@@ -61,7 +62,7 @@ cd /root/openwrt
 
 This installs the FM350 protocol handler (mrhaav's `atc`, or modemfeed's `xmm` with `--proto xmm`), adds a `wwan` interface, and sets up an `mwan3` failover policy. It keeps your existing mwan3 settings: the stock catch-all rules get pointed at the failover policy, and `uninstall.sh` puts them back. It also installs a small watchdog that restarts `wwan` if the protocol handler gets stuck (a known `atc.sh` bug); `--no-watchdog` skips it. `fm350-status` shows decoded signal and cell info on the router.
 
-In the QEMU test, traffic moved to the modem 5 s after the wired link dropped and came back 4 s after it returned. When the link stayed up but the upstream died, it took 13 s and 16 s — the [openwrt README](openwrt/README.md#failover-end-to-end-testsqemu-failover-testsh) gives a tighter bound of 12–13 s for the same test; the difference is rounding, not a second measurement.
+In the QEMU test (with the earlier, more aggressive mwan3 settings: `wan` down/up 3/3), traffic moved to the modem 5 s after the wired link dropped and came back 4 s after it returned. When the link stayed up but the upstream died, it took 13 s and 16 s — the [openwrt README](openwrt/README.md#failover-end-to-end-testsqemu-failover-testsh) gives a tighter bound of 12–13 s for the same test; the difference is rounding, not a second measurement. The current defaults (`wan` down 5 / up 10) trade speed for fewer false failovers onto a metered SIM: expect roughly 25 s to fail over and 50 s to fail back on a dead upstream (calculated, not yet re-measured).
 
 We built it for a GL.iNet Flint 2 (GL-MT6000). Nothing in it is specific to that router, but we haven't tried it on others. GL.iNet's stock firmware doesn't recognise the FM350; see [docs/compatibility-and-risks.md](docs/compatibility-and-risks.md). Full walkthrough: [docs/setup-guide.md](docs/setup-guide.md).
 
@@ -162,8 +163,12 @@ Specs, power budget and band support are in [docs/hardware.md](docs/hardware.md)
 ## Development
 
 ```sh
-cd fm350mac && uvx ruff check .                         # macOS driver
-shellcheck openwrt/*.sh                                  # router scripts
+cd fm350mac && uv run pytest -q && uvx ruff check .     # macOS driver
+shellcheck openwrt/*.sh openwrt/tests/*.sh               # router scripts
+tools/tests/bench-throughput-test.sh                     # benchmark failure handling (no hardware)
+openwrt/tests/docker-test.sh                             # install/uninstall in an OpenWrt rootfs (Docker)
+openwrt/tests/atc-test.sh                                # protocol handler against a fake FM350
+openwrt/tests/qemu-failover-test.sh                      # real mwan3 failover in OpenWrt under QEMU
 python3 tools/screenshots.py                             # regenerate the README screenshots
 ```
 

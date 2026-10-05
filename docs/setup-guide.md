@@ -201,8 +201,8 @@ config interface 'wan'
 	list track_ip '9.9.9.9'
 	option reliability '1'
 	option interval '5'
-	option down '3'
-	option up '3'
+	option down '5'
+	option up '10'
 
 config interface 'wwan'
 	option enabled '1'
@@ -210,7 +210,7 @@ config interface 'wwan'
 	list track_ip '1.1.1.1'
 	list track_ip '9.9.9.9'
 	option reliability '1'
-	option interval '10'
+	option interval '30'
 	option down '3'
 	option up '3'
 
@@ -233,9 +233,9 @@ config rule 'default'
 ```
 
 Notes:
-- A longer `interval` on `wwan` reduces the tracking traffic that counts against the mobile data plan.
+- The `wwan` tracking (30 s interval, two track IPs) costs roughly 15 to 30 MB per month on the mobile data plan; `wan` is probed every 5 s, marked down after 5 misses and up after 10 successes, so a short blip doesn't move traffic onto the metered SIM. Nothing caps LAN traffic during failover.
 - Add an IPv6 block if the ISP gives you IPv6.
-- Test: `mwan3 status`, then unplug the WAN cable and check that traffic moves to wwan within about 15 s (`curl ifconfig.io` should show the carrier IP). Plug the cable back in and check that traffic returns.
+- Test: `mwan3 status`, then unplug the WAN cable and check that traffic moves to wwan within about 30 s (`curl ifconfig.io` should show the carrier IP). Plug the cable back in and check that traffic returns.
 
 ## 8. Option B/C notes (keep GL.iNet firmware)
 

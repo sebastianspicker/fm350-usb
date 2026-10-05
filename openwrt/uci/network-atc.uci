@@ -11,9 +11,13 @@
 #   @APN@    - carrier APN
 #
 # The section is deleted first so re-running the installer never leaves stale
-# options (e.g. from a previous --proto xmm run) behind.
+# options (e.g. from a previous --proto xmm run) behind. install.sh itself
+# re-applies user-added options (pincode, atc_debug, custom_at, pdp, ...)
+# after this template on a re-run with the same proto, and saves a
+# pre-existing section lacking the fm350_owned marker for uninstall.sh.
 delete network.wwan
 set network.wwan=interface
+set network.wwan.fm350_owned='1'
 set network.wwan.proto='atc'
 set network.wwan.device='@DEVICE@'
 set network.wwan.apn='@APN@'

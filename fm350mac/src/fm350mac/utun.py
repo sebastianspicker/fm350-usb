@@ -64,7 +64,6 @@ class Utun:
     def __init__(self, sock: socket.socket, name: str) -> None:
         self._sock = sock
         self.name = name
-        self._nonblocking_write_fd: int | None = None
 
     @classmethod
     def open(cls, unit: int | None = None) -> "Utun":
@@ -105,43 +104,28 @@ class Utun:
         """Write one IP packet (AF header added) to the tunnel."""
         return self._sock.send(encode_af(packet))
 
-    def _get_nonblocking_write_fd(self) -> int:
-        """A file descriptor for ``write_nonblocking()``, guaranteed
-        ``O_NONBLOCK``. ``socket.settimeout()`` already puts the fd in
-        non-blocking mode at the OS level (Python emulates the timeout with
-        its own select()-based retry around non-blocking send/recv calls),
-        so this is normally just the socket's own fd; if it somehow isn't
-        (no timeout set, or a future refactor), a dup'd fd gets O_NONBLOCK
-        set explicitly instead, so the original fd's blocking behaviour
-        (used by the rx/tx threads' blocking-with-timeout reads) is untouched.
-        """
-        if self._nonblocking_write_fd is not None:
-            return self._nonblocking_write_fd
-        fd = self._sock.fileno()
-        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
-        if flags & os.O_NONBLOCK:
-            self._nonblocking_write_fd = fd
-        else:
-            dup_fd = os.dup(fd)
-            fcntl.fcntl(dup_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-            self._nonblocking_write_fd = dup_fd
-        return self._nonblocking_write_fd
-
     def write_nonblocking(self, packet: bytes) -> int:
         """Like ``write()``, but a single non-blocking attempt: raises
-        ``BlockingIOError`` immediately if the kernel send buffer is full,
+        ``BlockingIOError`` (or, as macOS datagram sockets report it,
+        ``OSError`` ENOBUFS) immediately if the kernel send buffer is full,
         rather than blocking (Python's ``socket.send()`` can still block up
         to the configured timeout even in "non-blocking with timeout" mode).
         For callers that must never block, e.g. AsyncBridge's libusb event
         thread.
+
+        With a timeout set (what the bridges do), Python has already put the
+        fd in O_NONBLOCK mode, so a plain write() is one attempt. Without
+        one, MSG_DONTWAIT makes just this send non-blocking: O_NONBLOCK is a
+        property of the shared open file description (a dup'd fd too), so
+        setting it would turn the blocking reads into EAGAIN errors.
         """
-        return os.write(self._get_nonblocking_write_fd(), encode_af(packet))
+        data = encode_af(packet)
+        if self._sock.gettimeout() is None:
+            return self._sock.send(data, socket.MSG_DONTWAIT)
+        return os.write(self._sock.fileno(), data)
 
     def close(self) -> None:
-        """Close the underlying socket (and the dup'd non-blocking write fd, if any)."""
-        if self._nonblocking_write_fd is not None and self._nonblocking_write_fd != self._sock.fileno():
-            os.close(self._nonblocking_write_fd)
-        self._nonblocking_write_fd = None
+        """Close the underlying socket."""
         self._sock.close()
 
     def __enter__(self) -> "Utun":

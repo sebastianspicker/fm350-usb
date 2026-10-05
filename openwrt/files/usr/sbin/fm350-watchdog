@@ -20,7 +20,7 @@
 #   option enabled             '1'    0 disables the watchdog entirely
 #   option interface           'wwan' the netifd interface to watch/restart
 #   option check_interval      '30'   seconds between ifstatus polls
-#   option pending_threshold   '180'  seconds the interface must be
+#   option pending_threshold   '600'  seconds the interface must be
 #                                     continuously non-"up" before the first
 #                                     restart of a given episode
 #   option backoff_max         '1800' cap, in seconds, on the exponential
@@ -36,7 +36,9 @@
 #
 # Numeric options that aren't plain non-negative integers (e.g. '180s')
 # fall back to their default with a log line, rather than crashing the
-# daemon on the first arithmetic test.
+# daemon on the first arithmetic test. check_interval, pending_threshold and
+# backoff_max must additionally be > 0 (0 would busy-loop or restart on every
+# tick); a 0 falls back to the default too.
 #
 # Also respected every tick, with no uci option of their own:
 #   - network.<interface>.disabled='1' or network.<interface>.auto='0': the
@@ -46,10 +48,29 @@
 #     this file to pause the watchdog by hand (e.g. while debugging on the
 #     bench with `ifdown wwan` yourself); remove it to resume. Lives on
 #     tmpfs, so a pause does not survive a reboot.
-#   - network.<interface>.device, if it looks like a /dev/ path: while that
-#     path doesn't exist (modem USB device absent/still enumerating), the
-#     watchdog neither restarts nor advances its pending-since clock, so
-#     unplugging the modem doesn't burn down the backoff for nothing.
+#   - network.<interface>.device, if it looks like a /dev/ path: while no
+#     FM350 AT port exists at all (modem USB device absent/still
+#     enumerating; see /usr/lib/fm350/at-port.sh), the watchdog neither
+#     restarts nor advances its pending-since clock, and it zeroes
+#     pending_since/up_since, so unplugging the modem doesn't burn down the
+#     backoff and a replug doesn't trigger an immediate restart. If the
+#     configured path is gone or isn't an FM350 AT port any more but one
+#     exists elsewhere (ttyUSB renumbering), the port is re-resolved before
+#     each ifup and network.<interface>.device is updated if it changed.
+#   - SIM/PIN safety: if ifstatus shows an error code that atc.sh raised with
+#     proto_notify_error + proto_block_restart for a SIM/PIN/registration
+#     problem (PINmissing, PINerror, SIMreadfailure, REG_DENIED, or a raw
+#     "+CME ERROR" text such as "SIM not inserted" - see atc.sh around
+#     'Check SIMcard and PIN status' and 'REG_DENIED'), the watchdog never
+#     restarts: with a configured pincode every restart would send
+#     AT+CPIN="..." again, and a wrong PIN burns SIM PIN attempts until the
+#     SIM is PUK-locked. It logs this once per episode. Matching is a
+#     case-insensitive substring test for pin, puk, sim or denied in the
+#     error codes; that mapping is an assumption taken from the atc.sh
+#     revision pinned in install.sh and is not verified on hardware.
+#
+# Deliberately no `set -e`: this is a long-running daemon and any failing
+# ifstatus/jsonfilter/uci call must degrade to "unknown", never kill it.
 #
 # Runs as a procd-supervised daemon (/etc/init.d/fm350-watchdog); main()'s
 # own loop sleeps check_interval seconds between ticks. All state (the
@@ -59,17 +80,30 @@
 # has to elapse again before the next restart - harmless.
 #
 # Decision logic lives in tick() and the small helpers it calls, which only
-# touch their arguments/globals plus interface_up()/restart_interface()/
-# should_manage()/device_missing()/paused()/now()/log() - each a thin,
-# one-line wrapper around a single external command (ifstatus/ifup+ifdown/
-# uci/date/logger respectively). tests/watchdog-test.sh sources this file
-# (FM350_WATCHDOG_TEST=1 skips the "$@"-driven main() call at the bottom)
-# and overrides those wrapper functions with fakes before calling tick()
-# directly, so the whole decision state machine runs without procd, netifd,
-# or a real modem. POSIX sh/ash (busybox) compatible.
-set -e
+# touch their arguments/globals plus interface_up()/interface_errors()/
+# restart_interface()/should_manage()/device_missing()/paused()/now()/log() -
+# each a thin, one-line wrapper around a single external command
+# (ifstatus/ifup+ifdown/uci/date/logger respectively). tests/watchdog-test.sh
+# and tests/watchdog-unit-test.sh source this file (FM350_WATCHDOG_TEST=1
+# skips the "$@"-driven main() call at the bottom) and override those wrapper
+# functions with fakes before calling tick() directly, so the whole decision
+# state machine runs without procd, netifd, or a real modem. POSIX sh/ash
+# (busybox) compatible.
 
 PAUSE_FILE=${FM350_WATCHDOG_PAUSE_FILE:-/tmp/fm350-watchdog.pause}
+AT_PORT_LIB=${FM350_AT_PORT_LIB:-/usr/lib/fm350/at-port.sh}
+
+if [ -r "$AT_PORT_LIB" ]; then
+	# shellcheck source=/dev/null # files/usr/lib/fm350/at-port.sh
+	. "$AT_PORT_LIB"
+else
+	# Without the lookup library the device checks degrade to "no opinion":
+	# the configured device counts as found (so the modem is never treated as
+	# absent, which would silently disable every restart) and is never
+	# re-resolved.
+	fm350_find_at_device() { uci_get "network.$interface.device"; }
+	fm350_is_at_port() { return 0; }
+fi
 
 log() {
 	logger -t fm350-watchdog "$*"
@@ -79,37 +113,58 @@ now() {
 	date +%s
 }
 
+# Always succeeds; prints nothing for an unset option.
 uci_get() {
-	uci -q get "$1" 2>/dev/null
+	uci -q get "$1" 2>/dev/null || true
 }
 
 cfg() {
 	# $1: fm350_watchdog.main option name  $2: default if unset/empty
-	val=$(uci_get "fm350_watchdog.main.$1")
-	[ -n "$val" ] && echo "$val" || echo "$2"
+	val=$(uci_get "fm350_watchdog.main.$1") || val=""
+	if [ -n "$val" ]; then echo "$val"; else echo "$2"; fi
 }
 
 cfg_num() {
 	# Like cfg, but only accepts a plain non-negative integer.
-	val=$(cfg "$1" "$2")
+	val=$(cfg "$1" "$2") || val="$2"
 	case "$val" in
 	'' | *[!0-9]*)
 		log "ignoring non-numeric fm350_watchdog.main.$1='$val', using $2"
 		echo "$2"
 		;;
-	*) echo "$val" ;;
+	*)
+		# Strip leading zeros: "060" would be read as octal (and "08" as an
+		# illegal number, killing the daemon) by the $(( )) arithmetic below.
+		while :; do
+			case "$val" in
+			0?*) val=${val#0} ;;
+			*) break ;;
+			esac
+		done
+		echo "$val"
+		;;
 	esac
 }
 
+cfg_pos() {
+	# Like cfg_num, but 0 is rejected too (falls back to the default).
+	val=$(cfg_num "$1" "$2") || val="$2"
+	if [ "$val" -eq 0 ]; then
+		log "ignoring fm350_watchdog.main.$1='0' (must be > 0), using $2"
+		echo "$2"
+	else
+		echo "$val"
+	fi
+}
+
 load_config() {
-	enabled=$(cfg enabled 1)
-	interface=$(cfg interface wwan)
-	check_interval=$(cfg_num check_interval 30)
-	[ "$check_interval" -gt 0 ] || check_interval=30
-	pending_threshold=$(cfg_num pending_threshold 180)
-	backoff_max=$(cfg_num backoff_max 1800)
-	backoff_reset_after=$(cfg_num backoff_reset_after 300)
-	boot_grace=$(cfg_num boot_grace 300)
+	enabled=$(cfg enabled 1) || enabled=1
+	interface=$(cfg interface wwan) || interface=wwan
+	check_interval=$(cfg_pos check_interval 30) || check_interval=30
+	pending_threshold=$(cfg_pos pending_threshold 600) || pending_threshold=600
+	backoff_max=$(cfg_pos backoff_max 1800) || backoff_max=1800
+	backoff_reset_after=$(cfg_num backoff_reset_after 300) || backoff_reset_after=300
+	boot_grace=$(cfg_num boot_grace 300) || boot_grace=300
 }
 
 # Seconds since boot (integer part of /proc/uptime).
@@ -129,26 +184,75 @@ should_manage() {
 	return 0
 }
 
-# True (0) only when network.<interface>.device is a /dev/ path that
-# currently doesn't exist (modem unplugged/still enumerating). Anything else
+# True (0) only when network.<interface>.device is a /dev/ path and no FM350
+# AT port exists at all (modem unplugged/still enumerating). Anything else
 # (unset, or a non-/dev/ value like the atc proto's sysfs-derived ifname) is
-# "not missing" as far as this check is concerned.
+# "not missing". A configured path that is gone, or exists but is not an
+# FM350 AT port, while a real FM350 port exists elsewhere is a mismatch, not
+# "missing": sync_device() fixes it before the next ifup.
 device_missing() {
-	dev=$(uci_get "network.$interface.device")
+	dev=$(uci_get "network.$interface.device") || dev=""
 	case "$dev" in
-	/dev/*) [ -e "$dev" ] || return 0 ;;
+	/dev/*) ;;
+	*) return 1 ;;
 	esac
-	return 1
+	resolved=$(fm350_find_at_device) || resolved=""
+	[ -n "$resolved" ] && return 1
+	return 0
+}
+
+# Makes netifd re-read /etc/config/network (needed after sync_device()).
+reload_network() {
+	ubus call network reload >/dev/null 2>&1 || true
+}
+
+# Re-resolves the AT port and points network.<interface>.device at it if the
+# configured /dev/ path is gone or is not an FM350 AT port. A configured path
+# that is still a valid FM350 AT port is kept (e.g. :1.4 chosen on purpose).
+sync_device() {
+	dev=$(uci_get "network.$interface.device") || dev=""
+	case "$dev" in
+	/dev/*) ;;
+	*) return 0 ;;
+	esac
+	resolved=$(fm350_find_at_device) || return 0
+	[ "$resolved" = "$dev" ] && return 0
+	[ -e "$dev" ] && fm350_is_at_port "$dev" && return 0
+	log "AT port changed: network.$interface.device $dev -> $resolved"
+	if uci set "network.$interface.device=$resolved" && uci commit network; then
+		reload_network
+	else
+		log "could not update network.$interface.device to $resolved"
+	fi
+	return 0
 }
 
 # Echoes "true"/"false", or "" if ifstatus/jsonfilter failed (interface
 # unknown to netifd yet, ubus not up, etc.) - tick() treats "" like "false".
 interface_up() {
-	ifstatus "$interface" 2>/dev/null | jsonfilter -e '@.up' 2>/dev/null
+	ifstatus "$interface" 2>/dev/null | jsonfilter -e '@.up' 2>/dev/null || true
+}
+
+# Echoes the error codes netifd holds for the interface, one per line.
+interface_errors() {
+	ifstatus "$interface" 2>/dev/null | jsonfilter -e '@.errors[*].code' 2>/dev/null || true
+}
+
+# True (0) if netifd reports a SIM/PIN/registration-denied error (atc.sh's
+# deliberate proto_block_restart states, see the header comment).
+sim_blocked() {
+	errs=$(interface_errors) || errs=""
+	[ -n "$errs" ] || return 1
+	errs=$(printf '%s' "$errs" | tr '[:upper:]' '[:lower:]') || errs=""
+	case "$errs" in
+	*pin* | *puk* | *sim* | *denied*) return 0 ;;
+	esac
+	return 1
 }
 
 restart_interface() {
 	log "$interface pending for ${elapsed}s, restarting it (backoff was ${backoff}s)"
+	sync_device
 	if ! ifdown "$interface" 2>/dev/null; then
 		log "ifdown $interface failed; continuing with ifup and backoff"
 	fi
@@ -158,29 +262,35 @@ restart_interface() {
 }
 
 # tick() - one decision-and-maybe-act cycle. Reads/writes the globals
-# pending_since, up_since, backoff and next_allowed_restart, all seconds
-# since the epoch (0 meaning "not currently tracked/no backoff yet").
+# pending_since, up_since, backoff, next_allowed_restart (all seconds since
+# the epoch, 0 meaning "not currently tracked/no backoff yet") and
+# sim_block_logged (0/1).
 tick() {
-	n=$(now)
+	n=$(now) || n=0
 
 	if [ "$enabled" = "0" ] || paused || ! should_manage; then
 		pending_since=0
 		up_since=0
 		backoff=0
 		next_allowed_restart=0
+		sim_block_logged=0
 		return 0
 	fi
 
 	if device_missing; then
-		# Modem physically absent: freeze the state machine rather than
-		# advancing (or resetting) any clock.
+		# Modem physically absent: no restarts, and no clock keeps running
+		# across the unplug, so a replug starts a fresh pending period
+		# instead of triggering an immediate restart.
+		pending_since=0
+		up_since=0
 		return 0
 	fi
 
-	up=$(interface_up)
+	up=$(interface_up) || up=""
 
 	if [ "$up" = "true" ]; then
 		pending_since=0
+		sim_block_logged=0
 		[ "$up_since" -eq 0 ] && up_since=$n
 		if [ "$backoff" -gt 0 ] && [ $((n - up_since)) -ge "$backoff_reset_after" ]; then
 			backoff=0
@@ -200,6 +310,15 @@ tick() {
 	[ "$n" -lt "$next_allowed_restart" ] && return 0
 	[ "$(uptime_s)" -lt "$boot_grace" ] && return 0
 
+	if sim_blocked; then
+		if [ "$sim_block_logged" -eq 0 ]; then
+			log "$interface is blocked by a SIM/PIN/registration error ($(interface_errors | tr '\n' ' ')); not restarting it (a restart could burn SIM PIN attempts)"
+			sim_block_logged=1
+		fi
+		return 0
+	fi
+	sim_block_logged=0
+
 	restart_interface
 
 	if [ "$backoff" -eq 0 ]; then
@@ -209,6 +328,7 @@ tick() {
 	fi
 	[ "$backoff" -gt "$backoff_max" ] && backoff=$backoff_max
 	next_allowed_restart=$((n + backoff))
+	return 0
 }
 
 main() {
@@ -217,6 +337,7 @@ main() {
 	up_since=0
 	backoff=0
 	next_allowed_restart=0
+	sim_block_logged=0
 	log "starting: interface=$interface check_interval=${check_interval}s pending_threshold=${pending_threshold}s backoff_max=${backoff_max}s backoff_reset_after=${backoff_reset_after}s boot_grace=${boot_grace}s"
 	while true; do
 		tick

@@ -30,6 +30,8 @@ BACKOFF_INITIAL_S = 5.0
 BACKOFF_MAX_S = 300.0
 STABLE_RESET_S = 600.0
 TICK_S = 1.0
+MIN_EARLY_POLL_SPACING_S = 5.0  # min gap between a poll and a tx-stall-triggered early poll
+AT_TIMEOUT_S = 10.0  # per-command AT timeout (AtPort's default is 240 s)
 
 
 class State(Enum):
@@ -72,6 +74,9 @@ class Supervisor:
         backoff_max: float = BACKOFF_MAX_S,
         stable_reset: float = STABLE_RESET_S,
         tick: float = TICK_S,
+        min_early_poll_spacing: float = MIN_EARLY_POLL_SPACING_S,
+        at_timeout: float = AT_TIMEOUT_S,
+        refresh_dns=None,
         time_source=time.monotonic,
         sleep=time.sleep,
     ) -> None:
@@ -85,6 +90,12 @@ class Supervisor:
         self.backoff_max = backoff_max
         self.stable_reset = stable_reset
         self.tick = tick
+        self.min_early_poll_spacing = min_early_poll_spacing
+        self.at_timeout = at_timeout
+        # Optional ``refresh_dns(new_ip)`` callback, called after an IP change
+        # so the caller can re-query/re-apply DNS (the supervisor itself only
+        # reconfigures the interface address).
+        self._refresh_dns = refresh_dns
         self._time = time_source
         self._sleep = sleep
 
@@ -94,7 +105,8 @@ class Supervisor:
         self.failure_reason: str | None = None
         self._backoff = backoff_initial
         self._connected_since: float | None = self._time()
-        self._last_tx_stalls = bridge.stats.tx_stalls
+        self._last_tx_timeouts = bridge.stats.tx_timeouts
+        self._last_poll_time = self._time()
         self._stop = threading.Event()
 
     def stop(self) -> None:
@@ -124,17 +136,24 @@ class Supervisor:
     def _wait_for_next_step(self) -> None:
         remaining = self.current_wait()
         while remaining > 0 and not self._stop.is_set():
+            if self.bridge.failed.is_set():
+                return  # run() reports the failure
             if self.state == State.CONNECTED and self._tx_stall_increased():
-                _log.info("tx stalls increased while connected; polling registration/PDP early")
+                _log.info("tx timeouts increased while connected; polling registration/PDP early")
                 return
             tick = min(self.tick, remaining)
             self._sleep(tick)
             remaining -= tick
 
     def _tx_stall_increased(self) -> bool:
-        current = self.bridge.stats.tx_stalls
-        if current > self._last_tx_stalls:
-            self._last_tx_stalls = current
+        """True if genuine tx timeouts (not pool-full drops) grew since the
+        last early poll, and at least ``min_early_poll_spacing`` has passed
+        since the last poll of any kind -- so a stalled link can't turn the
+        supervisor into an AT-command hammer.
+        """
+        current = self.bridge.stats.tx_timeouts
+        if current > self._last_tx_timeouts and self._time() - self._last_poll_time >= self.min_early_poll_spacing:
+            self._last_tx_timeouts = current
             return True
         return False
 
@@ -143,6 +162,7 @@ class Supervisor:
     def step(self) -> None:
         """Run one poll (and, if needed, one reconnect attempt). Never raises."""
         self.stats.poll_count += 1
+        self._last_poll_time = self._time()
         registered = self._poll_registration()
         if registered is None:
             return  # AT error/timeout already counted; try again next tick
@@ -158,9 +178,11 @@ class Supervisor:
             self.state = State.LOST
             self._connected_since = None
             return
-        ip = self._poll_ip()
-        if ip is None or ip == "0.0.0.0":
-            _log.warning("PDP context appears down (ip=%s)", ip)
+        answered, ip = self._poll_ip()
+        if not answered:
+            return  # AT timeout already counted; says nothing about the PDP context
+        if ip is None:
+            _log.warning("PDP context appears down (no valid IP)")
             self.state = State.LOST
             self._connected_since = None
             return
@@ -171,6 +193,18 @@ class Supervisor:
         if not registered:
             self.state = State.LOST
             return
+        # Registration is back; the PDP context may have survived (or the
+        # modem re-activated it itself). Only cycle it if there's no valid IP
+        # -- not merely because CGPADDR timed out.
+        answered, ip = self._poll_ip()
+        if not answered:
+            return
+        if ip is not None:
+            self._note_ip(ip)
+            self.state = State.CONNECTED
+            self._connected_since = self._time()
+            _log.info("registration restored with PDP still up: ip=%s", ip)
+            return
         self.state = State.RECONNECTING
         self._attempt_reconnect()
 
@@ -180,8 +214,8 @@ class Supervisor:
             self._backoff = min(self._backoff * 2, self.backoff_max)
             _log.warning("reconnect attempt failed; next retry in %.0fs", self._backoff)
             return
-        ip = self._poll_ip()
-        if ip is None or ip == "0.0.0.0":
+        _answered, ip = self._poll_ip()
+        if ip is None:
             self._backoff = min(self._backoff * 2, self.backoff_max)
             _log.warning("reconnect: no IP after CGACT=1; next retry in %.0fs", self._backoff)
             return
@@ -210,8 +244,12 @@ class Supervisor:
         response parses.
         """
         try:
-            cereg_stat = at_mod.parse_registration(self.at_port.command("AT+CEREG?"))
-            c5greg_stat = at_mod.parse_registration(self.at_port.command("AT+C5GREG?"))
+            cereg_stat = at_mod.parse_registration(self.at_port.command("AT+CEREG?", timeout=self.at_timeout))
+            c5greg_stat = at_mod.parse_registration(self.at_port.command("AT+C5GREG?", timeout=self.at_timeout))
+        except TimeoutError:
+            self.stats.at_errors += 1
+            _log.warning("registration poll timed out")
+            return None
         except Exception:
             self.stats.at_errors += 1
             _log.exception("registration poll failed")
@@ -221,23 +259,41 @@ class Supervisor:
             return None
         return at_mod.is_registered(cereg_stat) or at_mod.is_registered(c5greg_stat)
 
-    def _poll_ip(self) -> str | None:
+    def _poll_ip(self) -> tuple[bool, str | None]:
+        """Return ``(answered, ip)``. ``answered`` is False if CGPADDR timed
+        out: the modem is busy or wedged, which says nothing about the PDP
+        context, so callers must not treat that as "no IP" and cycle it.
+        ``ip`` is None if there's no valid assigned IPv4 address.
+        """
         try:
-            return at_mod.ip_address(self.at_port, self.cid)
+            # at_mod.ip_address() takes no timeout, so do what it does here.
+            resp = self.at_port.command(f"AT+CGPADDR={self.cid}", timeout=self.at_timeout)
+            return True, at_mod.valid_assigned_ipv4(at_mod.parse_cgpaddr(resp))
+        except TimeoutError:
+            self.stats.at_errors += 1
+            _log.warning("CGPADDR poll timed out")
+            return False, None
         except Exception:
             self.stats.at_errors += 1
             _log.exception("CGPADDR poll failed")
-            return None
+            return True, None
 
     def _deactivate_activate(self) -> bool:
         try:
-            self.at_port.command(f"AT+CGACT=0,{self.cid}")
-            resp = self.at_port.command(f"AT+CGACT=1,{self.cid}")
+            self.at_port.command(f"AT+CGACT=0,{self.cid}", timeout=at_mod.ACTIVATE_TIMEOUT_S)
+            resp = self.at_port.command(f"AT+CGACT=1,{self.cid}", timeout=at_mod.ACTIVATE_TIMEOUT_S)
+        except TimeoutError:
+            self.stats.at_errors += 1
+            _log.warning("CGACT during reconnect timed out")
+            return False
         except Exception:
             self.stats.at_errors += 1
             _log.exception("CGACT during reconnect failed")
             return False
-        if "OK" not in resp:
+        # The final non-empty line must be the result code: a bare "OK"
+        # substring would also match e.g. "+CME ERROR: BOOK" or echoed text.
+        lines = [line.strip() for line in resp.splitlines() if line.strip()]
+        if not lines or lines[-1] != "OK":
             self.stats.at_errors += 1
             return False
         return True
@@ -253,6 +309,11 @@ class Supervisor:
             except Exception:
                 _log.exception("failed to reconfigure utun address")
             self.bridge.set_our_ip(ip)
+            if self._refresh_dns is not None:
+                try:
+                    self._refresh_dns(ip)
+                except Exception:
+                    _log.exception("failed to refresh DNS after IP change")
         self.current_ip = ip
 
     def _maybe_reset_backoff(self) -> None:

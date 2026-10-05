@@ -8,6 +8,7 @@ Thin wrapper around fm350mac.at.AtPort (see ../fm350mac/); falls back to a
 self-contained implementation if the fm350mac package isn't importable.
 """
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -91,7 +92,7 @@ def _main_standalone(args) -> None:
         while time.time() < deadline:
             buf += drain(ep_in, 300)
             text = buf.decode(errors="replace")
-            if any(t in text for t in ("\r\nOK\r\n", "ERROR", "+CME ERROR", "+CMS ERROR")):
+            if _has_final_result(text):
                 break
         return buf.decode(errors="replace").strip()
 
@@ -104,6 +105,16 @@ def _main_standalone(args) -> None:
     finally:
         usb.util.release_interface(dev, iface_num)
         usb.util.dispose_resources(dev)
+
+
+# Same terminator rule as fm350mac.at: the line must be complete (a read can end
+# mid-line, e.g. "+CME ERROR: operation not al"), and NO CARRIER is final too.
+_FINAL_RESULT_RE = re.compile(r"^(OK|ERROR|NO CARRIER|\+CME ERROR:.*|\+CMS ERROR:.*)\n", re.MULTILINE)
+
+
+def _has_final_result(text: str) -> bool:
+    """True once a whole line is a final result code (not just a substring)."""
+    return _FINAL_RESULT_RE.search(text.replace("\r\n", "\n").replace("\r", "\n")) is not None
 
 
 def main():

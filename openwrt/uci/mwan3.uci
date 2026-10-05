@@ -27,45 +27,61 @@
 #     "fm350_orig_policy" option so uninstall.sh can restore it.
 # That rule-neutralising step needs an existence check per rule, so it is
 # done by install.sh directly with `uci` rather than in this static batch
-# file. IPv6 ("default_rule_v6") is left untouched; see README.md.
+# file. IPv6 ("default_rule_v6") is handled there too: pointed at the stock
+# wan_only policy when wan6 is enabled, otherwise removed, with the original
+# saved for uninstall.sh; see README.md.
+#
+# Metered-link defaults: wan is probed every 5 s and marked down after 5
+# misses (25 s) / up after 10 successes (50 s), so a short blip doesn't move
+# traffic onto the metered SIM; wwan is probed every 30 s with at most two
+# track IPs (reliability 1) to keep tracking traffic small (see README.md).
+#
+# Every section created here carries option fm350_owned='1' so install.sh can
+# tell its own sections from a user's own sections with the same names (those
+# are saved before being replaced and restored by uninstall.sh).
 set mwan3.globals=globals
 
 set mwan3.wan=interface
 set mwan3.wan.enabled='1'
 set mwan3.wan.family='ipv4'
 set mwan3.wan.interval='5'
-set mwan3.wan.down='3'
-set mwan3.wan.up='3'
+set mwan3.wan.down='5'
+set mwan3.wan.up='10'
 
 delete mwan3.wwan
 set mwan3.wwan=interface
+set mwan3.wwan.fm350_owned='1'
 set mwan3.wwan.enabled='1'
 set mwan3.wwan.family='ipv4'
 add_list mwan3.wwan.track_ip='1.1.1.1'
 add_list mwan3.wwan.track_ip='9.9.9.9'
 set mwan3.wwan.reliability='1'
-set mwan3.wwan.interval='10'
+set mwan3.wwan.interval='30'
 set mwan3.wwan.down='3'
 set mwan3.wwan.up='3'
 
 delete mwan3.wan_m1
 set mwan3.wan_m1=member
+set mwan3.wan_m1.fm350_owned='1'
 set mwan3.wan_m1.interface='wan'
 set mwan3.wan_m1.metric='1'
 
 delete mwan3.wwan_m2
 set mwan3.wwan_m2=member
+set mwan3.wwan_m2.fm350_owned='1'
 set mwan3.wwan_m2.interface='wwan'
 set mwan3.wwan_m2.metric='2'
 
 delete mwan3.failover
 set mwan3.failover=policy
+set mwan3.failover.fm350_owned='1'
 add_list mwan3.failover.use_member='wan_m1'
 add_list mwan3.failover.use_member='wwan_m2'
 set mwan3.failover.last_resort='unreachable'
 
 delete mwan3.default
 set mwan3.default=rule
+set mwan3.default.fm350_owned='1'
 set mwan3.default.dest_ip='0.0.0.0/0'
 set mwan3.default.family='ipv4'
 set mwan3.default.use_policy='failover'

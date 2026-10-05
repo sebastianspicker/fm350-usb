@@ -14,6 +14,12 @@ set -e
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 UCI_DIR="$SCRIPT_DIR/uci"
 FILES_DIR="$SCRIPT_DIR/files"
+# Where saved copies of user sections that install.sh had to replace live
+# (restored by uninstall.sh).
+STATE_DIR=/etc/fm350-usb
+
+# shellcheck source=/dev/null # files/usr/lib/fm350/at-port.sh
+. "$FILES_DIR/usr/lib/fm350/at-port.sh"
 
 # --- mrhaav atc-fib-fm350_gl / luci-proto-atc packages -----------------------
 # Pinned to the mrhaav/openwrt commit we tested against (master as of
@@ -211,6 +217,17 @@ download() {
 	log "sha256 ok: ${2##*/}"
 }
 
+# --- pre-flight: nothing below may mutate config before this passes ----------
+find_wan_zone() {
+	uci -q show firewall 2>/dev/null | sed -n "s/^\(firewall\.[^.]*\)\.name='wan'$/\1/p" | head -n1
+}
+
+wan_zone=$(find_wan_zone)
+if [ -z "$wan_zone" ]; then
+	echo "install.sh: no firewall zone with name='wan' found in /etc/config/firewall, aborting (nothing was changed)" >&2
+	exit 1
+fi
+
 # --- base packages -----------------------------------------------------------
 base_pkgs="kmod-usb-net-rndis kmod-usb-serial-option comgt"
 [ "$no_mwan3" -eq 1 ] || base_pkgs="$base_pkgs mwan3 luci-app-mwan3"
@@ -224,11 +241,13 @@ pkg_install repo $base_pkgs
 
 # --- protocol handler ---------------------------------------------------------
 if [ "$proto" = atc ]; then
-	tmp_dir=$(mktemp -d /tmp/fm350-usb-install.XXXXXX) || {
+	tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/fm350-usb-install.XXXXXX") || {
 		echo "install.sh: mktemp failed" >&2
 		exit 1
 	}
-	trap 'rm -rf "$tmp_dir"' EXIT INT TERM
+	trap 'rm -rf "$tmp_dir"' EXIT
+	trap 'rm -rf "$tmp_dir"; exit 130' INT
+	trap 'rm -rf "$tmp_dir"; exit 143' TERM
 
 	if [ "$pkg_mgr" = opkg ]; then
 		luci_pkg="$tmp_dir/luci-proto-atc.ipk"
@@ -262,23 +281,10 @@ EOF
 fi
 
 # --- find the AT command tty -------------------------------------------------
-# USB interface :1.6 (0e8d:7127, mode 41, default) or :1.4 (0e8d:7126, mode 40).
-find_at_device() {
-	suffix=""
-	for suffix in ":1.6" ":1.4"; do
-		for dev in /sys/bus/usb/devices/*"$suffix"; do
-			[ -d "$dev" ] || continue
-			for tty in "$dev"/ttyUSB*; do
-				[ -e "$tty" ] || continue
-				echo "/dev/$(basename "$tty")"
-				return 0
-			done
-		done
-	done
-	return 1
-}
-
-if device=$(find_at_device); then
+# fm350_find_at_device (files/usr/lib/fm350/at-port.sh): USB interface :1.6
+# (0e8d:7127, mode 41, default) or :1.4 (0e8d:7126, mode 40), only on a USB
+# device with idVendor 0e8d.
+if device=$(fm350_find_at_device); then
 	log "AT command device detected: $device"
 else
 	device=/dev/ttyUSB4
@@ -309,8 +315,79 @@ apply_uci_template() {
 		log "[dry-run] uci batch from $(basename "$template"):"
 		echo "$rendered"
 	else
-		echo "$rendered" | uci -q batch
+		# No -q: a failing batch must be visible. Its exit status is not
+		# relied on (idempotent `delete`s of sections that don't exist yet
+		# report "Entry not found", and whether that makes `uci batch` exit
+		# non-zero is unverified), so its output is shown on failure and the
+		# key results are verified explicitly afterwards (verify_uci).
+		if ! batch_out=$(echo "$rendered" | uci batch 2>&1); then
+			echo "install.sh: note: uci batch from $(basename "$template") reported:" >&2
+			echo "$batch_out" >&2
+		fi
 	fi
+}
+
+# Aborts unless uci option $1 currently equals $2 (post-batch sanity check).
+verify_uci() {
+	[ "$dry_run" -eq 1 ] && return 0
+	actual=$(uci -q get "$1" 2>/dev/null) || actual=""
+	if [ "$actual" != "$2" ]; then
+		echo "install.sh: verification failed: $1 is '$actual', expected '$2'" >&2
+		exit 1
+	fi
+}
+
+# Prints "set"/"add_list" uci batch commands that recreate section $2 of
+# config $1 from `uci export`, optionally skipping the (space-separated)
+# option names in $3. Lists stay lists. Empty output if the section is gone.
+uci_section_to_batch() {
+	uci -q export "$1" 2>/dev/null | awk -v cfg="$1" -v sect="$2" -v skip=" $3 " -v q="'" '
+	$1 == "config" {
+		on = ($3 == q sect q)
+		if (on) print "set " cfg "." sect "=" $2
+		next
+	}
+	on && ($1 == "option" || $1 == "list") {
+		key = $2
+		if (index(skip, " " key " ") > 0) next
+		val = $0
+		# POSIX classes, not "[ \t]": busybox awk may pass "\t" inside a
+		# bracket expression to regcomp unescaped, where it means "\" or "t".
+		sub(/^[[:space:]]*(option|list)[[:space:]]+[^[:space:]]+[[:space:]]+/, "", val)
+		print (($1 == "list") ? "add_list " : "set ") cfg "." sect "." key "=" val
+	}'
+}
+
+# Saves a pre-existing section the installer is about to replace, but only
+# on the very first install (state section absent, $3 = 1) and only if it
+# lacks our fm350_owned marker: that is the user's own section. The copy
+# lives in $STATE_DIR and is restored by uninstall.sh. A section from an
+# older installer version (state section already present) is ours, not
+# the user's.
+save_foreign_section() {
+	cfg=$1
+	sect=$2
+	first=$3
+	[ "$first" -eq 1 ] || return 0
+	uci -q get "$cfg.$sect" >/dev/null 2>&1 || return 0
+	[ "$(uci -q get "$cfg.$sect.fm350_owned" 2>/dev/null)" = 1 ] && return 0
+	backup="$STATE_DIR/$cfg.$sect.batch"
+	[ -f "$backup" ] && return 0
+	if [ "$dry_run" -eq 1 ]; then
+		log "[dry-run] would save your existing $cfg.$sect to $backup (uninstall.sh restores it)"
+		return 0
+	fi
+	# The saved section may hold a SIM PIN or credentials: keep it root-only
+	# (uci's own /etc/config files are 0600).
+	(umask 077 && mkdir -p "$STATE_DIR" && uci_section_to_batch "$cfg" "$sect" >"$backup.tmp")
+	chmod 700 "$STATE_DIR"
+	if [ ! -s "$backup.tmp" ]; then
+		rm -f "$backup.tmp"
+		echo "install.sh: could not save existing $cfg.$sect, refusing to overwrite it" >&2
+		exit 1
+	fi
+	mv "$backup.tmp" "$backup"
+	log "saved your existing $cfg.$sect to $backup (uninstall.sh restores it)"
 }
 
 # Save an option's original value and its set/unset state exactly once. The
@@ -369,10 +446,6 @@ ensure_state_section() {
 	fi
 }
 
-find_wan_zone() {
-	uci -q show firewall 2>/dev/null | sed -n "s/^\(firewall\.[^.]*\)\.name='wan'$/\1/p" | head -n1
-}
-
 # Returns success if uci list $1 (e.g. mwan3.wan.track_ip) already contains
 # value $2.
 uci_list_contains() {
@@ -420,6 +493,7 @@ mwan3_set_mmx_mask_if_unset() {
 # original with the now-current "failover" value.
 neutralize_mwan3_rule() {
 	section=$1
+	policy=${2:-failover}
 	uci -q get "mwan3.$section" >/dev/null 2>&1 || return 0
 	if ! uci -q get "mwan3.$section.fm350_orig_policy" >/dev/null 2>&1; then
 		orig=$(uci -q get "mwan3.$section.use_policy" 2>/dev/null || true)
@@ -430,37 +504,111 @@ neutralize_mwan3_rule() {
 		fi
 	fi
 	if [ "$dry_run" -eq 1 ]; then
-		log "[dry-run] would set mwan3.$section.use_policy='failover'"
+		log "[dry-run] would set mwan3.$section.use_policy='$policy'"
 	else
-		uci set "mwan3.$section.use_policy=failover"
+		uci set "mwan3.$section.use_policy=$policy"
+	fi
+}
+
+# Removes the stock default_rule_v6 (policy "balanced") when wan6 isn't
+# enabled, after saving it for uninstall.sh. A rule we already redirected
+# (fm350_orig_policy present) is left alone.
+disable_mwan3_v6_default_rule() {
+	uci -q get mwan3.default_rule_v6 >/dev/null 2>&1 || return 0
+	uci -q get mwan3.default_rule_v6.fm350_orig_policy >/dev/null 2>&1 && return 0
+	save_foreign_section mwan3 default_rule_v6 1
+	if [ "$dry_run" -eq 1 ]; then
+		log "[dry-run] would remove mwan3.default_rule_v6 (wan6 is not enabled)"
+	else
+		log "wan6 is not enabled: removing mwan3.default_rule_v6 so LAN IPv6 isn't blackholed (saved for uninstall.sh)"
+		uci delete mwan3.default_rule_v6
 	fi
 }
 
 # --- network ------------------------------------------------------------------
+network_first=1
+uci -q get network.fm350_install_state >/dev/null 2>&1 && network_first=0
 ensure_state_section network.fm350_install_state
 save_section network.fm350_install_state wan network.wan
 save_option network.fm350_install_state wan_metric network.wan.metric
+# A network.wwan the user created themselves (no fm350_owned marker) is saved
+# to $STATE_DIR before it is replaced; uninstall.sh puts it back.
+save_foreign_section network wwan "$network_first"
+# Remember whether "wwan" was already in the wan zone before we touched it, so
+# uninstall.sh only removes it again if we were the ones who added it.
+if ! uci -q get network.fm350_install_state.wan_zone_wwan_state >/dev/null 2>&1; then
+	if uci_list_contains "$wan_zone.network" wwan; then
+		zone_state=present
+	else
+		zone_state=absent
+	fi
+	if [ "$dry_run" -eq 1 ]; then
+		log "[dry-run] would record that wwan is $zone_state in $wan_zone.network"
+	else
+		uci set "network.fm350_install_state.wan_zone_wwan_state=$zone_state"
+	fi
+fi
+
+# On a re-run, keep options the user added to our own wwan section (pincode,
+# atc_debug, custom_at, pdp, ...): everything the template sets itself is
+# refreshed, everything else is re-applied after the template. Only when the
+# protocol is unchanged, since options are proto-specific.
+wwan_preserved=""
+if [ "$(uci -q get network.wwan.fm350_owned 2>/dev/null)" = 1 ] &&
+	[ "$(uci -q get network.wwan.proto 2>/dev/null)" = "$proto" ]; then
+	if [ "$dry_run" -eq 1 ]; then
+		log "[dry-run] would preserve user-added options on the existing network.wwan"
+	else
+		if [ "$proto" = atc ]; then
+			template_opts="fm350_owned proto device apn auth delay defaultroute peerdns metric"
+		else
+			template_opts="fm350_owned proto device apn auth delay metric"
+		fi
+		# Drop the section-type line: only real options count as "preserved".
+		wwan_preserved=$(uci_section_to_batch network wwan "$template_opts" | grep -v '^set network\.wwan=') || wwan_preserved=""
+	fi
+fi
+
 log "applying network config (proto=$proto, device=$device, apn=$apn)"
 if [ "$proto" = atc ]; then
 	apply_uci_template "$UCI_DIR/network-atc.uci" "DEVICE=$device" "APN=$apn"
 else
 	apply_uci_template "$UCI_DIR/network-xmm.uci" "DEVICE=$device" "APN=$apn"
 fi
+if [ -n "$wwan_preserved" ]; then
+	log "preserving your extra options on network.wwan"
+	if ! batch_out=$(printf '%s\n' "$wwan_preserved" | uci batch 2>&1); then
+		echo "install.sh: re-applying your network.wwan options failed:" >&2
+		echo "$batch_out" >&2
+		exit 1
+	fi
+	uci commit network
+fi
+verify_uci network.wwan.proto "$proto"
+verify_uci network.wwan.apn "$apn"
+verify_uci network.wwan.device "$device"
+verify_uci network.wwan.fm350_owned 1
 
 # --- firewall -------------------------------------------------------------
-wan_zone=$(find_wan_zone)
-if [ -z "$wan_zone" ]; then
-	echo "install.sh: no firewall zone with name='wan' found in /etc/config/firewall, aborting" >&2
-	exit 1
-fi
 log "applying firewall config (wan zone: $wan_zone)"
 apply_uci_template "$UCI_DIR/firewall.uci" "WAN_ZONE=$wan_zone"
+if [ "$dry_run" -eq 0 ] && ! uci_list_contains "$wan_zone.network" wwan; then
+	echo "install.sh: verification failed: wwan is not in $wan_zone.network" >&2
+	exit 1
+fi
 
 # --- mwan3 ----------------------------------------------------------------
 if [ "$no_mwan3" -eq 1 ]; then
 	log "--no-mwan3: skipping mwan3 config"
 else
+	mwan3_first=1
+	uci -q get mwan3.fm350_install_state >/dev/null 2>&1 && mwan3_first=0
 	ensure_state_section mwan3.fm350_install_state
+	# mwan3 sections the user created under the names we own are saved
+	# before being replaced; uninstall.sh restores them.
+	for section in wwan wan_m1 wwan_m2 failover default; do
+		save_foreign_section mwan3 "$section" "$mwan3_first"
+	done
 	save_section mwan3.fm350_install_state wan mwan3.wan
 	save_section mwan3.fm350_install_state globals mwan3.globals
 	for option in enabled family interval down up; do
@@ -479,6 +627,20 @@ else
 	log "neutralizing stock mwan3 rules that would shadow ours (default_rule_v4, https), if present"
 	neutralize_mwan3_rule default_rule_v4
 	neutralize_mwan3_rule https
+	# IPv6 (unverified on hardware): the stock default_rule_v6 uses the
+	# "balanced" policy, which can blackhole LAN IPv6 when wan6 is disabled
+	# (no usable IPv6 member). With wan6 enabled, pin it to the stock
+	# wan-only policy; otherwise remove the rule (original saved for
+	# uninstall.sh) so IPv6 follows the normal routing table.
+	if [ "$(uci -q get mwan3.wan6.enabled 2>/dev/null)" = 1 ] &&
+		uci -q get mwan3.wan_only >/dev/null 2>&1; then
+		log "wan6 is enabled: pointing mwan3.default_rule_v6 at wan_only (IPv6 does not fail over to wwan)"
+		neutralize_mwan3_rule default_rule_v6 wan_only
+	else
+		disable_mwan3_v6_default_rule
+	fi
+	verify_uci mwan3.failover.last_resort unreachable
+	verify_uci mwan3.default.use_policy failover
 	[ "$dry_run" -eq 1 ] || uci commit mwan3
 fi
 
@@ -505,10 +667,15 @@ else
 	log "kernel $(uname -r) >= 6.6: no hotplug driver needed (option driver already knows the FM350)"
 fi
 
-# --- status helper script ---------------------------------------------------
+# --- shared AT port lookup + status helper script ---------------------------
+# at-port.sh is sourced by fm350-status and fm350-watchdog at run time.
 if [ "$dry_run" -eq 1 ]; then
+	log "[dry-run] would install $FILES_DIR/usr/lib/fm350/at-port.sh to /usr/lib/fm350/at-port.sh"
 	log "[dry-run] would install $SCRIPT_DIR/fm350-status.sh to /usr/bin/fm350-status"
 else
+	mkdir -p /usr/lib/fm350
+	cp "$FILES_DIR/usr/lib/fm350/at-port.sh" /usr/lib/fm350/at-port.sh
+	chmod 0644 /usr/lib/fm350/at-port.sh
 	cp "$SCRIPT_DIR/fm350-status.sh" /usr/bin/fm350-status
 	chmod 0755 /usr/bin/fm350-status
 fi

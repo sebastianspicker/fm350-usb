@@ -114,11 +114,15 @@ possible piece of the job.
 1. **AT (iface 6):** `AT+CPIN?` = READY → `AT+CGDCONT=1,"IP","<apn>"` → `AT+CGACT=1,1` → `AT+CGPADDR=1` → our IPv4 → `AT+GTDNS=1` → DNS servers.
 2. **RNDIS (ifaces 0/1):** INITIALIZE (MaxTransferSize 0x4000) → query MAC/MTU → SET `OID_GEN_CURRENT_PACKET_FILTER` = directed | multicast | broadcast (0x0B).
 3. **utun:** open → `ifconfig utunN inet <ip> <peer> mtu 1500 up`, with peer = a placeholder like `<ip>` (point-to-point; the gateway is implicit).
-4. **Routes:** save the current default → `route add default -interface utunN` (only with `--default-route`; otherwise add a scoped route or test with `ping -b utunN`).
-5. **DNS:** publish a `State:/Network/Service/fm350mac/DNS` key via `scutil` (removed on exit).
+4. **Routes:** with `--route-host IP` (repeatable, max 8; unicast IPv4 only), add a host route `IP -> utunN` for each (`route add -host IP -interface utunN`); this is the way to test on a metered SIM, since only those hosts use the tunnel. With `--default-route`, save the current default → `route add default -interface utunN`. Everything is removed on exit, routes and DNS first, and also while waiting for the modem to re-enumerate (so the Mac is never left routing into a dead utun); they are re-added after the rebuild.
+5. **DNS:** the modem's DNS servers are always queried and logged (`DNS=[...]` or `DNS=<none returned>`). Only with `--dns` is a `State:/Network/Service/fm350mac/DNS` key published via `scutil` (removed on exit). `--dns` requires `--default-route`: without it the carrier resolver would be queried over the normal uplink, so `up` refuses. If `--dns` is given but the modem returned no servers, a warning is logged and DNS is left unchanged.
+
+`up --dry-run` has no side effects: it sends only read-only AT queries (`CPIN?`, `CGSN`, `CGACT?`, `CGPADDR`, `GTDNS`; no `CGDCONT`/`CGACT` writes), does no RNDIS init/halt and runs no system command. It prints the AT commands and system commands it would run (using a placeholder address if the PDP context isn't already active).
+
+Shutdown order (SIGINT/SIGTERM/SIGHUP handlers are installed before the first network change): routes/DNS, then the bridge, then AT deactivate, then RNDIS halt.
 6. **Pump:** rx thread = bulk IN → RNDIS PACKET_MSG decode → Ethernet strip / ARP reply → utun write. tx thread = utun read → Ethernet wrap (dst = learned peer MAC, fallback broadcast; src = device MAC) → PACKET_MSG → bulk OUT.
 7. **Keepalive:** answer device `KEEPALIVE_MSG` with `KEEPALIVE_CMPLT`, and send our own every 5 s on the control channel.
-8. **Teardown (SIGINT/SIGTERM):** restore routes, remove DNS key, close utun, RNDIS HALT, `AT+CGACT=0,1`, release interfaces.
+8. **Teardown (SIGINT/SIGTERM/SIGHUP):** remove DNS key and restore routes, stop the bridge, `AT+CGACT=0,1`, RNDIS HALT, release interfaces, then close utun.
 
 > **Note (stale text, C3):** the heading above still shows `sudo fm350mac
 > up`. That was accurate before privilege separation existed. With the root
@@ -150,7 +154,8 @@ fm350mac/                 Python ≥3.11 project, uv-managed (pyproject.toml)
     utun.py               utun open/read/write (AF header handling)
     netconfig.py          ifconfig/route/scutil wrappers, dry-run capable, restore on exit
     bridge.py             rx/tx threads, stats, shutdown
-    cli.py                `fm350mac probe|at|status|connect|up|down`
+    cli.py                `fm350mac probe|at|status|doctor|connect|disconnect|up|async-selftest|helper`
+  tests/                  pytest: rndis codec, ethernet/ARP, utun framing, netconfig dry-run
 ```
 
 `probe`, `at` and `status` need no root. `up` needs root (utun + routes).
@@ -167,7 +172,7 @@ fm350mac/                 Python ≥3.11 project, uv-managed (pyproject.toml)
 ## Milestones
 
 1. Done: `probe`, RNDIS init + OID queries (done manually; now in the package).
-2. `status`/`connect`: AT data session, print IP and DNS. Code done; untested live (no SIM).
+2. `status`/`connect`: AT data session, print IP and DNS. Done; verified live with a Telekom DE SIM (2026-10-05).
 3. `up` with `--no-default-route`: utun + pump, then `ping -b utunN 1.1.1.1`.
 4. `--default-route` + DNS + clean teardown.
 5. Measure with iperf3 and decide whether the hot path needs porting.
@@ -192,7 +197,7 @@ running sync pyusb (packets can be reordered on RX).
 
 - `Libusb`: loads `libusb-1.0.dylib` via ctypes (same search order as today). Declares `argtypes`/`restype` for every function used: `libusb_init_context` (fallback `libusb_init`), `libusb_exit`, `libusb_get_device_list`/`free_device_list`, `libusb_get_device_descriptor`, `libusb_open`/`close`, `libusb_get_active_config_descriptor`/`free_config_descriptor` (endpoint discovery), `libusb_claim_interface`/`release_interface`, `libusb_clear_halt`, `libusb_reset_device`, `libusb_control_transfer`, `libusb_bulk_transfer`, `libusb_interrupt_transfer`, `libusb_alloc_transfer`/`free_transfer`/`submit_transfer`/`cancel_transfer`, `libusb_handle_events_timeout_completed`, `libusb_error_name`, `libusb_get_version`.
 - `LibusbTransfer(ctypes.Structure)` mirrors `struct libusb_transfer` field by field (`dev_handle`, `flags` u8, `endpoint` u8, `type` u8, `timeout` c_uint, `status` c_int, `length` c_int, `actual_length` c_int, `callback`, `user_data`, `buffer`, `num_iso_packets` c_int). ctypes natural alignment gives 64 bytes on LP64. `libusb_fill_bulk_transfer` is `static inline` in the header, so we fill the fields ourselves.
-- **Layout check:** the struct layout was checked against a small C program compiled with `cc` against `/opt/homebrew/include/libusb-1.0/libusb.h` that prints `sizeof`/`offsetof` for every field, and compared with `ctypes.sizeof`/`Field.offset`.
+- **Layout test:** `tests/test_usb_async_layout.py` compiles a small C program with `cc` against `/opt/homebrew/include/libusb-1.0/libusb.h` that prints `sizeof`/`offsetof` for every field, and compares them with `ctypes.sizeof`/`Field.offset`. It is skipped (with a reason) only if no compiler or header is present.
 - `UsbDevice`: one open handle per process, shared by the RNDIS ifaces (0/1) and the AT iface (6). Ctx-managed, releases claimed ifaces on close. It has sync helpers (`control_in/out`, `bulk_in/out`, `interrupt_in`) that map libusb errors to typed exceptions: `UsbTimeout`, `UsbNoDevice`, `UsbPipeError`, `UsbError(code, name)`.
 - `AsyncEndpoint`: a pool of N pre-allocated transfers plus buffers for one endpoint.
   - **Lifetime rules (a mistake here crashes a root process):** transfers, buffers and the single `CFUNCTYPE` callback object are allocated once and kept referenced in the pool until *every* transfer has reported a final status after cancel. Never free or resize a buffer while its transfer is in flight. `free_transfer` only after its callback ran with a non-resubmitted status. No `LIBUSB_TRANSFER_FREE_*` flags (Python owns the memory).
@@ -204,7 +209,7 @@ running sync pyusb (packets can be reordered on RX).
 
 - **RX:** `--rx-urbs` (default 8) bulk-IN transfers of 16 KiB on 0x81. On completion: `unpack_packets` → strip → utun write (non-blocking; count drops on EAGAIN) → ARP handling → resubmit immediately. The utun write happens on the event thread, which keeps the order.
 - **TX:** the tx thread reads utun and wraps into PACKET_MSG (+1 pad byte when the length is a multiple of wMaxPacketSize, and drop if > max_transfer_size). It takes a free OUT transfer from a pool of `--tx-urbs` (default 8) and submits it. If none is free (all in flight / modem stalled), drop and count `tx_stalls` (rate-limited log). OUT timeout 500 ms.
-- **Control:** a 1-deep async interrupt-IN transfer on 0x82 sets an event. The control thread then does a single `GET_ENCAPSULATED_RESPONSE` (never poll without a notification: that crashed the modem firmware), handles KEEPALIVE/INDICATE_STATUS, and sends our 5 s keepalive.
+- **Control:** a 1-deep async interrupt-IN transfer on 0x82 increments a counted condition, once per `RESPONSE_AVAILABLE` notification. The control thread then does exactly one `GET_ENCAPSULATED_RESPONSE` per counted notification (never poll without a notification: that crashed the modem firmware), handles KEEPALIVE/INDICATE_STATUS, and sends our 5 s keepalive. The FM350 sends the RNDIS-spec encoding of RESPONSE_AVAILABLE (`01 00 00 00 00 00 00 00`), not the CDC `A1 01 …` form; both are accepted. It also sends more notifications than it has responses, so some GETs return the spec's 1-byte `00` "nothing pending" reply, which is ignored (verified on hardware 2026-10-05).
 - `cli up --io async|sync` (default async). `Bridge` (sync) stays as the fallback until async is proven with a SIM.
 
 ### Verification without a SIM
@@ -236,14 +241,15 @@ running sync pyusb (packets can be reordered on RX).
   - `open_utun {}` → the fd via `SCM_RIGHTS` + `{ifname}`. Max 1 per connection.
   - `set_address {ip}`: ip must pass the same checks as `at.valid_assigned_ipv4` (the helper has its own copy; no import from the package).
   - `reconfigure_address {old_ip, new_ip}`
-  - `add_host_route {dest}`: dest must be a single IPv4 host. For loopback mode only 198.51.100.0/24 is allowed.
+  - `add_host_route {dest}`: dest must be a single unicast IPv4 host (not 0/8, 127/8, 169.254/16, multicast, 240/4 or broadcast). Used by `up --route-host` and loopback mode. Max 8 per connection, no duplicates; deleted newest first on teardown.
+  - `clear_host_routes {}`: delete this connection's host routes now (used while the modem is re-enumerating).
   - `set_default_route {enable}`: capture/restore semantics exactly as in `NetConfig` (idempotent; never captures an interface it owns).
   - `set_dns {servers: [≤3 IPv4]}` / `clear_dns {}`
   - `teardown {}`
 - **Automatic cleanup:** the helper tracks all changes per connection. When the connection closes for any reason (including SIGKILL or a crash of the main process), it undoes them in reverse order and closes the utun. That removes the "SIGKILL leaves routes/DNS behind" problem.
 - Commands run with fixed argv lists via absolute paths (`/sbin/ifconfig`, `/sbin/route`, `/usr/sbin/scutil`), with a minimal environment and no shell.
 - **Main process:** `HelperClient` implements the existing `Utun` + `NetConfig` interfaces over the socket, so cli/bridge/supervisor don't change. `up` no longer needs root when the helper is installed. `--no-helper` keeps the current sudo mode as a fallback.
-- **Install/uninstall** (run these with sudo; they print every step first and have `--dry-run`): `fm350mac helper install` copies the helper file, writes `/Library/LaunchDaemons/de.fm350mac.helper.plist` (root:wheel 0644, `ProgramArguments = [/usr/bin/python3, -I, -S, /usr/local/libexec/fm350mac-helper, --allowed-uid, <uid>]`), then `launchctl bootstrap system …`. `helper uninstall` reverses it. `helper status` shows whether it's loaded and reachable.
+- **Install/uninstall** (run these with sudo; they print every step first and have `--dry-run`): `fm350mac helper install` copies the helper file, writes `/Library/LaunchDaemons/de.fm350mac.helper.plist` (root:wheel 0644, `ProgramArguments = [/usr/bin/python3, -I, -S, /usr/local/libexec/fm350mac-helper, --allowed-uid, <uid>]`), then `/bin/launchctl bootout system/de.fm350mac.helper` (failure ignored) and `/bin/launchctl bootstrap system …`. The bootout matters: once launchd has started the helper (on the first connection) it stays resident, so a reinstall would otherwise keep running the old code. `helper uninstall` reverses it (and removes `/var/log/fm350mac-helper.log`). `helper status` shows whether it's loaded and reachable, and prints "installed helper is out of date — run `fm350mac helper install`" if the installed file differs from the packaged one. Connections that stay silent for 300 s before opening a utun are dropped (the timeout only applies until the utun is open; a live session may idle for hours); SIGTERM unwinds through the connection's cleanup (one teardown).
 - **Tests:** the helper's request validation and state machine are unit-tested with a fake command runner, **also executed under `/usr/bin/python3` (3.9)**. The fd passing is tested with a socketpair and a pipe fd. Client/helper end to end runs in-process with the fake runner. The only live root step is running `helper install` and then `up --loopback` without sudo.
 
 This design has since run live end to end — see the [bench log's privilege
@@ -255,10 +261,11 @@ from a user's point of view.
 
 ## What's not proven yet
 
-- The real data path (`up` against the actual FM350-GL) has not run live —
-  it needs a SIM. Everything about it so far is either unit-tested or
-  exercised through `up --loopback` against the in-process fake modem, not
-  the real device [fm350mac README, Limitations].
+- The real data path (`up` against the actual FM350-GL) has run live only
+  briefly (2026-10-05, Telekom DE SIM, `up --route-host`: ping, HTTPS, a 1 MB
+  download). Long sessions, re-enumeration recovery and `--default-route` /
+  `--dns` on hardware are still verified only by unit tests and
+  `up --loopback` [fm350mac README, Limitations].
 - The async I/O rewrite's whole point — higher throughput than the ~9 k
   pkt/s / ~100 Mbps synchronous ceiling — has not been measured; only the
   synchronous figure above comes from a real measurement. The "~150 Mbps"

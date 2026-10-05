@@ -13,9 +13,12 @@ otherwise connect to a root:wheel, mode-0600 socket. The plist's
 ``SockPathName``/``SockPathMode``) that tells launchd to ``chown`` the
 socket to that uid right after creating it -- so it's chosen here over the
 alternative (giving the helper ``RunAtLoad``/``KeepAlive`` true and having
-it bind+chown its own socket at startup), since that alternative would mean
-a root process runs continuously instead of only while ``up`` is actually
-connected, which is exactly what privilege separation is meant to avoid.
+it bind+chown its own socket at startup), since that alternative would start
+a root process at every boot rather than on demand. Note that with socket
+activation the helper is only *started* by the first connection; once
+activated it stays resident (idle, just listening) until ``bootout``/
+``uninstall``/reboot. That is why ``install`` boots out any running helper
+before bootstrapping: otherwise a reinstall would leave the old code running.
 
 **Install safety (`install` runs as root):** every destination is written
 atomically (temp file in the same directory, ``O_EXCL|O_NOFOLLOW``,
@@ -39,6 +42,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -52,6 +56,7 @@ PLIST_LABEL = "de.fm350mac.helper"
 PYTHON3 = "/usr/bin/python3"
 SOCKET_PATH = helper_client.HELPER_SOCKET_PATH  # /var/run/fm350mac-helper.sock
 _LOG_PATH = "/var/log/fm350mac-helper.log"
+LAUNCHCTL = "/bin/launchctl"
 
 # The helper is one smallish, hand-written file; anything bigger than this
 # is not it, and reading it into memory is meant to be cheap.
@@ -60,6 +65,15 @@ _MAX_HELPER_SOURCE_BYTES = 256 * 1024
 
 class HelperInstallError(Exception):
     """A safety check failed; installation must be refused."""
+
+
+# See cmd_helper_install: bootout is asynchronous.
+_BOOTOUT_WAIT_POLLS = 20
+_BOOTOUT_WAIT_INTERVAL_S = 0.5
+_BOOTSTRAP_ATTEMPTS = 3
+_BOOTSTRAP_RETRY_INTERVAL_S = 1.0
+
+_UID_NO_CHANGE = 2**32 - 1  # (uid_t)-1
 
 
 def _print_step(msg: str) -> None:
@@ -89,6 +103,10 @@ def _resolve_allowed_uid(explicit: Optional[int]) -> int:
         source = "$SUDO_UID"
     if uid == 0:
         raise HelperInstallError(f"refusing uid 0 (root) as the helper's allowed uid (from {source})")
+    # uid_t is unsigned 32-bit and (uid_t)-1 means "no owner change" to
+    # chown(): such a uid could never own the socket or match a peer.
+    if not 0 < uid < _UID_NO_CHANGE:
+        raise HelperInstallError(f"uid {uid} (from {source}) is out of range (1..{_UID_NO_CHANGE - 1})")
     return uid
 
 
@@ -280,6 +298,7 @@ def cmd_helper_install(
     after_source_read_hook: Optional[Callable[[], None]] = None,
     owner_uid: int = 0,
     owner_gid: int = 0,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> int:
     """Copy the helper file to ``install_path``, write the LaunchDaemon
     plist, and bootstrap it. Needs sudo; ``--dry-run`` prints the plan
@@ -346,7 +365,8 @@ def cmd_helper_install(
     _print_step(f"create {install_dir} if missing (root:wheel 0755)")
     _print_step(f"install {install_path} (root:wheel 0755)")
     _print_step(f"write {plist_path} (root:wheel 0644)")
-    _print_step(f"launchctl bootstrap system {plist_path}")
+    _print_step(f"{LAUNCHCTL} bootout system/{PLIST_LABEL} (ignore failure: replaces a running helper)")
+    _print_step(f"{LAUNCHCTL} bootstrap system {plist_path}")
 
     if dry_run:
         print("(dry run: nothing was changed)")
@@ -356,8 +376,26 @@ def cmd_helper_install(
     _write_root_file(install_path, data, 0o755, uid=owner_uid, gid=owner_gid)
     _write_root_file(plist_path, _plist_xml(allowed_uid, install_path).encode(), 0o644, uid=owner_uid, gid=owner_gid)
 
-    result = launchctl_runner(["launchctl", "bootstrap", "system", str(plist_path)], capture_output=True, text=True)
-    if result.returncode != 0:
+    # A helper that's already running (it stays resident once activated)
+    # would otherwise keep serving the old code: boot it out first. Failure
+    # just means nothing was loaded.
+    launchctl_runner([LAUNCHCTL, "bootout", f"system/{PLIST_LABEL}"], capture_output=True, text=True)
+    # bootout returns before launchd has finished unloading the old job; a
+    # bootstrap in that window fails with "5: Input/output error" (seen on
+    # macOS 27). Wait until the job is really gone, then retry a few times.
+    for _ in range(_BOOTOUT_WAIT_POLLS):
+        probe = launchctl_runner([LAUNCHCTL, "print", f"system/{PLIST_LABEL}"], capture_output=True, text=True)
+        if probe.returncode != 0:
+            break
+        sleep(_BOOTOUT_WAIT_INTERVAL_S)
+
+    for attempt in range(1, _BOOTSTRAP_ATTEMPTS + 1):
+        result = launchctl_runner([LAUNCHCTL, "bootstrap", "system", str(plist_path)], capture_output=True, text=True)
+        if result.returncode == 0:
+            break
+        if attempt < _BOOTSTRAP_ATTEMPTS:
+            sleep(_BOOTSTRAP_RETRY_INTERVAL_S)
+    else:
         print(f"launchctl bootstrap failed: {result.stderr.strip()}", file=sys.stderr)
         return 1
 
@@ -372,30 +410,34 @@ def cmd_helper_uninstall(
     launchctl_runner=subprocess.run,
     install_path: Optional[Path] = None,
     plist_path: Optional[Path] = None,
+    log_path: Optional[Path] = None,
 ) -> int:
-    """Reverse ``install``: ``launchctl bootout``, then remove the plist and
-    the installed helper binary. Needs sudo; ``--dry-run`` needs neither.
+    """Reverse ``install``: ``launchctl bootout``, then remove the plist, the
+    installed helper binary and the helper's log file. Needs sudo;
+    ``--dry-run`` needs neither.
     """
     install_path = Path(install_path) if install_path is not None else INSTALL_PATH
     plist_path = Path(plist_path) if plist_path is not None else PLIST_PATH
+    log_path = Path(log_path) if log_path is not None else Path(_LOG_PATH)
     dry_run = args.dry_run
     if not dry_run and geteuid() != 0:
         print("fm350mac helper uninstall must be run with sudo.", file=sys.stderr)
         return 1
 
-    _print_step(f"launchctl bootout system/{PLIST_LABEL}")
+    _print_step(f"{LAUNCHCTL} bootout system/{PLIST_LABEL}")
     _print_step(f"remove {plist_path}")
     _print_step(f"remove {install_path}")
+    _print_step(f"remove {log_path}")
 
     if dry_run:
         print("(dry run: nothing was changed)")
         return 0
 
-    result = launchctl_runner(["launchctl", "bootout", f"system/{PLIST_LABEL}"], capture_output=True, text=True)
+    result = launchctl_runner([LAUNCHCTL, "bootout", f"system/{PLIST_LABEL}"], capture_output=True, text=True)
     if result.returncode != 0:
         print(f"launchctl bootout: {result.stderr.strip()} (continuing to remove files anyway)", file=sys.stderr)
 
-    for path in (plist_path, install_path):
+    for path in (plist_path, install_path, log_path):
         try:
             path.unlink()
         except FileNotFoundError:
@@ -420,15 +462,25 @@ def cmd_helper_status(
     helper_probe=helper_client.probe,
     install_path: Optional[Path] = None,
     plist_path: Optional[Path] = None,
+    helper_source: Path = _HELPER_SOURCE,
 ) -> int:
-    """Report file presence/ownership, socket presence, and a hello round
-    trip. Never needs root.
+    """Report file presence/ownership, socket presence, whether the installed
+    helper matches the packaged source, and a hello round trip. Never needs
+    root.
     """
     install_path = Path(install_path) if install_path is not None else INSTALL_PATH
     plist_path = Path(plist_path) if plist_path is not None else PLIST_PATH
     print(f"helper binary : {install_path}: {_describe_path(install_path)}")
     print(f"LaunchDaemon  : {plist_path}: {_describe_path(plist_path)}")
     print(f"socket        : {SOCKET_PATH}: {_describe_path(Path(SOCKET_PATH))}")
+    try:
+        installed_bytes = install_path.read_bytes()
+        packaged_bytes = Path(helper_source).read_bytes()
+    except OSError:
+        pass  # not installed (already reported above) or source unreadable: nothing to compare
+    else:
+        if installed_bytes != packaged_bytes:
+            print("installed helper is out of date — run `fm350mac helper install`")
 
     client = helper_probe()
     if client is None:

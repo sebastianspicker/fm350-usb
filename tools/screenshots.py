@@ -494,7 +494,7 @@ def main() -> int:
         if args.skip_qemu and name == "qemu-failover-summary":
             print("skipping %s.svg: --skip-qemu" % name)
             continue
-        if args.skip_live and name in ("identity", "status", "probe"):
+        if args.skip_live and name in ("identity", "status", "doctor", "probe"):
             print("skipping %s.svg: --skip-live" % name)
             continue
 

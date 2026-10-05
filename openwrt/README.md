@@ -7,6 +7,7 @@
 - Tested so far in an OpenWrt Docker rootfs, against a pty modem emulator, and in a full OpenWrt-under-QEMU build with real mwan3 — not yet on real router hardware.
 - A watchdog service works around a known hang in the `atc` protocol handler by restarting the `wwan` interface.
 - IPv6 isn't covered by the failover policy; see the warning below.
+- The backup SIM is metered: read [Metered SIM: tracking traffic and what is not capped](#metered-sim-tracking-traffic-and-what-is-not-capped) and [the PIN/PUK risk](#pinpuk-risk) before relying on it.
 
 ## Usage
 
@@ -26,6 +27,7 @@ After a real run:
 /etc/init.d/network reload
 /etc/init.d/firewall reload
 /etc/init.d/mwan3 restart   # unless --no-mwan3
+/etc/init.d/fm350-watchdog start   # unless --no-watchdog; install.sh only enables it
 fm350-status                # confirm registration
 mwan3 status                # confirm the failover policy is active
 ```
@@ -43,9 +45,42 @@ mwan3 status                # confirm the failover policy is active
 
 `install.sh` detects `opkg` vs `apk` automatically. It also auto-detects the
 FM350's AT tty from sysfs (`*:1.6/ttyUSB*` for `0e8d:7127` mode 41, `*:1.4/ttyUSB*`
-for `0e8d:7126` mode 40); if the modem isn't enumerated yet it falls back to
-`/dev/ttyUSB4` with a warning, and `network.wwan.device` can be corrected by
-hand afterwards.
+for `0e8d:7126` mode 40, `:1.6` preferred) and only accepts an interface whose
+parent USB device has vendor ID `0e8d`, so another USB serial adapter is never
+picked. The lookup lives in `files/usr/lib/fm350/at-port.sh`, installed to
+`/usr/lib/fm350/at-port.sh` and shared by `install.sh`, `fm350-status` and the
+watchdog. If the modem isn't enumerated yet, `install.sh` falls back to
+`/dev/ttyUSB4` with a warning; the watchdog re-resolves the port before each
+`ifup` and updates `network.wwan.device` if the configured path is gone or is
+no longer an FM350 AT port (its `ubus call network reload` step is unverified
+on hardware).
+
+`install.sh` also checks that a `wan` firewall zone exists before it changes
+any config, and shows `uci batch` errors instead of hiding them (`-q` is no
+longer passed).
+
+### What happens to your existing config
+
+- **Your own `network.wwan` / mwan3 `wwan`, `wan_m1`, `wwan_m2`, `failover`,
+  `default`**: every section the installer creates carries `option
+  fm350_owned '1'`. On the first install, a section with one of those names
+  but without the marker is yours: it is saved (as `uci batch` commands,
+  lists kept as lists) to `/etc/fm350-usb/<config>.<section>.batch` before it
+  is replaced, and `uninstall.sh` restores it. Restored sections are appended
+  at the end of their config, so their position in the rule order may change.
+  Unverified on real `uci`; the conversion was only exercised against sample
+  `uci export` text and a fake `uci` (`tests/uci-section-test.sh`,
+  `tests/install-roundtrip-test.sh`). `uninstall.sh` only deletes those
+  sections (and `network.wwan`) when they carry the marker or `install.sh`
+  recorded its state for that config, so an uninstall after `--no-mwan3`, or
+  without a prior install, leaves your own `mwan3` sections and `network.wwan`
+  untouched.
+- **Re-running** `install.sh` keeps options you added to our `network.wwan`
+  (for example `pincode`, `atc_debug`, `custom_at`, `pdp`) as long as `--proto`
+  is unchanged; only the options the template sets (`proto`, `device`, `apn`,
+  `auth`, `delay`, `defaultroute`, `peerdns`, `metric`) are refreshed.
+- **`wwan` in the `wan` firewall zone**: if it was already in the zone's
+  network list before the first install, `uninstall.sh` leaves it there.
 
 ## Rollback
 
@@ -57,8 +92,11 @@ cd /root/openwrt
 /etc/init.d/mwan3 restart
 ```
 
-`uninstall.sh` removes the uci sections listed below, the hotplug driver file
-and `/usr/bin/fm350-status`, but leaves packages installed (it prints the
+`uninstall.sh` removes the uci sections listed below, the hotplug driver file,
+`/usr/bin/fm350-status`, `/usr/lib/fm350/at-port.sh` and the watchdog (it
+stops and disables the service, then deletes `/etc/init.d/fm350-watchdog`,
+`/usr/sbin/fm350-watchdog` and `/etc/config/fm350_watchdog`), restores any of
+your own sections that `install.sh` saved, but leaves packages installed (it prints the
 `opkg remove` / `apk del` command for that). To fully revert, also run that
 command and, if flashed over GL.iNet firmware, restore your backup from step 0
 of the setup guide.
@@ -71,12 +109,17 @@ of the setup guide.
 | `uninstall.sh` | Removes the uci sections and files added by `install.sh`. Leaves packages installed. |
 | `fm350-status.sh` | Read-only modem status: registration, operator, signal (RSRP/RSRQ/SINR), serving cell and band, temperature, FCC-lock state. `-r` prints the raw AT responses, `-x` masks the cell ID and TAC so you can paste the output publicly. Never changes modem state. Copied to `/usr/bin/fm350-status` by `install.sh`. |
 | `files/usr/sbin/fm350-watchdog`, `files/etc/init.d/fm350-watchdog` | Watchdog that restarts `wwan` when the `atc` handler hangs (see below). Installed and enabled by `install.sh` unless you pass `--no-watchdog`. |
+| `files/usr/lib/fm350/at-port.sh` | Shared AT tty lookup (vendor `0e8d` only, `:1.6` before `:1.4`), sourced by `install.sh`, `fm350-status` and the watchdog. Installed to `/usr/lib/fm350/at-port.sh`. |
+| `tests/watchdog-unit-test.sh` | Pure-shell watchdog tests (no Docker): failing `uci`/`ifstatus`, zero values, PIN/SIM skip, modem unplug/replug, AT port lookup and re-resolve. |
+| `tests/uci-section-test.sh`, `tests/install-roundtrip-test.sh`, `tests/fake-uci.sh` | Pure-shell tests (no Docker): the `uci export` to `uci batch` conversion used to save your sections, and install, re-install and uninstall against a small fake `uci` (restores your own sections, `--no-mwan3`, proto switch, kernel < 6.6 hotplug file). The fake `uci` only mimics what the scripts use, so this does not replace `docker-test.sh` with the real `uci`. |
 | `uci/fm350-watchdog.uci` | Default settings for the watchdog (`/etc/config/fm350_watchdog`). |
 | `uci/network-atc.uci` | `network.wwan` for the mrhaav `atc` protocol handler, plus `network.wan.metric`. |
 | `uci/network-xmm.uci` | `network.wwan` for the modemfeed `xmm` protocol handler, plus `network.wan.metric`. |
 | `uci/firewall.uci` | Adds `wwan` to the `wan` firewall zone and the "Allow modem RA" ICMPv6 rule. |
 | `uci/mwan3.uci` | wan/wwan mwan3 tracking, members, `failover` policy and `default` rule. |
 | `files/etc/hotplug.d/usb/50-fm350_driver` | Binds the `option` serial driver via `new_id` on kernel < 6.6 only. Copied by `install.sh` when needed. |
+| `tests/docker-test.sh` | Repeatable install/uninstall idempotency test against an OpenWrt Docker rootfs. |
+| `tests/fixtures/mwan3.default` | Vendored copy of the stock mwan3 default config (see below), used by `docker-test.sh`. |
 
 All `uci/*.uci` files are `uci batch` snippets: they `delete` a section (or
 `del_list`/`add_list` a single value) before (re-)creating it, so running
@@ -89,7 +132,7 @@ applied with `uci import`, so they never touch unrelated config in
 In short: installing `mwan3` on OpenWrt 24.10 gives you a working default config of its own, already pointed at a `wan`-only policy. Rather than overwrite that, `install.sh` builds its failover setup around whatever is already there: it only ever changes the handful of settings it actually needs, it fully owns and rebuilds its own sections every run so re-running it is safe, and where it has to redirect an existing rule to its failover policy, it remembers the original value so `uninstall.sh` can put it back exactly.
 
 The precise mechanics: `opkg install mwan3` on OpenWrt 24.10 ships a default
-`/etc/config/mwan3` with its own `globals` and `wan`
+`/etc/config/mwan3` (vendored at `tests/fixtures/mwan3.default`) with its own `globals` and `wan`
 sections, plus a `https` rule (tcp/443) and a `default_rule_v4` rule
 (`0.0.0.0/0`), both pointed at a `balanced` policy and evaluated **before**
 any rule `install.sh` appends. mwan3 is first-match, so an appended `default`
@@ -126,23 +169,68 @@ restores `default_rule_v4`/`https`'s original `use_policy` from
 `fm350_orig_policy` before deleting that option. It also removes a
 `mwan3.wan` or `mwan3.globals` section if the installer created it.
 
-> **IPv6 is not covered**: `default_rule_v6` is left untouched (still pointed
-> at `balanced`), and the `failover` policy has no IPv6 members. If your ISP
-> hands out IPv6 on `wan`, IPv6 traffic will not fail over to `wwan`.
+> **IPv6 is not covered**: the `failover` policy has no IPv6 members, so IPv6
+> traffic never fails over to `wwan`. mwan3's stock `default_rule_v6` (policy
+> `balanced`) can blackhole LAN IPv6 when `wan6` is disabled, which is the
+> stock setting. So `install.sh` points `default_rule_v6` at the stock
+> `wan_only` policy when `mwan3.wan6` is enabled, and otherwise removes the
+> rule (saving it in `/etc/fm350-usb`, and `fm350_orig_policy` for the
+> redirect case, so `uninstall.sh` restores it). **This IPv6 handling is
+> unverified on hardware** (and untested under QEMU).
+
+## Metered SIM: tracking traffic and what is not capped
+
+The backup SIM is a metered 5 GB plan (Telekom), so the mwan3 defaults in
+`uci/mwan3.uci` are tuned to keep probing small and failover stable:
+
+- `wan`: `interval 5`, `down 5`, `up 10`. A blip of a few seconds doesn't move
+  traffic to the SIM (25 s of misses to fail over, 50 s of successes to fail back).
+- `wwan`: `interval 30`, `reliability 1`, two track IPs. Roughly one ping
+  (about 170 bytes with the reply) per probe means about 15 MB per month if the
+  first track IP answers, up to about 30 MB if both are probed every cycle.
+  This is an estimate, not a measurement; mwan3track also runs while `wan` is
+  healthy.
+- **Nothing caps or filters LAN traffic during failover.** While `wan` is down,
+  every LAN client (updates, backups, video, cloud sync) uses the 5 GB. Set a
+  data limit or alert with the carrier, or add your own firewall/QoS rules.
+- `peerdns` is left at `1` on `wwan`: when the interface is up, the carrier's DNS
+  servers are added to the resolver list, so DNS queries may go over the
+  metered link even while `wan` is healthy, depending on how dnsmasq picks
+  servers. We have not measured this.
+
+## PIN/PUK risk
+
+If the SIM has a PIN, `atc.sh` sends `AT+CPIN="<pincode>"` from the
+`network.wwan.pincode` option on every interface start. A wrong PIN is tried
+again at each start and three failures PUK-lock the SIM (a carrier-issued PUK
+is then needed, and ten wrong PUKs destroy the SIM). The watchdog restarts
+`wwan`, so it must never do that blindly: it reads `ifstatus wwan`'s
+`errors[].code` and does **not** restart (it logs once per episode) when a code
+contains `pin`, `puk`, `sim` or `denied`, case-insensitively. This covers the
+codes `atc.sh` passes to `proto_notify_error` right before
+`proto_block_restart` in the pinned revision: `PINmissing`, `PINerror`,
+`SIMreadfailure`, `REG_DENIED`, and raw `+CME ERROR` texts such as
+`SIM not inserted`. Assumption: these codes show up in `ifstatus` as
+`errors[].code`; this is unverified on hardware, and `SESSION_FAILED` (bad
+APN) is still retried with backoff. Prefer a SIM with the PIN disabled, and do
+not set `pincode` until you have checked the PIN by hand.
 
 ## fm350-watchdog: recovering a stuck `wwan`
 
 mrhaav's `atc.sh` treats only `+CME ERROR ... (#33)` from `AT+CGACT` as fatal. Any other error during activation leaves it waiting forever for messages that never come, so `wwan` stays "connecting" and failover to 5G is silently unavailable (see [docs/compatibility-and-risks.md](../docs/compatibility-and-risks.md)).
 
-`fm350-watchdog` is a small procd service that checks `ifstatus wwan` every 30 s. If the interface hasn't been up for 180 s in a row, it runs `ifdown wwan; ifup wwan` and logs to syslog (`logread -e fm350-watchdog`). Restarts back off exponentially up to 30 minutes, and the backoff resets once `wwan` has stayed up for 5 minutes. It leaves the interface alone when:
+`fm350-watchdog` is a small procd service that checks `ifstatus wwan` every 30 s. If the interface hasn't been up for 600 s in a row (`pending_threshold`, raised from 180 s to be gentle with SIM PIN attempts and slow cell search), it runs `ifdown wwan; ifup wwan` and logs to syslog (`logread -e fm350-watchdog`). Restarts back off exponentially up to 30 minutes, and the backoff resets once `wwan` has stayed up for 5 minutes. It leaves the interface alone when:
 
 - you disabled it (`network.wwan.disabled=1` or `network.wwan.auto=0`),
-- you paused the watchdog (`touch /tmp/fm350-watchdog.pause`), or
-- the modem's `/dev/ttyUSB*` device is missing (unplugged or still booting).
+- you paused the watchdog (`touch /tmp/fm350-watchdog.pause`),
+- the modem is absent (no FM350 AT port in sysfs; its clocks are reset, so a replug doesn't trigger an immediate restart), or
+- `ifstatus` shows a SIM/PIN/registration-denied error (see [the PIN/PUK risk](#pinpuk-risk)).
+
+The watchdog runs without `set -e`, so a failing `ifstatus`, `jsonfilter` or `uci` call is treated as "unknown" instead of killing it, and procd respawns it indefinitely (`respawn 3600 5 0`). `check_interval`, `pending_threshold` and `backoff_max` must be greater than 0; a `0` falls back to the default.
 
 It also waits until the router has been up for 5 minutes (`boot_grace`) before the first restart, so a slow first connection after boot isn't mistaken for a hang.
 
-Settings live in `/etc/config/fm350_watchdog`: `enabled`, `interface`, `check_interval`, `pending_threshold`, `backoff_max`, `backoff_reset_after` and `boot_grace`. Values that aren't plain numbers fall back to the default with a log line. Re-running `install.sh` resets them to the defaults. The header of `files/usr/sbin/fm350-watchdog` documents each one. The decision logic was tested with fake `ifstatus`/`ifup`/clock inside the OpenWrt Docker image. We haven't yet shown end to end that it recovers a real CGACT hang: the pty emulator has no netifd to restart.
+Settings live in `/etc/config/fm350_watchdog`: `enabled`, `interface`, `check_interval`, `pending_threshold`, `backoff_max`, `backoff_reset_after` and `boot_grace`. Values that aren't plain numbers fall back to the default with a log line. Re-running `install.sh` resets them to the defaults. The header of `files/usr/sbin/fm350-watchdog` documents each one. `tests/watchdog-test.sh` tests the decision logic with fake `ifstatus`/`ifup`/clock inside the OpenWrt Docker image, and `tests/watchdog-unit-test.sh` runs the same logic (plus the failure paths, PIN skip and AT port lookup) in plain `sh` with stubbed `uci`/`ifstatus`/`jsonfilter` and a fake sysfs. We haven't yet shown end to end that it recovers a real CGACT hang: the pty emulator has no netifd to restart.
 
 ## For contributors
 
@@ -178,8 +266,8 @@ stops if a file doesn't match:
 | `luci-proto-atc-2025.01.10-r2.apk` | `7a196e9a2565534d4657d81ce9c18794ad3687812fe941bf76aa2c4106577484` |
 | `atc-fib-fm350_gl-2025.01.11-r2.apk` | `94e097b6a674f818921c648ed8c6ab80639e626c129f37d4224e64fe37c2eba0` |
 
-The `atc-fib-fm350_gl` `.ipk` is byte-identical to the one that was run
-against a fake modem. The other three files were fetched from the same
+The `atc-fib-fm350_gl` `.ipk` is byte-identical to the one `tests/atc-test.sh`
+runs against the fake modem. The other three files were fetched from the same
 commit but haven't been exercised by a test.
 
 (The `.apk` build of `atc-fib-fm350_gl` lags the `.ipk` build; `2025.01.11-r2`
@@ -187,7 +275,8 @@ is the newest `.apk` published at that commit, `2025.08.24-r3` the newest `.ipk`
 
 **Updating to a newer release** is a deliberate step: pick the new commit and
 file names in mrhaav/openwrt, download the files, check them, and update the
-URLs and hashes in `install.sh` together.
+URLs and hashes in `install.sh` (and the `.ipk` URL and hash in
+`tests/atc-test.sh`) together. Then run `tests/atc-test.sh`.
 
 **What you're still trusting:** the pinned files are whatever mrhaav published
 at that commit. The pin and the hashes guarantee that you get the same bytes
@@ -198,17 +287,93 @@ with an OpenWrt feed key; the base packages from the official feeds (`mwan3`,
 
 **Worth flagging:** the option names above come from `mrhaav/openwrt-packages` (`main`), while `install.sh` downloads the built packages from a different repository, `mrhaav/openwrt` (`atc/`, pinned commit above). Both are kept here as given because that's what we verified against; whether the two repos track exactly the same code wasn't confirmed, so treat this as something to double-check if the two ever seem to disagree.
 
-### Linting
+### Testing
 
 ```sh
 shellcheck -s sh install.sh uninstall.sh fm350-status.sh \
   files/etc/hotplug.d/usb/50-fm350_driver \
-  files/usr/sbin/fm350-watchdog files/etc/init.d/fm350-watchdog
+  files/usr/sbin/fm350-watchdog files/etc/init.d/fm350-watchdog tests/*.sh
+./tests/fm350-decode-test.sh   # status decoder against canned AT responses (plain sh, no Docker)
+sh ./tests/install-input-test.sh # APN validation and dry-run rendering (plain sh, no Docker)
+sh ./tests/uci-section-test.sh   # uci export -> uci batch conversion of saved sections (plain sh, no Docker)
+sh ./tests/install-roundtrip-test.sh # install, re-install, uninstall against a fake uci (plain sh, no Docker)
+./tests/watchdog-test.sh       # watchdog decision logic (Docker)
+./tests/watchdog-unit-test.sh  # watchdog logic, pure sh, no Docker
+./tests/docker-test.sh         # install/uninstall idempotency (Docker)
 ```
+
+`tests/docker-test.sh` pulls an OpenWrt rootfs image and runs three scenarios,
+each in its own container:
+
+1. stock mwan3: seeds `tests/fixtures/mwan3.default` (the real
+   `opkg install mwan3` default config) as `/etc/config/mwan3`, and asserts
+   that after `install.sh` the `default` rule is reordered ahead of
+   `https`/`default_rule_v4`, both of those now use `failover`, and
+   `mwan3.wan` still has its stock `track_ip` entries plus ours.
+2. unset options: keeps the stock sections but removes selected options,
+   checking that uninstall restores their unset state.
+3. empty mwan3: seeds an empty `/etc/config/mwan3` and removes `network.wan`,
+   exercising the from-scratch section-creation path.
+
+All scenarios start with a minimal `/etc/config/network` (`wan`/`lan`) and reuse
+the image's default `/etc/config/firewall` (already has a `wan` zone), run
+`install.sh --dry-run` (must change nothing), then a real run with
+`--skip-packages` (a hidden flag that skips `opkg`/`apk` and all downloads,
+for use in environments without kernel modules or network access) twice
+to prove idempotency (`uci show` must be byte-identical after run 1 and
+run 2, including rule order and the `fm350_orig_policy` bookkeeping), then
+run `uninstall.sh` and compare the complete `uci show` output with its
+pre-install state. Existing `mwan3.wan`/`mwan3.globals` sections remain,
+installer-created ones are removed, and `default_rule_v4`/`https` (stock
+scenario) are back to their original `use_policy`. It exits non-zero on any
+mismatch and removes the containers it creates.
+
+#### Protocol handler against a fake modem: `tests/atc-test.sh`
+
+Runs mrhaav's real, unmodified `atc.sh` (from the cached
+`atc-fib-fm350_gl` .ipk, driven by real `gcom`) in the OpenWrt Docker rootfs
+against `tests/atc-sim/fake_fm350.py`, an FM350-GL AT emulator on a pty. The
+`network.wwan` config comes from `uci/network-atc.uci`. The only stubs are
+netifd's ubus notify, which is logged instead, and the sysfs lookup of the
+RNDIS netdev; each is documented in `tests/atc-sim/run_setup.sh`. Scenarios:
+
+| Scenario | Asserted |
+|---|---|
+| `ok` | exact 20-command AT transcript; address, gateway host route, default route and DNS reach netifd |
+| `nosim` | stops after `AT+CPIN?`, reports `SIM not inserted`, blocks restart; no hang |
+| `cgact_error` | `+CME ERROR ... (#33)` on `AT+CGACT` → `SESSION_FAILED`, blocks restart |
+| `slow_boot` | the modem stays silent for 3 s and the session still comes up |
+
+`tests/atc-sim/responses.py` is the golden response table. Each entry notes
+whether it is verbatim from the bench log or inferred from 3GPP 27.007.
+Takes about 1.5 min and needs network access for `opkg`.
+
+#### Failover end to end: `tests/qemu-failover-test.sh`
+
+Boots OpenWrt 24.10.8 (armsr-armv8, checksum verified, cached in
+`tests/.cache/`) under `qemu-system-aarch64 -accel hvf`. It installs the real
+`mwan3` package, runs `install.sh --skip-packages`, and then replaces only
+`network.wwan` with a DHCP stand-in on its own QEMU uplink. A LAN client
+(a netns on `br-lan`) generates the traffic. nft `postrouting` counters show
+which NIC it actually leaves through. The test asserts:
+
+- baseline traffic leaves via wan;
+- `set_link wan off` fails over to wwan, and the LAN client keeps connectivity;
+- `set_link wan on` fails back;
+- a dead upstream (link up, all egress dropped) also fails over and back;
+- with both uplinks down the policy is `unreachable` and the LAN ping fails
+  instead of hanging.
+
+Measured on 2026-09-25, with the earlier mwan3 settings (`wan` down/up 3/3,
+`wwan` interval 10): failover 5 s / failback 4 s on link loss, 12–13 s /
+16 s on a dead upstream. With the current defaults (`wan` down 5 / up 10,
+`wwan` interval 30) expect roughly 25 s / 50 s on a dead upstream and a
+longer test run (calculated, not yet re-measured). The bounds are derived from `uci/mwan3.uci`. The root README rounds this to "13 s"; treat the 12–13 s range here as the more precise figure, since it comes directly from this test. Took about 2 min with the old settings and needs network access (opkg, track pings).
 
 ## What's not proven yet
 
-- **IPv6** isn't covered by the failover policy at all (see the warning above).
+- **IPv6** isn't covered by the failover policy at all, and the `default_rule_v6` handling is unverified (see the warning above).
+- Saving/restoring your own sections, the AT port re-resolve, and the SIM/PIN skip on real `ifstatus` `errors[].code` values have only been tested against stubs and sample text.
 - The watchdog hasn't been shown, end to end, to recover a real `AT+CGACT` hang — only its decision logic is tested, against a fake clock and fake `ifstatus`/`ifup`.
 - Everything here is verified in Docker, against a pty emulator, and under QEMU — none of it has run on real router hardware yet.
 - The package file names in [Package URLs](#package-urls) change with every upstream release; re-verify them if `install.sh` starts reporting 404s.

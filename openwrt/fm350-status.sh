@@ -68,20 +68,33 @@ while [ $# -gt 0 ]; do
 done
 device_arg=$1
 
-# USB interface :1.6 (0e8d:7127, mode 41, default) or :1.4 (0e8d:7126, mode 40).
-find_at_device() {
-	suffix=""
-	for suffix in ":1.6" ":1.4"; do
-		for dev in /sys/bus/usb/devices/*"$suffix"; do
-			[ -d "$dev" ] || continue
-			for tty in "$dev"/ttyUSB*; do
-				[ -e "$tty" ] || continue
-				echo "/dev/$(basename "$tty")"
-				return 0
-			done
-		done
+# The AT tty lookup (USB interface :1.6 for 0e8d:7127 mode 41, else :1.4 for
+# 0e8d:7126 mode 40, vendor 0e8d only) is shared with install.sh and
+# fm350-watchdog: /usr/lib/fm350/at-port.sh when installed, else the copy
+# next to this script in the repo checkout. Loaded lazily by main() so
+# sourcing this file for the decoder tests needs neither.
+load_at_port_lib() {
+	for lib in /usr/lib/fm350/at-port.sh "$(dirname "$0")/files/usr/lib/fm350/at-port.sh"; do
+		if [ -r "$lib" ]; then
+			# shellcheck source=/dev/null # files/usr/lib/fm350/at-port.sh
+			. "$lib"
+			return 0
+		fi
 	done
+	echo "fm350-status.sh: at-port.sh not found (expected /usr/lib/fm350/at-port.sh); pass the device explicitly, e.g. /dev/ttyUSB4" >&2
 	return 1
+}
+
+# Warn if netifd's wwan is up or connecting: atc.sh then owns the same tty and
+# our AT replies may be stolen by it (and its replies by us).
+warn_if_wwan_active() {
+	command -v ifstatus >/dev/null 2>&1 || return 0
+	st=$(ifstatus wwan 2>/dev/null) || return 0
+	up=$(printf '%s' "$st" | jsonfilter -e '@.up' 2>/dev/null) || up=""
+	pending=$(printf '%s' "$st" | jsonfilter -e '@.pending' 2>/dev/null) || pending=""
+	if [ "$up" = "true" ] || [ "$pending" = "true" ]; then
+		echo "fm350-status.sh: WARNING: interface wwan is up or connecting; atc.sh shares this tty, so replies below may be incomplete or stolen. Use 'ifdown wwan' first for a clean read." >&2
+	fi
 }
 
 # --- decoder: pure awk, no modem/gcom dependency -----------------------------
@@ -93,7 +106,7 @@ run_decode() {
 	# after it) - a suffixed template like "...XXXXXX.awk" errors out with
 	# "Invalid argument" on real OpenWrt/busybox, verified in the same
 	# openwrt/rootfs image tests/docker-test.sh uses.
-	awk_script=$(mktemp /tmp/fm350-status-awk.XXXXXX) || {
+	awk_script=$(mktemp "${TMPDIR:-/tmp}/fm350-status-awk.XXXXXX") || {
 		echo "fm350-status.sh: mktemp failed" >&2
 		return 1
 	}
@@ -290,7 +303,13 @@ section == "AT+GTCCINFO?" {
 		printf "  RSRP: %s  RSRQ: %s  RSSNR: %s dB\n", rsrp_dbm(rsrp), rsrq_db(rsrq), rssnr / 2.0
 		serving_found = 1
 	} else {
-		printf "Serving cell (GTCCINFO): rat=%s (decoding only implemented for LTE; raw: %s)\n", rat_name(rat), line
+		# Same masking as redact_raw() below: fields 5 (TAC) and 6 (cell ID).
+		rawline = line
+		if (redact && n >= 6) {
+			rawline = f[1]
+			for (i = 2; i <= n; i++) rawline = rawline "," ((i == 5 || i == 6) ? "REDACTED" : f[i])
+		}
+		printf "Serving cell (GTCCINFO): rat=%s (decoding only implemented for LTE; raw: %s)\n", rat_name(rat), rawline
 		serving_found = 1
 	}
 }
@@ -338,7 +357,7 @@ main() {
 
 	if [ -n "$device_arg" ]; then
 		device=$device_arg
-	elif device=$(find_at_device); then
+	elif load_at_port_lib && device=$(fm350_find_at_device); then
 		:
 	else
 		echo "fm350-status.sh: could not find the FM350 AT tty in sysfs; pass it explicitly, e.g.:" >&2
@@ -352,15 +371,18 @@ main() {
 	fi
 
 	echo "AT device: $device"
+	warn_if_wwan_active
 	echo
 
 	# See run_decode()'s comment above: busybox mktemp needs the template to
 	# end in XXXXXX, no suffix after it.
-	gcom_script=$(mktemp /tmp/fm350-status-gcom.XXXXXX) || {
+	gcom_script=$(mktemp "${TMPDIR:-/tmp}/fm350-status-gcom.XXXXXX") || {
 		echo "fm350-status.sh: mktemp failed" >&2
 		exit 1
 	}
-	trap 'rm -f "$gcom_script"' EXIT INT TERM
+	trap 'rm -f "$gcom_script"' EXIT
+	trap 'rm -f "$gcom_script"; exit 130' INT
+	trap 'rm -f "$gcom_script"; exit 143' TERM
 
 	# Send $COMMAND, collect whatever the modem prints back for 2s. Modelled on
 	# mrhaav's atc-fib-fm350_gl /etc/gcom/getrun_at.gcom, which uses the same
@@ -402,10 +424,14 @@ AT+GTFCCEFFSTATUS?"
 	if [ "$raw_mode" -eq 1 ]; then
 		for q in $queries; do
 			echo "== $q =="
+			out=$(run_at "$q") || {
+				echo "(query failed: $q)" >&2
+				continue
+			}
 			if [ "$redact" -eq 1 ]; then
-				run_at "$q" | redact_raw
+				printf '%s\n' "$out" | redact_raw
 			else
-				run_at "$q"
+				printf '%s\n' "$out"
 			fi
 			echo
 		done
@@ -414,7 +440,10 @@ AT+GTFCCEFFSTATUS?"
 
 	dump=""
 	for q in $queries; do
-		out=$(run_at "$q")
+		out=$(run_at "$q") || {
+			echo "(query failed: $q)" >&2
+			continue
+		}
 		dump="$dump
 @@Q $q
 $out"

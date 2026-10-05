@@ -14,19 +14,20 @@ architecture, session flow and rationale.
 
 - `fm350mac` is a pure-Python program that talks to the FM350-GL's USB RNDIS interface directly (via libusb) and hands the packets to a macOS `utun` interface — no kernel extension, no DriverKit entitlement, no SIP change.
 - USB access itself needs no root. A small root helper, installed once as a background service, does only the part that does need root (creating the `utun` interface and setting routes/DNS), so the main program runs as you.
-- `probe` and the read-only commands (`status`, `doctor`, `at`) work against real hardware. The full data session (`up`) has code and unit-test coverage and has run successfully against an in-process fake modem (`--loopback`), but not yet against a real SIM.
+- `probe` and the read-only commands (`status`, `doctor`, `at`) work against real hardware. The full data session (`up`) has run against an in-process fake modem (`--loopback`) and, briefly, against the real modem with a Telekom DE SIM (2026-10-05, `up --route-host`; see Limitations).
 
 ## Status
 
 The [root README's status table](../README.md#status) has the project-wide picture; this section is the detail for `fm350mac` itself.
 
-Scaffold implemented and reviewed (2026-09-25): `fm350mac probe` works against real hardware. The data path (`up`) has code
-but hasn't run live yet -- it needs a SIM and root
-(or the helper, see below). `up --loopback`, which replaces the modem with
+Scaffold implemented and reviewed (2026-09-25): 101 unit tests pass, and
+`fm350mac probe` works against real hardware. At that point the data path
+(`up`) had code and unit-test coverage but hadn't run live yet; it first ran
+against a real SIM on 2026-10-05 (see Limitations). `up --loopback`, which replaces the modem with
 an in-process fake, has run live successfully; see
 [`../docs/bench-log.md`](../docs/bench-log.md).
 
-Since then the driver has grown. The sections below also cover `status --watch`, `doctor` and the privilege-separation helper.
+Since then the suite has grown (`uv run pytest -q` collected **327 tests** on 2026-09-26, all passing). The sections below also cover `status --watch`, `doctor` and the privilege-separation helper.
 
 ## Requirements
 
@@ -73,7 +74,7 @@ uv run fm350mac async-selftest
 `status` prints a readable snapshot: SIM, LTE and NR registration, operator and access technology, the serving cell (band, EARFCN, PCI, RSRP, RSRQ), NR signal when the modem measures a 5G carrier, neighbour cells by band, and temperature. Options:
 
 - `--raw` shows the AT responses as the modem sent them.
-- `--json` prints machine-readable output.
+- `--json` prints machine-readable output (not combinable with `--watch`, which redraws the screen).
 - `--redact` masks the cell ID and TAC (serving and neighbour cells). Use it before you paste output anywhere public: with the operator code, those two values locate you to within a few hundred metres in public cell databases.
 - `--watch [SECONDS]` refreshes every 2 s (or the interval you give) with a signal bar. It's handy for aiming antennas. Ctrl-C stops it.
 
@@ -90,6 +91,32 @@ they create the `utun` interface and set routes/DNS through the helper (see
 "Privilege separation" below). Without it, pass `--no-helper` and run with
 `sudo`, the same as before privilege separation existed. `--dry-run` never
 needs root or the helper, with either mode.
+
+### `--route-host`, `--dns`, `--dry-run`
+
+- `--route-host IP` (repeatable, max 8, unicast IPv4) adds a host route
+  `IP -> utunN` after the interface is configured and removes it on
+  teardown. Use it instead of `--default-route` for safe testing on a metered
+  SIM: only the chosen hosts go through the tunnel, e.g.
+  `uv run fm350mac up --apn internet --route-host 1.1.1.1` then
+  `ping 1.1.1.1`.
+- The modem's DNS servers are always queried and logged (`DNS=[...]` or
+  `DNS=<none returned>`). `--dns` publishes them via `scutil`, and requires
+  `--default-route` (otherwise the carrier's resolver would be queried over
+  the normal uplink, so `up` refuses). A warning is logged if `--dns` was
+  given but the modem returned no servers.
+- `--dry-run` has no side effects: only read-only AT queries (`CPIN?`,
+  `CGSN`, `CGACT?`, `CGPADDR`, `GTDNS`), no `CGDCONT`/`CGACT`, no RNDIS
+  init/halt, nothing run on the system. It prints the AT and system
+  commands it would run (with a placeholder address if the PDP context isn't
+  active yet).
+- `--redact` masks the assigned IP, DNS servers and IMEI in every log line
+  (and in the `--dry-run` plan).
+- On shutdown (SIGINT/SIGTERM/SIGHUP) routes/DNS are removed first, then the
+  bridge stops, then the PDP context is deactivated, then RNDIS is halted.
+  While waiting for a modem re-enumeration, the default route, host routes
+  and DNS are removed too (so the Mac isn't left routing into a dead utun)
+  and re-added after the rebuild.
 
 ### `--io async|sync`
 
@@ -129,12 +156,14 @@ address is updated in place and the bridge is told about it.
 
 If the bridge fails because the USB device itself disappeared (the FM350's
 firmware is known to crash and re-enumerate under real network conditions --
-see `rndis_device.py`), `up` doesn't give up immediately: it leaves the utun
-interface and routes as they are, polls for the modem to come back for up to
-`--reenum-timeout` seconds (default 180), waits 15s for its firmware to
-settle, and rebuilds the whole AT/RNDIS/bridge session. If the modem doesn't
-come back in time, `up` exits with status 3. Any other fatal bridge failure
-(or a device loss with `--no-supervise`) exits with status 2.
+see `rndis_device.py`), `up` doesn't give up immediately: it keeps the utun
+interface (removing its routes and DNS meanwhile), polls for the modem to come
+back for up to `--reenum-timeout` seconds (default 180), waits 15s for its
+firmware to settle, and rebuilds the whole AT/RNDIS/bridge session. If the
+modem doesn't come back in time, `up` exits with status 3; if a modem with a
+different IMEI comes back, it refuses to rebuild and exits with status 4. Any
+other fatal bridge failure (or a device loss with `--no-supervise`) exits with
+status 2.
 
 ## Privilege separation and the trust model
 
@@ -168,11 +197,16 @@ Both `install` and `uninstall` print every step before doing it, and support
 if `/usr/bin/python3` is missing or not root-owned, or if the helper file
 doesn't compile under it -- so a bad install fails loudly instead of quietly
 installing a broken daemon. The helper's `LaunchDaemon` plist has
-`RunAtLoad`/`KeepAlive` both false: it only runs while `up` is actually
-connected to it (launchd starts it on the first connection, via the plist's
-`Sockets` entry with `SockPathOwner` set to the installing user's uid, so
-the unprivileged main process can open a socket that launchd itself created
-as root).
+`RunAtLoad`/`KeepAlive` both false: launchd starts it on the first
+connection, via the plist's `Sockets` entry with `SockPathOwner` set to the
+installing user's uid, so the unprivileged main process can open a socket
+that launchd itself created as root. Once started, the helper stays resident
+(idle) until `helper uninstall` or a reboot, so `helper install` first runs
+`/bin/launchctl bootout system/de.fm350mac.helper` (failure ignored) to
+replace a running helper when you reinstall after an update.
+`helper status` prints "installed helper is out of date" if the installed
+file differs from the packaged one; `helper uninstall` also removes
+`/var/log/fm350mac-helper.log`.
 
 Once installed, `up` (and `up --loopback`) use the helper automatically and
 need no root. Pass `--no-helper` to fall back to the old direct/root path
@@ -204,13 +238,26 @@ EOF
 
 ## Limitations
 
-- The real data path (`up` against actual hardware) hasn't been run live
-  yet -- we're waiting on a data SIM. Everything about it is verified either
-  by unit tests or by `up --loopback` against the in-process fake modem, not
-  against the real FM350-GL.
-- Throughput hasn't been measured with `iperf3`; the ~150 Mbps async design
-  target (see [`../docs/macos-driver.md`](../docs/macos-driver.md)) is an
-  estimate, not a result.
+- The real data path has been run live only briefly (2026-10-05, Telekom DE,
+  `up --route-host`: ping, HTTPS, a 1 MB download). Long sessions,
+  re-enumeration recovery and `--default-route` / `--dns` on hardware are
+  still verified only by unit tests and `up --loopback`.
+- macOS counts received packets twice in a utun's `netstat -ib` byte counters
+  (a 1 MB download showed ~2.1 MB); the `stats:` line `up` logs on shutdown
+  is the real SIM usage.
+- Throughput has only been measured in short, capped `iperf3` runs
+  (2026-10-05, 5 MB per test on a weak LTE B7 cell: 20.4 Mbit/s down,
+  13.8 Mbit/s up, ~9% CPU). The ~150 Mbps async design target (see
+  [`../docs/macos-driver.md`](../docs/macos-driver.md)) is still an estimate.
+  That first upload run also exposed the OUT pool acting as an 8-packet
+  tail-drop queue; the tx thread now waits up to 1 s for a free slot
+  (backpressure into the utun) before dropping. A later sync-vs-async
+  comparison (interleaved rounds, 5 MB per test) found a lost wakeup in that
+  wait that made async uploads slower than sync in 4/4 rounds; after the fix
+  async uploaded at 15.2/9.1/7.2 Mbit/s vs sync 6.7/7.7 (one sync run ended
+  by the server). Both modes are radio-limited here (driver CPU 3-8%); async
+  stays the default. `--io sync` works but had one unexplained download stall
+  in 6 runs (the missing data never reached the driver).
 - No IPv6 support yet (`IPV4V6` PDP context, router advertisements from the
   modem).
 - macOS/Apple Silicon only, by design (see the rejected alternatives in
@@ -218,6 +265,53 @@ EOF
   support, no kernel extension, no DriverKit dext.
 - DHCP on the FM350's RNDIS interface is unreliable; `fm350mac` always
   assigns the IP itself from `AT+CGPADDR` instead of relying on DHCP.
+
+## For contributors: Tests
+
+```sh
+cd fm350mac && uv run pytest -q
+```
+
+Tests are pure unit tests and fake-hardware end-to-end tests: RNDIS codec,
+Ethernet/ARP, AT response parsers, utun AF framing, netconfig dry-run,
+bridge threads with fake USB/utun, CLI argument validation, `cli.py` command
+functions with a scriptable fake AT port and fake RNDIS/utun, the loopback
+fake modem, and the reconnect supervisor — no USB or network access, no root,
+no real subprocess calls, no SIM needed.
+
+`usb_async.py`'s ctypes binding has its own tests: `test_usb_async_layout.py`
+compiles a small C program against the real `libusb.h` and checks
+`LibusbTransfer`'s field layout against it (skipped, with a reason, only if
+no C compiler or the header is missing); `test_usb_async_pool.py` exercises
+`AsyncEndpoint`/`EventLoop`'s transfer-lifetime state machine against a fake
+`Libusb` that records submit/cancel/free calls and lets tests fire a
+transfer's callback with any status; `test_async_bridge.py` covers
+`AsyncBridge`'s RX ordering, ARP replies and TX pool exhaustion the same
+way. None of these touch real hardware.
+
+`test_helper.py` covers the root helper (`helper/fm350mac_helper.py`) and
+its client (`helper_client.py`): request validation for every op (bad IPs,
+`0.0.0.0`, multicast, oversize messages, unknown ops/fields, a non-`/24`
+loopback host), the reverse-order teardown on disconnect, default-route
+capture/restore semantics, peer-uid rejection (with an injected credential
+lookup), `SCM_RIGHTS` fd passing over a `socket.socketpair()` (a pipe fd
+standing in for a real utun), and an end-to-end run of `cli.cmd_up
+--loopback` against a real helper server on a background thread. `helper
+install|uninstall|status` are covered by `test_helper_admin.py`, entirely
+through `--dry-run`/injected `subprocess.run`/`launchctl` fakes -- no sudo,
+nothing under `/usr/local`, `/Library` or `/var/run` is ever touched.
+
+Because the helper file itself must run under the *system*
+`/usr/bin/python3` (3.9.6, `-I -S`), not this project's `.venv`:
+
+```sh
+tests/run_helper_tests_py39.sh
+```
+
+compiles it with `python3 -I -S -m py_compile` and runs a stdlib-`unittest`
+port of its core tests (`tests/helper_unittest_py39.py`) under that exact
+interpreter -- no pytest, no third-party imports, since `-I -S` gives it no
+access to site-packages.
 
 ## Glossary
 

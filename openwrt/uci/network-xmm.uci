@@ -10,6 +10,7 @@
 #   @APN@    - carrier APN
 delete network.wwan
 set network.wwan=interface
+set network.wwan.fm350_owned='1'
 set network.wwan.proto='xmm'
 set network.wwan.device='@DEVICE@'
 set network.wwan.apn='@APN@'

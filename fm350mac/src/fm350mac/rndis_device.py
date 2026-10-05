@@ -49,21 +49,32 @@ class RndisDevice:
         """
         deadline = time.monotonic() + timeout / 1000
         fallback_polls_left = _MAX_FALLBACK_POLLS
+        # Each wait is bounded so the fallback polls can actually happen
+        # before the deadline: the first one only after a full
+        # _FALLBACK_POLL_INTERVAL without any notification, later ones at
+        # least that far apart.
+        last_fetch = time.monotonic()
         while True:
-            remaining = deadline - time.monotonic()
+            now = time.monotonic()
+            remaining = deadline - now
             if remaining <= 0:
                 raise TimeoutError("no matching RNDIS response from device")
-            notified = self.usb.wait_notify(max(1, int(remaining * 1000)))
+            wait_s = remaining
+            if fallback_polls_left > 0:
+                wait_s = min(remaining, max(0.001, last_fetch + _FALLBACK_POLL_INTERVAL - now))
+            notified = self.usb.wait_notify(max(1, int(wait_s * 1000)))
 
             if notified is not None:
                 msg = self.usb.get_encapsulated()
-            elif fallback_polls_left > 0 and time.monotonic() < deadline:
+            elif fallback_polls_left > 0 and time.monotonic() - last_fetch >= _FALLBACK_POLL_INTERVAL - 0.005:
                 fallback_polls_left -= 1
-                time.sleep(_FALLBACK_POLL_INTERVAL)
                 msg = self.usb.get_encapsulated()
             else:
                 continue  # keep waiting for a notification; no unsolicited polling
-            if not msg:
+            last_fetch = time.monotonic()
+            if rndis.is_empty_response(msg):
+                # RNDIS spec: a 1-byte 0x00 reply means "no response available".
+                _log.debug("GET_ENCAPSULATED_RESPONSE: nothing pending (%d-byte reply)", len(msg))
                 continue
 
             msg_type = rndis.message_type(msg)
@@ -109,8 +120,13 @@ class RndisDevice:
         rndis.parse_set_cmplt(msg)
 
     def mac(self) -> bytes:
-        """Query OID_802_3_CURRENT_ADDRESS (6 bytes)."""
-        return self.query(rndis.OID_802_3_CURRENT_ADDRESS)
+        """Query OID_802_3_CURRENT_ADDRESS (6 bytes). Raises RndisError if
+        the device answers with any other length.
+        """
+        value = self.query(rndis.OID_802_3_CURRENT_ADDRESS)
+        if len(value) != 6:
+            raise rndis.RndisError(rndis.STATUS_INVALID_DATA, f"MAC address is {len(value)} bytes, expected 6")
+        return value
 
     def set_packet_filter(self, filter_value: int = rndis.PACKET_FILTER_DEFAULT) -> None:
         """Set OID_GEN_CURRENT_PACKET_FILTER (default: directed|multicast|broadcast)."""

@@ -14,10 +14,12 @@ Stages (subcommands):
                suggested next step.
   volatile     level <=1, transient probes that revert on their own on
                reset/power-cycle (CEREG reject cause, operator scan, a CFUN
-               cycle).
+               cycle). It reads AT+CMEE? first and puts it back afterwards.
   experiment   level <=2, temporarily changes one persistent setting,
                measures, then restores it (writing restore.txt with the
                manual recovery commands before touching anything).
+               Exception: `experiment fcc-unlock-dell` sends a one-way
+               vendor unlock response and has NO restore step.
   backup       read-only ADB NV backup (IMEI + RF calibration -- never
                share it, never restore it onto another unit).
   dipc         switch/revert the on-module DIPC config file (level 3, ADB
@@ -62,7 +64,8 @@ if _FM350MAC_SRC.is_dir():
 try:
     from fm350mac import at as at_mod
     from fm350mac import cellinfo
-    from fm350mac.cli import _GTCCINFO_ROW_RE, _parse_int_tuple  # reuse, don't reinvent
+    from fm350mac.cli import _parse_int_tuple  # reuse, don't reinvent
+    from fm350mac.redact import _GTCCINFO_ROW_RE
     from fm350mac.usb_async import LIBUSB_ERROR_ACCESS, LIBUSB_ERROR_BUSY, UsbError
 except ImportError:
     print("fm350mac package not importable -- run from within the fm350-usb repo", file=sys.stderr)
@@ -122,20 +125,24 @@ class TtyTransport:
         self.fd = os.open(path, os.O_RDWR | os.O_NOCTTY)
         tty_mod.setraw(self.fd)
         attrs = termios.tcgetattr(self.fd)
-        termios.cfsetispeed(attrs, self._BAUD)
-        termios.cfsetospeed(attrs, self._BAUD)
+        # Python's termios has no cfsetispeed/cfsetospeed: ispeed/ospeed are attrs[4]/[5].
+        attrs[4] = attrs[5] = self._BAUD
         termios.tcsetattr(self.fd, termios.TCSANOW, attrs)
         self._drain(0.2)  # discard unsolicited output left over from boot
 
-    def _drain(self, timeout_s: float) -> str:
+    def _drain(self, timeout_s: float, deadline: float | None = None) -> str:
         out = b""
-        while True:
+        while deadline is None or time.monotonic() < deadline:
             ready, _, _ = select.select([self.fd], [], [], timeout_s)
             if not ready:
                 return out.decode(errors="replace")
             out += os.read(self.fd, 4096)
+        return out.decode(errors="replace")
 
     def command(self, cmd: str, timeout: float = 240.0) -> str:
+        # Like AtPort: late output of an earlier command (e.g. its final "OK")
+        # must not be mistaken for this command's result.
+        self._drain(0.01, deadline=time.monotonic() + 0.05)
         os.write(self.fd, (cmd + "\r").encode())
         buf = ""
         deadline = time.time() + timeout
@@ -217,6 +224,7 @@ AT_COMMANDS: dict[str, int] = {
     "AT+GTFCCLOCKMODE?": 0,
     "AT+GTFMODE?": 0,
     "AT+CFUN?": 0,
+    "AT+CMEE?": 0,
     "AT+GTANTTUNINGEN?": 0,
     "AT+BODYSAREN?": 0,
     "AT+GTRXPATHEN?": 0,
@@ -244,8 +252,10 @@ AT_COMMANDS: dict[str, int] = {
     "AT+CFUN=4": 1,
     "AT+CFUN=1": 1,
     "AT+CFUN=15": 1,
-    # Level 2: persistent, but every caller in this tool restores it (see
-    # the `experiment` template).
+    # Level 2: persistent. Every caller in this tool restores it (see the
+    # `experiment` template) except AT+GTFCCLOCKGEN/AT+GTFCCLOCKVER, the
+    # one-way Dell vendor unlock in `experiment fcc-unlock-dell`, which has
+    # no restore step.
     "AT+GTFCCLOCKGEN": 2,
 }
 
@@ -254,11 +264,12 @@ AT_COMMANDS: dict[str, int] = {
 # table. Full-match ($ anchored) so e.g. "AT+GTFMODE=0,0;AT+CFUN=15" or a
 # non-integer argument is rejected, not just the valid prefix.
 AT_COMMAND_PATTERNS: tuple[tuple[re.Pattern[str], int], ...] = (
-    (re.compile(r"^AT\+CEREG=[0-5]$"), 1),  # 3GPP TS 27.007 <n> 0-5
-    (re.compile(r"^AT\+GTFMODE=[01],[01]$"), 2),
-    (re.compile(r"^AT\+GTANTTUNINGEN=[01]$"), 2),
-    (re.compile(r"^AT\+ERAT=\d+$"), 2),
-    (re.compile(r"^AT\+GTFCCLOCKVER=\d+$"), 2),
+    (re.compile(r"^AT\+CEREG=[0-5]$", re.ASCII), 1),  # 3GPP TS 27.007 <n> 0-5
+    (re.compile(r"^AT\+CMEE=[0-2]$", re.ASCII), 1),  # restores the value read via AT+CMEE?
+    (re.compile(r"^AT\+GTFMODE=[01],[01]$", re.ASCII), 2),
+    (re.compile(r"^AT\+GTANTTUNINGEN=[01]$", re.ASCII), 2),
+    (re.compile(r"^AT\+ERAT=\d+$", re.ASCII), 2),
+    (re.compile(r"^AT\+GTFCCLOCKVER=\d+$", re.ASCII), 2),
 )
 
 
@@ -267,7 +278,7 @@ def command_level(cmd: str) -> int | None:
     if cmd in AT_COMMANDS:
         return AT_COMMANDS[cmd]
     for pattern, level in AT_COMMAND_PATTERNS:
-        if pattern.match(cmd):
+        if pattern.fullmatch(cmd):
             return level
     return None
 
@@ -277,7 +288,12 @@ def command_level(cmd: str) -> int | None:
 # On by default (--no-redact disables it); applied to everything printed or
 # written (transcript, report, journal).
 
-_BARE_ID_RE = re.compile(r"\b\d{14,20}\b")  # IMEI/IMSI/ICCID: bare 14-20 digit runs
+# IMEI/IMSI/ICCID: bare 14-22 digit runs, optionally with one trailing hex pad
+# digit (ICCIDs are often padded with "F").
+_BARE_ID_RE = re.compile(r"\b\d{14,22}[0-9A-Fa-f]?\b")
+# By context: whatever follows these labels is an identifier, whatever its shape.
+_ID_CONTEXT_RE = re.compile(r"(\+(?:ICCID|CCID|CIMI|CGSN)\s*:\s*)[0-9A-Za-z]+")
+_CNUM_RE = re.compile(r'(\+CNUM:\s*(?:"[^"]*")?\s*,\s*)"[^"]*"')
 _CEREG_TAC_CI_RE = re.compile(r'(\+C(?:E|5G)REG:\s*\d+\s*,\s*\d+\s*,\s*)"[0-9A-Fa-f]+"(\s*,\s*)"[0-9A-Fa-f]+"')
 
 
@@ -292,6 +308,8 @@ def redact_text(text: str) -> str:
     """Mask IMEI/IMSI/ICCID, GTCCINFO TAC/cell-id, and CEREG/C5GREG quoted tac/ci."""
     text = redact_gtccinfo(text)
     text = _CEREG_TAC_CI_RE.sub(r'\1"<redacted>"\2"<redacted>"', text)
+    text = _ID_CONTEXT_RE.sub(r"\1<redacted>", text)
+    text = _CNUM_RE.sub(r'\1"<redacted>"', text)
     text = _BARE_ID_RE.sub("<redacted>", text)
     return text
 
@@ -390,7 +408,7 @@ _ADB_LEVEL0_EXACT: frozenset[str] = frozenset(
     }
     | {f"tar -C /mnt/vendor -cf - {name}" for name in _ADB_BACKUP_DIRS}
 )
-_ADB_LEVEL0_PATTERNS: tuple[re.Pattern[str], ...] = (re.compile(r"^cat /dev/mtdblock\d+$"),)
+_ADB_LEVEL0_PATTERNS: tuple[re.Pattern[str], ...] = (re.compile(r"^cat /dev/mtdblock\d+$", re.ASCII),)
 
 _DIPC_DIR = "/mnt/vendor/nvdata/md_cmn"
 _DIPC_PATH = f"{_DIPC_DIR}/dipc_config"
@@ -440,14 +458,17 @@ class Adb:
     def devices(self) -> str:
         if not self.available():
             raise AdbError("adb not found on PATH")
-        result = subprocess.run([self.binary, "devices"], capture_output=True, text=True, timeout=_ADB_TIMEOUT_S)
+        try:
+            result = subprocess.run([self.binary, "devices"], capture_output=True, text=True, timeout=_ADB_TIMEOUT_S)
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            raise AdbError(f"adb devices failed: {exc}") from exc
         return result.stdout
 
     def run(
         self, cmd: str, level: int = 0, *, binary_output: bool = False, timeout: float = _ADB_TIMEOUT_S
     ) -> bytes | str:
         if level == 0:
-            allowed = cmd in _ADB_LEVEL0_EXACT or any(p.match(cmd) for p in _ADB_LEVEL0_PATTERNS)
+            allowed = cmd in _ADB_LEVEL0_EXACT or any(p.fullmatch(cmd) for p in _ADB_LEVEL0_PATTERNS)
         elif level == 3:
             allowed = cmd in _ADB_LEVEL3_EXACT
         else:
@@ -683,7 +704,7 @@ def usb_present() -> bool:
             out = subprocess.run(
                 ["ioreg", "-p", "IOUSB", "-w0"], capture_output=True, text=True, timeout=5
             ).stdout
-        except OSError:
+        except (OSError, subprocess.SubprocessError):
             return False
         return "FM350" in out or "0e8d" in out.lower()
     for vendor_path in glob.glob("/sys/bus/usb/devices/*/idVendor"):
@@ -703,6 +724,29 @@ _SAFETY_BANNER = (
     "This changes modem state. Tested on one Dell DW5931e (FW 29.20.22, OEM 5025) on 2026-09-25 "
     "without damage; no warranty (MIT, as is). See docs/diagnostics.md."
 )
+
+
+_UP_SESSION_WARNING = (
+    "WARNING: this can drop the modem off USB (CFUN cycles / resets) and needs the AT port to itself. "
+    "A running `fm350mac up` session WILL be killed; stop it first."
+)
+
+
+def fm350mac_up_running() -> bool:
+    """Best-effort: is another `fm350mac ... up` process alive? (False if `ps` is unavailable.)"""
+    try:
+        out = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    for line in out.splitlines():
+        pid_str, _, command = line.strip().partition(" ")
+        if pid_str == str(os.getpid()):
+            continue
+        # The `up` subcommand itself (after optional global flags), not just
+        # any command line that mentions both words (e.g. a commit message).
+        if re.search(r"(?:^|[/\s])fm350mac(?:\s+--?[\w-]+)*\s+up(?:\s|$)", command) and "fm350_diag" not in command:
+            return True
+    return False
 
 
 def _git_commit() -> str | None:
@@ -735,6 +779,8 @@ def write_report(out_dir: Path, session: Session, title: str, checks: list[Check
     if commit:
         lines.append(f"- tool commit: {commit}")
     lines += ["", "## Checks", ""]
+    if session.redact:
+        checks = [dataclasses.replace(c, message=redact_text(c.message)) for c in checks]
     lines += [f"- [{c.level}] {c.message}" for c in checks]
     (out_dir / "report.md").write_text("\n".join(lines) + "\n")
     (out_dir / "report.json").write_text(
@@ -785,6 +831,7 @@ _LEVEL0_SNAPSHOT_COMMANDS: tuple[tuple[str, str], ...] = (
     ("gtfcclockmode", "AT+GTFCCLOCKMODE?"),
     ("gtfmode", "AT+GTFMODE?"),
     ("cfun", "AT+CFUN?"),
+    ("cmee", "AT+CMEE?"),
     ("gtanttuningen", "AT+GTANTTUNINGEN?"),
     ("bodysaren", "AT+BODYSAREN?"),
     ("gtrxpathen", "AT+GTRXPATHEN?"),
@@ -930,14 +977,39 @@ _VOLATILE_SAMPLE_INTERVAL_S = 10.0
 _COPS_SCAN_TIMEOUT_S = 180.0
 
 
+_REENUM_GONE_TIMEOUT_S = 30.0
+_REENUM_SETTLE_S = 15.0
+
+
 def _wait_for_reenumeration(
     transport_factory: Callable[[], Transport],
     timeout_s: float,
     *,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
+    usb_present_fn: Callable[[], bool] | None = None,
+    gone_timeout_s: float = _REENUM_GONE_TIMEOUT_S,
+    settle_s: float = _REENUM_SETTLE_S,
 ) -> Transport | None:
-    """Poll ``transport_factory`` every 3s until it opens or ``timeout_s`` elapses."""
+    """After AT+CFUN=15: wait for the device to disappear (bounded by
+    ``gone_timeout_s``), wait for it to reappear (``timeout_s``), settle
+    ``settle_s`` seconds, then poll ``transport_factory`` every 3s until it
+    opens (``timeout_s``). Returns None if the device never disappeared or
+    never came back. Without ``usb_present_fn`` the disappear/reappear steps
+    are skipped (the settle and the open-poll still happen).
+    """
+    if usb_present_fn is not None:
+        gone_deadline = monotonic() + gone_timeout_s
+        while usb_present_fn():
+            if monotonic() >= gone_deadline:
+                return None  # still the old device: the reset never happened
+            sleep(1.0)
+        back_deadline = monotonic() + timeout_s
+        while not usb_present_fn():
+            if monotonic() >= back_deadline:
+                return None
+            sleep(1.0)
+    sleep(settle_s)
     deadline = monotonic() + timeout_s
     while monotonic() < deadline:
         try:
@@ -945,6 +1017,15 @@ def _wait_for_reenumeration(
         except Exception:
             sleep(3.0)
     return None
+
+
+def _cereg_mode(response: str) -> int:
+    """The ``<n>`` of an ``AT+CEREG?`` response (0 if unreadable). Not
+    ``_parse_int_tuple``: it returns None as soon as the quoted tac/ci fields
+    of a ``<n>=2/3`` response appear, which would "restore" 2 or 3 as 0.
+    """
+    match = re.search(r"^\+CEREG:\s*([0-5])\b", response, re.MULTILINE)
+    return int(match.group(1)) if match else 0
 
 
 def cmd_volatile(
@@ -956,20 +1037,32 @@ def cmd_volatile(
     monotonic: Callable[[], float] = time.monotonic,
     out_dir: Path,
     confirm: Callable[[str], str] = input,
+    usb_present_fn: Callable[[], bool] = usb_present,
+    up_running_fn: Callable[[], bool] = fm350mac_up_running,
 ) -> int:
     print(_SAFETY_BANNER)
+    print(_UP_SESSION_WARNING)
+    if up_running_fn():
+        print("refusing: a `fm350mac up` process is running. Stop it first.", file=sys.stderr)
+        return 2
     if not args.yes and confirm("Type 'yes' to continue: ").strip() != "yes":
         print("aborted")
         return 1
     session = session_factory()
+    orig_cmee: int | None = None
     try:
         snapshot = _collect_snapshot(session)
         before_samples = _collect_samples(session, args.duration, args.interval, sleep, monotonic)
 
-        session.send("AT+CMEE=2")
+        cmee = _parse_int_tuple(snapshot.get("cmee", ""))
+        orig_cmee = cmee[0] if cmee and cmee[0] in (0, 1, 2) else None
+        cmee_note: Check | None = None
+        if orig_cmee is None:
+            cmee_note = Check("WARN", "AT+CMEE? unreadable; left error reporting unchanged (can't restore it)")
+        else:
+            session.send("AT+CMEE=2")
 
-        orig_cereg = _parse_int_tuple(snapshot["cereg"])
-        orig_cereg_n = orig_cereg[0] if orig_cereg else 0
+        orig_cereg_n = _cereg_mode(snapshot["cereg"])
         try:
             session.send("AT+CEREG=3")
             reject_samples = _collect_samples(session, 60.0, _VOLATILE_SAMPLE_INTERVAL_S, sleep, monotonic)
@@ -977,6 +1070,8 @@ def cmd_volatile(
             session.send(f"AT+CEREG={orig_cereg_n}")
 
         checks = [check_cells(before_samples), check_registration(before_samples, snapshot.get("ceer"))]
+        if cmee_note is not None:
+            checks.append(cmee_note)
         checks.append(Check("INFO", f"CEREG=3 reject-cause sampling: {len(reject_samples)} sample(s) collected"))
 
         if not args.skip_scan:
@@ -1005,9 +1100,11 @@ def cmd_volatile(
         if args.reset:
             session.send("AT+CFUN=15")
             session.transport.close()
-            new_transport = _wait_for_reenumeration(transport_factory, 120.0, sleep=sleep, monotonic=monotonic)
+            new_transport = _wait_for_reenumeration(
+                transport_factory, 120.0, sleep=sleep, monotonic=monotonic, usb_present_fn=usb_present_fn
+            )
             if new_transport is None:
-                checks.append(Check("WARN", "modem did not re-enumerate within 120s after AT+CFUN=15"))
+                checks.append(Check("WARN", "modem did not disappear and re-enumerate within 120s after AT+CFUN=15"))
             else:
                 session.rebind(new_transport)
                 session.send("AT")
@@ -1026,6 +1123,11 @@ def cmd_volatile(
         write_report(out_dir, session, "fm350_diag volatile", checks)
         return 1 if any(c.level in ("WARN", "FAIL") for c in checks) else 0
     finally:
+        if orig_cmee is not None:
+            try:
+                session.send(f"AT+CMEE={orig_cmee}")
+            except Exception as exc:  # transport may be gone after a reset; CMEE reverts on reset anyway
+                print(f"could not restore AT+CMEE={orig_cmee}: {exc}", file=sys.stderr)
         session.transport.close()
 
 
@@ -1230,11 +1332,11 @@ def _experiment_fcc_unlock_dell(
     if fcc is not None and len(fcc) >= 2 and fcc[1] == 1 and not even_if_unlocked:
         return [Check("OK", f"already unlocked (mode={fcc[0]}, status={fcc[1]}); nothing to do")]
 
-    # Nothing persistent is set here that needs restoring: the vendor unlock
-    # response is one-way, not a setting (see docs/dell-dw5931e-usb.md).
+    # No restore: the vendor unlock response is one-way, and this tool has no
+    # way to put the previous FCC state back (see docs/dell-dw5931e-usb.md).
     (out_dir / "restore.txt").write_text(
         "# experiment fcc-unlock-dell has no restore step: it sends a one-way vendor\n"
-        "# unlock response, it doesn't change any persistent setting.\n"
+        "# unlock response, and this tool cannot undo it.\n"
     )
 
     gen_resp = session.send("AT+GTFCCLOCKGEN")
@@ -1267,11 +1369,19 @@ def cmd_experiment(
     monotonic: Callable[[], float] = time.monotonic,
     out_dir: Path,
     confirm: Callable[[str], str] = input,
+    usb_present_fn: Callable[[], bool] = usb_present,
+    up_running_fn: Callable[[], bool] = fm350mac_up_running,
 ) -> int:
     if args.name not in _EXPERIMENT_NAMES:
         print(f"unknown experiment: {args.name!r} (choices: {', '.join(_EXPERIMENT_NAMES)})", file=sys.stderr)
         return 2
     print(_SAFETY_BANNER)
+    print(_UP_SESSION_WARNING)
+    if args.name == "fcc-unlock-dell":
+        print("NOTE: fcc-unlock-dell sends a one-way vendor unlock response; this tool has no restore step for it.")
+    if up_running_fn():
+        print("refusing: a `fm350mac up` process is running. Stop it first.", file=sys.stderr)
+        return 2
     if not args.accept_risk and confirm(f"Type '{args.name}' to continue: ").strip() != args.name:
         print("aborted")
         return 1
@@ -1282,10 +1392,14 @@ def cmd_experiment(
         session.send("AT+CFUN=15")
         session.transport.close()
         new_transport = _wait_for_reenumeration(
-            transport_factory, _EXPERIMENT_REENUM_TIMEOUT_S, sleep=sleep, monotonic=monotonic
+            transport_factory,
+            _EXPERIMENT_REENUM_TIMEOUT_S,
+            sleep=sleep,
+            monotonic=monotonic,
+            usb_present_fn=usb_present_fn,
         )
         if new_transport is None:
-            raise RuntimeError("modem did not re-enumerate within 120s")
+            raise RuntimeError("modem did not disappear and re-enumerate within 120s")
         session.rebind(new_transport)
         session.send("AT")
 
@@ -1294,6 +1408,8 @@ def cmd_experiment(
 
     before: list[Sample] = []
     after: list[Sample] = []
+    # fcc-unlock-dell is a one-way unlock: nothing is restored, so never claim it.
+    restored_note = "" if args.name == "fcc-unlock-dell" else "; original value restored"
     try:
         if args.name == "fmode":
             orig, before, after = _run_fmode(session, out_dir, measure, reenumerate)
@@ -1318,21 +1434,21 @@ def cmd_experiment(
         write_report(out_dir, session, f"fm350_diag experiment {args.name}", [Check("FAIL", str(exc))])
         return 2
     except KeyboardInterrupt:
-        print("\ninterrupted; original value restored")
+        print(f"\ninterrupted{restored_note}")
         write_report(
             out_dir,
             session,
             f"fm350_diag experiment {args.name}",
-            [Check("WARN", "interrupted by user; original value restored")],
+            [Check("WARN", f"interrupted by user{restored_note}")],
         )
         return 1
     except Exception as exc:
-        print(f"experiment failed (original value restored): {exc}")
+        print(f"experiment failed{restored_note}: {exc}")
         write_report(
             out_dir,
             session,
             f"fm350_diag experiment {args.name}",
-            [Check("WARN", f"failed: {exc}; original value restored")],
+            [Check("WARN", f"failed: {exc}{restored_note}")],
         )
         return 1
     finally:
@@ -1729,7 +1845,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_volatile.add_argument("--skip-cfun", action="store_true", help="skip the CFUN=4/1 cycle")
     p_volatile.set_defaults(func=_run_volatile)
 
-    p_experiment = sub.add_parser("experiment", help="level<=2 temporary setting change, measured, then restored")
+    p_experiment = sub.add_parser("experiment", help="level<=2 temporary setting change, measured, then restored (not fcc-unlock-dell)")
     p_experiment.add_argument("name", choices=_EXPERIMENT_NAMES)
     p_experiment.add_argument("--measure", type=float, default=DEFAULT_EXPERIMENT_MEASURE_S)
     p_experiment.add_argument("--accept-risk", action="store_true", help="skip typing the experiment name to confirm")

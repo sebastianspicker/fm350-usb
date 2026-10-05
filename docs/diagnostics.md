@@ -16,7 +16,7 @@ Please read this before you run anything above stage 0.
 
 - **We tested this on one module.** It's a Dell DW5931e (FM350-GL, firmware 29.20.22, Dell OEM image `5025`) in a Waveshare USB TO M.2 B KEY, tested on 2026-09-25. We ran every stage-1 and stage-2 action on it, and did the stage-3 edit by hand. The module still works. Your module may have different firmware or an OEM image from another vendor, and it may not react the same way.
 - **Stage 0 is read-only by construction.** The tool keeps a fixed list of every AT command it's allowed to send, with a stage number for each one. It refuses to send any command that isn't on the list or that belongs to a higher stage than the one you picked. Stage 0 only sends queries (`?`), plain reads such as `AT+CESQ`, and `AT+GTSENRDTEMP=0`, which selects a temperature sensor to read. It never sends a command that sets anything.
-- **Stages 1 and 2 restore what they change.** Stage 1 only changes things that reset when the module restarts. Stage 2 changes settings the module keeps. Before it changes one, it reads the current value and writes the exact commands to put it back into `restore.txt`. It restores the value when the experiment ends, even if you press Ctrl-C or something fails, and then reads it back to check. If that check fails, it stops and prints the commands for you to run by hand.
+- **Stages 1 and 2 restore what they change, with one exception.** `experiment fcc-unlock-dell` sends a one-way vendor unlock response and has no restore step. Stage 1 only changes things that reset when the module restarts. Stage 2 changes settings the module keeps. Before it changes one, it reads the current value and writes the exact commands to put it back into `restore.txt`. It restores the value when the experiment ends, even if you press Ctrl-C or something fails, and then reads it back to check. If that check fails, it stops and prints the commands for you to run by hand.
 - **Stage 3 can lock you out of USB.** It edits a file on the module's internal system. If that file ends up with the wrong value, the module turns USB off, and after that only PCIe or a reflash with SP Flash Tool can reach it. The tool only writes one exact file content, checks it before and after writing, and refuses to run without a verified backup. It still carries that risk. You don't need it to use the module over USB.
 - **What the tool never does:** flash firmware, change the USB mode (`GTUSBMODE`), change SIM detection (`MSMPD`), make an FCC unlock permanent (`GTFCCLOCKMODE`), change the IMEI or serial number (`EGMR`), set an APN, or change the DIPC mode with AT commands. We either didn't need these or didn't try them, so the tool doesn't offer them.
 - **No warranty.** The tool is MIT-licensed and provided as is. We're not affiliated with Fibocom, Dell, MediaTek or Waveshare. Changing modem settings can void a warranty and, in the worst case, make a module unusable. You decide what to run, and you're responsible for the result.
@@ -31,15 +31,15 @@ Please read this before you run anything above stage 0.
 | 2 | `experiment <name>` | One setting per experiment, restored at the end | Yes, until it's restored | Type the experiment name, or pass `--accept-risk` |
 | 3 | `dipc set-dual` / `dipc revert` | The DIPC config file on the module | Yes | Type `CHANGE DIPC` (there's no flag to skip this) |
 
-`plan <stage>` prints every command a stage can send and what each one changes, without touching the module. `--dry-run` does the same for a single run.
+`plan <stage>` prints every command a stage can send and what each one changes, without touching the module. Only `dipc set-dual` and `dipc revert` have a `--dry-run`, which shows what that single run would do.
 
 ## Requirements
 
 - Python 3.11 or newer. The tool uses only the standard library and the `fm350mac` code in this repo. You don't need to install anything with pip.
 - **macOS:** `brew install libusb`. The tool talks to the AT port (USB interface 6) directly. You don't need root.
-- **Linux:** if the kernel's `option` driver has bound the modem, the tool finds the AT port (`/dev/ttyUSB*` on interface 6) on its own. You can also pass `--tty /dev/ttyUSB4`. If no `ttyUSB` device appears, run `echo "0e8d 7127 ff" > /sys/bus/usb-serial/drivers/option1/new_id` as root. Your user needs access to the device (for example, membership in the `dialout` group).
+- **Linux:** if the kernel's `option` driver has bound the modem, the tool finds the AT port (`/dev/ttyUSB*` on interface 6) on its own. You can also pass `--tty /dev/ttyUSB4`; this and the other global options (`--iface`, `--out`, `--no-redact`) go before the stage name, for example `python3 tools/fm350_diag.py --tty /dev/ttyUSB4 read`. If no `ttyUSB` device appears, run `echo "0e8d 7127 ff" > /sys/bus/usb-serial/drivers/option1/new_id` as root. Your user needs access to the device (for example, membership in the `dialout` group).
 - **Optional: `adb`** (`brew install --cask android-platform-tools` or `apt install adb`). You need it for `read --adb`, `backup`, and `dipc`. See [Step 3 of the Dell guide](dell-dw5931e-usb.md#step-3-get-the-adb-root-shell-and-make-a-backup) for what ADB gives you on this module. It's a root shell with no password.
-- Close anything else that's using the AT port first, such as `fm350mac up`, ModemManager, the OpenWrt `atc`/`xmm` handlers, or `picocom`. Only one program can use the port at a time.
+- Close anything else that's using the AT port first, such as `fm350mac up`, ModemManager, the OpenWrt `atc`/`xmm` handlers, or `picocom`. Only one program can use the port at a time. Stages 1 and 2 refuse to start while `fm350mac up` is running, because they can drop the module off USB (`AT+CFUN` cycles) and would kill that session.
 
 On an OpenWrt router without Python, use [`openwrt/fm350-status.sh`](../openwrt/fm350-status.sh). It's read-only and covers the most important part of stage 0.
 
@@ -123,11 +123,11 @@ Stage 1 runs a short stage 0 first, then:
 
 | Step | Commands | Effect | How it's undone |
 |---|---|---|---|
-| Readable errors | `AT+CMEE=2` | Errors come back as text instead of numbers | Resets on restart |
+| Readable errors | `AT+CMEE?` first, then `AT+CMEE=2` | Errors come back as text instead of numbers | Set back to the value it read first, and resets on restart anyway |
 | Reject cause | `AT+CEREG=3`, then samples for 60 s | Registration reports include the network's reject cause | Set back to the previous value, and resets on restart anyway |
 | Network scan | `AT+COPS=?` (up to 180 s) | Lists every network the module can hear. Registration pauses during the scan | Registration resumes by itself |
 | Radio off and on | `AT+CFUN=4`, 5 s wait, `AT+CFUN=1`, then samples for 60 s | Starts the network search again from scratch | Always ends with the original `CFUN` value |
-| `--reset` | `AT+CFUN=15` | Restarts the module. It drops off USB and comes back within about 60 s | – |
+| `--reset` | `AT+CFUN=15` | Restarts the module. It drops off USB and comes back within about 60 s. The tool waits for it to disappear, waits for it to reappear, then waits another 15 s before the first command | – |
 | `--usb-reset` | libusb port reset (macOS/libusb only) | Fixes ADB showing `offline` after a module restart | – |
 
 What we saw on our module: an instant, empty `AT+COPS=?` meant the module wasn't really scanning. A real scan takes more than 30 s. Reject cause `114` isn't a standard 3GPP cause (it's MediaTek-internal), and `AT+CEER: 0,NONE` meant the network hadn't rejected anything. An unexpected crash is also possible: when we sent about 2000 USB control requests back to back, the module's firmware crashed. It came back by itself 60 to 90 s later, with all settings intact. Stage 1 doesn't do that, but if the module drops off USB during stage 1, wait 90 s before you unplug it.
@@ -145,7 +145,7 @@ Each experiment tests one setting that we suspected on our module. It reads the 
 
 Notes:
 
-- `fcc-unlock-dell` only runs on a Dell image (`_5025`) unless you pass `--force-oem`, and it skips modules that are already unlocked unless you pass `--even-if-unlocked`. It never sends `AT+GTFCCLOCKMODE`, so the unlock doesn't become permanent and there's nothing to restore. For other vendors, see mrhaav's [`fm350_fcc_unlock.sh`](https://github.com/mrhaav/openwrt/blob/master/atc/fib-fm350_gl/fm350_fcc_unlock.sh). The Lenovo key is `3df8c719`.
+- `fcc-unlock-dell` only runs on a Dell image (`_5025`) unless you pass `--force-oem`, and it skips modules that are already unlocked unless you pass `--even-if-unlocked`. It never sends `AT+GTFCCLOCKMODE`, so the unlock doesn't become permanent. The tool has no restore step for it and doesn't claim one. For other vendors, see mrhaav's [`fm350_fcc_unlock.sh`](https://github.com/mrhaav/openwrt/blob/master/atc/fib-fm350_gl/fm350_fcc_unlock.sh). The Lenovo key is `3df8c719`.
 - Experiments that restart the module need it to come back on USB. If it doesn't come back within 120 s, the tool stops and prints `restore.txt`. Unplug the adapter, plug it back in, wait 60 s, then run the commands in `restore.txt` with `tools/fm350_at.py`.
 - We didn't include the APN test (`AT+EIAAPN`/`AT+CGDCONT`) as an experiment. Setting an APN is configuration, not diagnostics. Use `fm350mac connect` or the router scripts for that.
 

@@ -318,30 +318,55 @@ def pack_packet(frame: bytes) -> bytes:
     return header + frame
 
 
-def unpack_packets(buf: bytes) -> list[bytes]:
+def unpack_packets_counted(buf: bytes, alignment_factor: int = 0) -> tuple[list[bytes], int]:
     """Split a bulk-IN buffer into the Ethernet frames carried by concatenated
-    REMOTE_NDIS_PACKET_MSGs.
+    REMOTE_NDIS_PACKET_MSGs, and count malformed trailing data.
 
     The device may batch several PACKET_MSGs in one transfer and pad the
-    remainder of the transfer with zero bytes. Malformed or truncated
-    trailers are ignored rather than raised, since they're expected padding.
+    remainder of the transfer with zero bytes (that padding is not counted).
+    ``alignment_factor`` is INIT_CMPLT's PacketAlignmentFactor, an exponent:
+    each PACKET_MSG starts on a ``2**alignment_factor``-byte boundary relative
+    to the start of the transfer. Returns ``(frames, malformed)`` where
+    ``malformed`` is 1 if parsing stopped early on non-padding garbage
+    (unknown message type, truncated/inconsistent lengths), else 0. Frames
+    parsed before the malformed part are still returned.
     """
+    align = 1 << min(max(alignment_factor, 0), 12)
     frames: list[bytes] = []
     pos = 0
     n = len(buf)
     while pos + _PACKET_HEADER_LEN <= n:
         msg_type = struct.unpack_from("<I", buf, pos)[0]
         if msg_type == 0:
-            break  # zero padding
+            return frames, 0  # zero padding
         if msg_type != PACKET:
-            break  # malformed trailer, ignore
+            return frames, 1  # malformed trailer
         msg_length, data_offset, data_length = struct.unpack_from("<III", buf, pos + 4)
         if msg_length < _PACKET_HEADER_LEN or pos + msg_length > n:
-            break  # truncated/malformed, ignore
+            return frames, 1  # truncated/malformed
         data_start = pos + 8 + data_offset
         data_end = data_start + data_length
         if data_start < pos or data_end > pos + msg_length or data_end < data_start:
-            break  # malformed offsets, ignore
+            return frames, 1  # malformed offsets
         frames.append(bytes(buf[data_start:data_end]))
         pos += msg_length
-    return frames
+        pos = (pos + align - 1) & ~(align - 1)
+    # Leftover bytes shorter than a header: padding if all zero, else malformed.
+    if any(buf[pos:]):
+        return frames, 1
+    return frames, 0
+
+
+def unpack_packets(buf: bytes, alignment_factor: int = 0) -> list[bytes]:
+    """Like ``unpack_packets_counted`` but returns only the frames; malformed
+    or truncated trailers are ignored rather than raised.
+    """
+    return unpack_packets_counted(buf, alignment_factor)[0]
+
+
+def is_empty_response(msg: bytes) -> bool:
+    """True if a GET_ENCAPSULATED_RESPONSE reply is the RNDIS-spec "no
+    response available" answer (a single 0x00 byte; any reply too short to
+    hold a message header counts), i.e. nothing is pending.
+    """
+    return len(msg) < 8

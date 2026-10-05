@@ -66,6 +66,7 @@ LIBUSB_TRANSFER_TYPE_INTERRUPT = 3
 
 _TRANSFER_TYPE_CODES = {"bulk": LIBUSB_TRANSFER_TYPE_BULK, "interrupt": LIBUSB_TRANSFER_TYPE_INTERRUPT}
 
+_EVENT_ERROR_LOG_INTERVAL_S = 5.0
 _MAX_CONSECUTIVE_ERRORS = 8  # ERROR/OVERFLOW completions before a pool goes fatal
 
 
@@ -511,11 +512,43 @@ def open_device(vid: int = VID, pids: tuple[int, ...] = PIDS, *, libusb: "Libusb
     """
     global _shared_device
     with _shared_lock:
+        cached = _shared_device
+    # Probe outside the lock: close() takes it too, and the probe is a real
+    # USB round trip.
+    if cached is not None and not cached.closed and not cached.is_alive():
+        # Stale: the device went away (or re-enumerated) while the cached
+        # handle was still "open". Drop it and open a fresh one.
+        _log.info("cached UsbDevice handle is stale; reopening")
+        _discard_stale(cached)
+    with _shared_lock:
+        if _shared_device is cached and cached is not None and cached.closed:
+            _shared_device = None
         if _shared_device is not None and not _shared_device.closed:
             return _shared_device
         dev = UsbDevice._open(vid, pids, libusb)
         _shared_device = dev
         return dev
+
+
+def _discard_stale(dev: "UsbDevice") -> None:
+    try:
+        dev.close()
+    except Exception:
+        _log.exception("closing stale UsbDevice failed")
+
+
+def close_cached() -> None:
+    """Close and forget the shared ``UsbDevice``, if any. For callers that
+    opened it only to probe whether the modem exists (e.g. before a
+    re-enumeration wait): the next ``open_device()`` then opens a fresh handle
+    instead of reusing one that may go stale. A no-op if nothing is cached.
+    """
+    global _shared_device
+    with _shared_lock:
+        dev = _shared_device
+        _shared_device = None
+    if dev is not None:
+        _discard_stale(dev)
 
 
 class UsbDevice:
@@ -593,6 +626,20 @@ class UsbDevice:
             # libusb context.
             if opened is None:
                 lib.exit(ctx)
+
+    def is_alive(self) -> bool:
+        """Cheap liveness probe: a standard GET_CONFIGURATION control
+        request. False only if the device is gone (LIBUSB_ERROR_NO_DEVICE);
+        any other error (PIPE, IO, NOT_SUPPORTED, ...) or a timeout (busy
+        device) still counts as alive, since the handle itself is fine.
+        """
+        try:
+            self.control_in(0x80, 0x08, 0, 0, 1, timeout_ms=500)
+        except UsbNoDevice:
+            return False
+        except UsbError:
+            return True
+        return True
 
     def claim_interface(self, iface: int) -> None:
         code = self._libusb.claim_interface(self.handle, iface)
@@ -677,6 +724,10 @@ class UsbDevice:
         buf = (ctypes.c_uint8 * max(length, 1))()
         ptr = ctypes.cast(buf, ctypes.POINTER(ctypes.c_uint8))
         code, transferred = self._libusb.bulk_transfer(self.handle, endpoint, ptr, length, timeout_ms)
+        if code == LIBUSB_ERROR_TIMEOUT and transferred > 0:
+            # libusb reports a partial transfer as a timeout; the bytes that
+            # did arrive are real data, not something to discard.
+            return _clamped_bytes(buf, transferred)
         _raise_for_code(self._libusb, code, f"bulk_transfer(in, ep={endpoint:#04x})")
         return _clamped_bytes(buf, transferred)
 
@@ -732,6 +783,8 @@ class _Slot:
     in_flight: bool = False
     retired: bool = True  # not submitted (yet)
     metadata: object = None  # caller-supplied, round-tripped to on_out_result
+    length: int = 0  # bytes of the last submission (OUT: payload length; IN: buffer size)
+    pending_resubmit: bool = False  # a delayed resubmit thread owns this slot
 
 
 class AsyncEndpoint:
@@ -800,12 +853,22 @@ class AsyncEndpoint:
     def failed(self) -> bool:
         return self._failed
 
-    def start(self) -> None:
-        """IN pools only: submit every slot immediately so the pool starts full."""
+    def start(self) -> bool:
+        """IN pools only: submit every slot immediately so the pool starts full.
+
+        Returns False (and marks the pool fatal, so ``on_fatal`` fires) if
+        any initial submit failed -- the pool would otherwise start short.
+        """
         if self.direction != "in":
-            return
+            return True
+        ok = True
         for slot in self._slots:
-            self._submit(slot, self._buffer_size)
+            code = self._submit(slot, self._buffer_size, retry=False)
+            if code != 0:
+                ok = False
+                if not self._failed:
+                    self._mark_fatal(f"initial submit_transfer failed: {self._libusb.error_name(code)}")
+        return ok
 
     def submit_out(self, data: bytes, metadata=None) -> bool:
         """Submit ``data`` on a free OUT slot. Returns False if none is free
@@ -839,7 +902,7 @@ class AsyncEndpoint:
             target.metadata = metadata
             ctypes.memmove(target.buffer, data, len(data))
             code = self._submit_locked(target, len(data))
-        self._report_submit_error(code)
+        self._report_submit_error(code, target)
         return code == 0
 
     def cancel_all(self) -> None:
@@ -893,6 +956,8 @@ class AsyncEndpoint:
             slot.in_flight = False
             slot.retired = True
             return 0
+        slot.pending_resubmit = False
+        slot.length = length
         self._fill(slot, length)
         slot.in_flight = True
         slot.retired = False
@@ -902,19 +967,45 @@ class AsyncEndpoint:
             slot.retired = True
         return code
 
-    def _submit(self, slot: _Slot, length: int) -> None:
+    def _submit(self, slot: _Slot, length: int, *, retry: bool = True) -> int:
         with self._lock:
             code = self._submit_locked(slot, length)
-        self._report_submit_error(code)
+        self._report_submit_error(code, slot, retry=retry)
+        return code
 
-    def _report_submit_error(self, code: int) -> None:
+    def _report_submit_error(self, code: int, slot: _Slot | None = None, *, retry: bool = True) -> None:
         if code == 0:
             return
         name = self._libusb.error_name(code)
         if code == LIBUSB_ERROR_NO_DEVICE:
             self._mark_fatal(f"submit_transfer: {name}", device_lost=True)
-        else:
-            _log.error("submit_transfer on endpoint %#04x failed: %s", self.endpoint, name)
+            return
+        _log.error("submit_transfer on endpoint %#04x failed: %s", self.endpoint, name)
+        self._error_streak += 1
+        if self._error_streak >= _MAX_CONSECUTIVE_ERRORS:
+            self._mark_fatal(f"{self._error_streak} consecutive transfer errors (submit_transfer: {name})")
+            return
+        if self.direction == "in" and slot is not None and retry:
+            # An IN slot that fails to submit would otherwise be lost for
+            # good, silently shrinking the pool: retry it with backoff.
+            self._schedule_resubmit(slot, min(0.01 * self._error_streak, 0.5))
+        self._check_in_pool_alive()
+
+    def _schedule_resubmit(self, slot: _Slot, delay: float) -> None:
+        slot.pending_resubmit = True
+        threading.Thread(target=self._resubmit_after, args=(slot, delay), daemon=True).start()
+
+    def _check_in_pool_alive(self) -> None:
+        """An IN pool with nothing in flight (and nothing about to be
+        resubmitted) while not stopping will never receive again: make that
+        visible as a fatal pool error instead of a silently dead data path.
+        """
+        if self.direction != "in" or self._stopping or self._failed:
+            return
+        with self._lock:
+            alive = any(slot.in_flight or slot.pending_resubmit for slot in self._slots)
+        if not alive:
+            self._mark_fatal("all IN transfers lost (pool has nothing in flight)")
 
     def _mark_fatal(self, reason: str, device_lost: bool = False) -> None:
         if not self._failed:
@@ -958,22 +1049,25 @@ class AsyncEndpoint:
                 if self._on_complete:
                     self._on_complete(data)
             else:
+                metadata = slot.metadata  # before retiring: the slot may be reused at once
                 slot.retired = True
                 if self._on_out_result:
-                    self._on_out_result(True, actual_length, slot.metadata)
+                    self._on_out_result(True, actual_length, metadata)
             return
 
         if status == LIBUSB_TRANSFER_TIMED_OUT:
             if self.direction == "in":
                 self._submit(slot, self._buffer_size)
             else:
-                slot.retired = True
-                if self._on_out_result:
-                    self._on_out_result(False, actual_length, slot.metadata)
+                self._retire_out_failed(slot, actual_length)
             return
 
         if status == LIBUSB_TRANSFER_CANCELLED:
-            slot.retired = True
+            if self.direction == "in":
+                # Not stopping, so someone else cancelled it: keep the pool full.
+                self._submit(slot, self._buffer_size)
+            else:
+                slot.retired = True
             return
 
         if status == LIBUSB_TRANSFER_NO_DEVICE:
@@ -985,29 +1079,56 @@ class AsyncEndpoint:
             # clear_halt is a sync libusb call; run it (and the resubmit) off
             # the event thread so a slow/blocked clear_halt never delays
             # every other transfer's completion.
-            threading.Thread(target=self._handle_stall, args=(slot,), daemon=True).start()
+            if self.direction == "in":
+                slot.pending_resubmit = True
+                threading.Thread(target=self._handle_stall, args=(slot,), daemon=True).start()
+            else:
+                # OUT: never retransmit (the data is stale by now and the
+                # modem may have partly consumed it); clear the halt so the
+                # endpoint works for the next packet, and report the failure.
+                # Off the event thread, like IN; the slot stays un-retired
+                # (so a stop still waits for it) until the halt is cleared.
+                threading.Thread(target=self._handle_out_stall, args=(slot, actual_length), daemon=True).start()
             return
 
         # LIBUSB_TRANSFER_ERROR / LIBUSB_TRANSFER_OVERFLOW: count, resubmit
-        # with backoff (off-thread, same reasoning as STALL), fatal after
-        # too many in a row.
+        # IN transfers with backoff (off-thread, same reasoning as STALL),
+        # fatal after too many in a row. OUT transfers are retired and
+        # reported as failed, never retransmitted.
         self._error_streak += 1
         if self._error_streak >= _MAX_CONSECUTIVE_ERRORS:
             slot.retired = True
             self._mark_fatal(f"{self._error_streak} consecutive transfer errors (status={status})")
             return
+        if self.direction == "out":
+            self._retire_out_failed(slot, actual_length)
+            return
         delay = min(0.01 * self._error_streak, 0.5)
-        threading.Thread(target=self._resubmit_after, args=(slot, delay), daemon=True).start()
+        self._schedule_resubmit(slot, delay)
 
-    def _handle_stall(self, slot: _Slot) -> None:
+    def _retire_out_failed(self, slot: _Slot, actual_length: int) -> None:
+        metadata = slot.metadata  # before retiring: the slot may be reused at once
+        slot.retired = True
+        if self._on_out_result:
+            self._on_out_result(False, actual_length, metadata)
+
+    def _clear_halt(self) -> None:
         try:
             self._libusb.clear_halt(self._dev_handle, self.endpoint)
         except Exception:
             _log.exception("clear_halt failed for endpoint %#04x", self.endpoint)
+
+    def _handle_stall(self, slot: _Slot) -> None:
+        self._clear_halt()
         # _submit()'s lock-guarded _stopping check is the single source of
         # truth for whether this resubmit actually happens (see cancel_all()
         # / _submit_locked()); a stale, unlocked check here would race it.
+        # Only IN slots get here, so the buffer size is the right length.
         self._submit(slot, self._buffer_size)
+
+    def _handle_out_stall(self, slot: _Slot, actual_length: int) -> None:
+        self._clear_halt()
+        self._retire_out_failed(slot, actual_length)
 
     def _resubmit_after(self, slot: _Slot, delay: float) -> None:
         time.sleep(delay)
@@ -1028,6 +1149,7 @@ class EventLoop:
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._pools: list[AsyncEndpoint] = []
+        self._last_error_log = 0.0
 
     def register(self, pool: AsyncEndpoint) -> None:
         self._pools.append(pool)
@@ -1040,10 +1162,18 @@ class EventLoop:
     def _run(self) -> None:
         while not self._stop.is_set():
             try:
-                self._libusb.handle_events_timeout_completed(self._ctx, self._poll_interval_s)
+                code = self._libusb.handle_events_timeout_completed(self._ctx, self._poll_interval_s)
             except Exception:
                 _log.exception("libusb event handling failed")
                 time.sleep(0.01)
+                continue
+            if code < 0:
+                # Don't spin if libusb keeps failing immediately.
+                now = time.monotonic()
+                if now - self._last_error_log >= _EVENT_ERROR_LOG_INTERVAL_S:
+                    self._last_error_log = now
+                    _log.error("libusb_handle_events failed: %s", self._libusb.error_name(code))
+                time.sleep(0.05)
 
     def stop(self, drain_timeout_s: float = 2.0) -> bool:
         """Cancel every registered pool, then keep handling events (from

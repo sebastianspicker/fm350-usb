@@ -30,7 +30,7 @@ from dataclasses import dataclass
 
 from . import ethernet, rndis
 from .usb_async import UsbError, UsbNoDevice, UsbTimeout
-from .usb_transport import RndisUsb
+from .usb_transport import RateLimiter, RndisUsb, mark_usb_unsafe
 from .utun import Utun
 
 _log = logging.getLogger(__name__)
@@ -53,6 +53,10 @@ _TX_STALL_WARN_INTERVAL_S = 10.0
 # checks (measured: 18 ms median echo RTT instead of <1 ms in --loopback).
 _FAST_RETURN_FRACTION = 0.1
 _FAST_RETURN_STREAK_LIMIT = 3
+_LOG_INTERVAL_S = 10.0  # rate limit for per-packet error logs
+_UTUN_ERROR_BACKOFF_S = 0.05  # first backoff after a utun.read() OSError; grows linearly
+_UTUN_ERROR_BACKOFF_MAX_S = 1.0
+_UTUN_ERROR_FAIL_STREAK = 30  # consecutive utun.read() errors before the bridge fails
 
 
 def _is_device_gone(exc: UsbError) -> bool:
@@ -70,6 +74,7 @@ class BridgeStats:
     tx_bytes: int = 0
     drops: int = 0
     tx_stalls: int = 0
+    tx_timeouts: int = 0  # same as tx_stalls here (no pool to be full); mirrors AsyncBridgeStats
 
 
 class Bridge:
@@ -82,6 +87,7 @@ class Bridge:
         our_mac: bytes,
         our_ip: bytes,
         max_transfer_size: int,
+        packet_alignment_factor: int = 0,
     ) -> None:
         self.usb = rndis_usb
         self.utun = utun
@@ -89,6 +95,11 @@ class Bridge:
         self._our_ip_lock = threading.Lock()
         self._our_ip = our_ip
         self.max_transfer_size = max_transfer_size
+        self.packet_alignment_factor = packet_alignment_factor
+        self._utun_write_log = RateLimiter(_LOG_INTERVAL_S)
+        self._utun_read_log = RateLimiter(_LOG_INTERVAL_S)
+        self._malformed_log = RateLimiter(_LOG_INTERVAL_S)
+        self._bulk_write_log = RateLimiter(_LOG_INTERVAL_S)
         self.learner = ethernet.PeerMacLearner()
         self.stats = BridgeStats()
         self.failed = threading.Event()
@@ -151,6 +162,9 @@ class Bridge:
             if t.is_alive():
                 all_stopped = False
                 _log.warning("thread %s did not exit within %.1fs", t.name, _JOIN_TIMEOUT_S)
+                # The thread may still be inside a call on the USB handle:
+                # closing it underneath would be a use-after-free.
+                mark_usb_unsafe(self.usb, f"thread {t.name} did not exit within {_JOIN_TIMEOUT_S:.1f}s")
         return all_stopped
 
     def _run_guarded(self, target, name: str) -> None:
@@ -196,18 +210,41 @@ class Bridge:
     # --- rx: RNDIS bulk IN -> utun ------------------------------------------
 
     def _rx_loop(self) -> None:
+        # Per-read tracing only under --verbose (DEBUG): diagnoses rx stalls
+        # in this sync path (e.g. a read timing out around a packet).
+        trace = _log.isEnabledFor(logging.DEBUG)
+        timeouts_in_a_row = 0
         while not self._stop.is_set():
             try:
                 buf = self.usb.bulk_read(_BULK_READ_SIZE, timeout=_BULK_TIMEOUT_MS)
             except UsbTimeout:
+                timeouts_in_a_row += 1
                 continue
             except UsbError as exc:
+                if trace:
+                    _log.debug("rx-trace: bulk_read error %s", exc)
                 if self._note_usb_error(exc, "rx: bulk_read"):
                     return
                 continue
             self._note_usb_ok()
-            for frame in rndis.unpack_packets(buf):
-                self._handle_frame(frame)
+            frames, malformed = rndis.unpack_packets_counted(buf, self.packet_alignment_factor)
+            if trace:
+                _log.debug(
+                    "rx-trace: read %d bytes -> %d frame(s) (sizes %s), malformed=%s, after %d timeout(s)",
+                    len(buf), len(frames), [len(f) for f in frames], malformed, timeouts_in_a_row,
+                )
+            timeouts_in_a_row = 0
+            if malformed:
+                self.stats.drops += 1
+                if self._malformed_log.allow():
+                    _log.warning("rx: malformed trailing data in a %d-byte bulk transfer (dropped)", len(buf))
+            for frame in frames:
+                try:
+                    self._handle_frame(frame)
+                except ValueError:
+                    self.stats.drops += 1
+                    if self._malformed_log.allow():
+                        _log.warning("rx: dropped a malformed frame", exc_info=True)
 
     def _handle_frame(self, frame: bytes) -> None:
         try:
@@ -215,14 +252,18 @@ class Bridge:
         except ValueError:
             self.stats.drops += 1
             return
-        self.stats.rx_packets += 1
-        self.stats.rx_bytes += len(frame)
         if ethertype in (ethernet.ETH_P_IP, ethernet.ETH_P_IPV6):
+            # rx/tx stats count IP bytes only (what the SIM is billed for):
+            # not the synthetic 14-byte Ethernet header, nor link-local ARP.
+            self.stats.rx_packets += 1
+            self.stats.rx_bytes += len(payload)
             self.learner.observe(ethertype, src_mac)
             try:
                 self.utun.write(payload)
-            except OSError:
-                _log.exception("utun write failed")
+            except OSError as exc:
+                self.stats.drops += 1
+                if self._utun_write_log.allow():
+                    _log.warning("utun write failed: %s (further failures counted as drops)", exc)
         elif ethertype == ethernet.ETH_P_ARP:
             self._handle_arp(payload)
         else:
@@ -243,24 +284,42 @@ class Bridge:
     # --- tx: utun -> RNDIS bulk OUT ------------------------------------------
 
     def _tx_loop(self) -> None:
+        read_errors = 0
         while not self._stop.is_set():
             try:
                 payload = self.utun.read()
             except (socket.timeout, TimeoutError):
+                read_errors = 0
                 continue
             except (OSError, ValueError):
                 if self._stop.is_set():
                     break
-                _log.exception("utun read failed")
+                read_errors += 1
+                if self._utun_read_log.allow():
+                    _log.warning("utun read failed (%d in a row)", read_errors, exc_info=True)
+                if read_errors >= _UTUN_ERROR_FAIL_STREAK:
+                    self._mark_failed(f"tx: {read_errors} consecutive utun read errors")
+                    return
+                # Back off (growing) so a persistently failing utun can't
+                # turn this loop into a busy-spin.
+                self._stop.wait(min(_UTUN_ERROR_BACKOFF_S * read_errors, _UTUN_ERROR_BACKOFF_MAX_S))
                 continue
+            read_errors = 0
             if not payload:
                 continue
             version = payload[0] >> 4
+            if version not in (4, 6):
+                self.stats.drops += 1
+                _log.debug("dropping utun packet with IP version nibble %d", version)
+                continue
             ethertype = ethernet.ETH_P_IP if version == 4 else ethernet.ETH_P_IPV6
             frame = ethernet.wrap(payload, ethertype, dst=self.learner.current(), src=self.our_mac)
-            self._send_frame(frame)
+            self._send_frame(frame, ip_len=len(payload))
 
-    def _send_frame(self, frame: bytes) -> None:
+    def _send_frame(self, frame: bytes, ip_len: int | None = None) -> None:
+        """Send one Ethernet ``frame``; ``ip_len`` (the IP packet's length)
+        is what tx stats count on success -- None for our ARP replies.
+        """
         msg = rndis.pack_packet(frame)
         if len(msg) > self.max_transfer_size:
             self.stats.drops += 1
@@ -277,6 +336,7 @@ class Bridge:
             # there's no active data session (see module docstring). Counted
             # and rate-limited, not retried at the full 500 ms timeout.
             self.stats.tx_stalls += 1
+            self.stats.tx_timeouts += 1
             self.stats.drops += 1
             self._tx_stalled = True
             self._warn_tx_stall_rate_limited()
@@ -284,12 +344,15 @@ class Bridge:
         except UsbError as exc:
             if _is_device_gone(exc):
                 self._mark_failed(f"tx: bulk_write: device disconnected ({exc})", device_lost=True)
-            else:
-                _log.exception("bulk_write failed")
+                return
+            self.stats.drops += 1
+            if self._bulk_write_log.allow():
+                _log.warning("bulk_write failed: %s (further failures counted as drops)", exc)
             return
         self._tx_stalled = False
-        self.stats.tx_packets += 1
-        self.stats.tx_bytes += len(frame)
+        if ip_len is not None:
+            self.stats.tx_packets += 1
+            self.stats.tx_bytes += ip_len
 
     def _warn_tx_stall_rate_limited(self) -> None:
         self._tx_stall_warn_count_since += 1
@@ -343,7 +406,9 @@ class Bridge:
                 if self._note_usb_error(exc, "control: get_encapsulated"):
                     return
                 continue
-            if not msg:
+            if rndis.is_empty_response(msg):
+                # RNDIS spec: a 1-byte 0x00 reply means "no response available".
+                _log.debug("control: nothing pending (%d-byte reply)", len(msg))
                 continue
 
             try:

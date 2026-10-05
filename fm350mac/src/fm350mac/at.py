@@ -8,6 +8,7 @@ CLI, now a thin wrapper around ``AtPort``.
 from __future__ import annotations
 
 import ipaddress
+import logging
 import re
 import time
 
@@ -19,8 +20,32 @@ PIDS = {0x7127: 6, 0x7126: 4}  # USB product id -> AT interface number
 # command() doesn't keep draining (with 300 ms read timeouts) after the
 # modem is already done -- a plain "AT" measured a 327 ms round trip before
 # this, almost all of it spent waiting out one extra drain past "\r\nOK\r\n".
-_FINAL_RESULT_RE = re.compile(r"\r\nOK\r\n|\r\nERROR\r\n|\+CME ERROR:[^\r\n]*\r\n|\+CMS ERROR:[^\r\n]*\r\n")
+_FINAL_RESULT_RE = re.compile(r"(?m)^(?:OK|ERROR|NO CARRIER|\+CME ERROR:[^\r\n]*|\+CMS ERROR:[^\r\n]*)\r\n")
 _DRAIN_TIMEOUT_MS = 50
+_STALE_DRAIN_TIMEOUT_MS = 5  # near-non-blocking: just collect what's already queued
+
+_log = logging.getLogger("fm350mac.at")
+
+# Timeouts (seconds). Queries answer instantly; only network operations
+# (CGACT) can legitimately take a while.
+QUERY_TIMEOUT_S = 10.0
+ACTIVATE_TIMEOUT_S = 60.0
+
+
+class AtTimeoutError(TimeoutError):
+    """No final result code arrived before the deadline; ``response`` holds what did."""
+
+    def __init__(self, message: str, response: str = "") -> None:
+        super().__init__(message)
+        self.response = response
+
+
+class AtCommandError(RuntimeError):
+    """An AT command didn't answer OK; ``response`` holds the response text."""
+
+    def __init__(self, message: str, response: str = "") -> None:
+        super().__init__(message)
+        self.response = response
 
 
 class AtPort:
@@ -45,29 +70,56 @@ class AtPort:
         self.ep_in, self.ep_in_max_packet = self.usb_device.find_endpoint(self.iface_num, "in", "bulk")
         self._drain(200)  # discard unsolicited output left over from boot
 
-    def _drain(self, timeout_ms: int = 200) -> str:
+    def _drain(self, timeout_ms: int = 200, deadline: float | None = None) -> str:
+        """Read until a read times out, or ``deadline`` (time.monotonic) passes.
+
+        The deadline is checked between reads, so a stream of unsolicited
+        output can't keep this running past it.
+        """
         out = b""
         while True:
+            read_timeout_ms = timeout_ms
+            if deadline is not None:
+                remaining_ms = int((deadline - time.monotonic()) * 1000)
+                if remaining_ms <= 0:
+                    break
+                read_timeout_ms = min(timeout_ms, remaining_ms)
             try:
-                out += self.usb_device.bulk_in(self.ep_in, self.ep_in_max_packet * 8, timeout_ms=timeout_ms)
+                out += self.usb_device.bulk_in(self.ep_in, self.ep_in_max_packet * 8, timeout_ms=read_timeout_ms)
             except UsbTimeout:
-                return out.decode(errors="replace")
+                break
+        return out.decode(errors="replace")
 
     def command(self, cmd: str, timeout: float = 240.0) -> str:
         """Send an AT command and return the response text.
 
-        Returns as soon as the buffer contains a final result code (rather
-        than always draining for the full per-read timeout first), using
-        short per-read timeouts so the common case is fast.
+        Stale bytes (URCs queued since the last command) are drained first
+        so they can't be mistaken for this command's result. Returns as soon
+        as the buffer contains a final result code (rather than always
+        draining for the full per-read timeout first), using short per-read
+        timeouts so the common case is fast. Raises AtTimeoutError if no
+        final result code arrives within ``timeout`` seconds.
+
+        The response ends at the final result code: anything read after it
+        in the same drain (a URC such as ``+CGEV: ...``) is not part of this
+        command's response and is dropped, so ``is_ok()``/``check_ok()``
+        still see the result code as the last line.
         """
+        stale = self._drain(_STALE_DRAIN_TIMEOUT_MS, deadline=time.monotonic() + 0.05)
+        if stale.strip():
+            _log.debug("discarded stale AT output before %r: %r", cmd, stale)
         self.usb_device.bulk_out(self.ep_out, (cmd + "\r").encode())
         buf = ""
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            buf += self._drain(_DRAIN_TIMEOUT_MS)
-            if _FINAL_RESULT_RE.search(buf):
-                break
-        return buf.strip()
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            buf += self._drain(_DRAIN_TIMEOUT_MS, deadline=deadline)
+            final = _FINAL_RESULT_RE.search(buf)
+            if final:
+                trailing = buf[final.end():]
+                if trailing.strip():
+                    _log.debug("discarded AT output after %r's final result code: %r", cmd, trailing)
+                return buf[: final.end()].strip()
+        raise AtTimeoutError(f"no final result code for {cmd!r} within {timeout:g}s", buf.strip())
 
     def close(self) -> None:
         """Release the AT interface, and the shared UsbDevice if this AtPort opened it."""
@@ -85,10 +137,55 @@ class AtPort:
 # --- Pure response parsers (no I/O, unit-testable) -------------------------
 
 
+def is_ok(response: str) -> bool:
+    """True if the final non-empty line of ``response`` is ``OK``."""
+    lines = [line.strip() for line in response.splitlines() if line.strip()]
+    return bool(lines) and lines[-1] == "OK"
+
+
+def check_ok(response: str, what: str) -> str:
+    """Return ``response`` if it ended in OK, else raise AtCommandError naming ``what``."""
+    if not is_ok(response):
+        raise AtCommandError(f"{what} failed: {response!r}", response)
+    return response
+
+
+_IPV4_TOKEN_RE = re.compile(r"(?<![\d.])(\d{1,3}(?:\.\d{1,3}){3})(?![\d.])")
+
+
 def parse_cgpaddr(response: str) -> str | None:
-    """Parse ``+CGPADDR: <cid>,"a.b.c.d"`` (quotes optional) from an AT response."""
-    match = re.search(r"\+CGPADDR:\s*\d+\s*,\s*\"?(\d{1,3}(?:\.\d{1,3}){3})\"?", response)
-    return match.group(1) if match else None
+    """Parse the IPv4 address from ``+CGPADDR: <cid>,"a.b.c.d"[,"<ipv6>"]`` (quotes optional).
+
+    When the context has both an IPv4 and an IPv6 address the IPv4 one is
+    returned; an IPv6-only result gives None (the data path is IPv4-only).
+    """
+    for line in response.splitlines():
+        if "+CGPADDR:" not in line:
+            continue
+        match = _IPV4_TOKEN_RE.search(line.split(":", 1)[1])
+        if match:
+            return match.group(1)
+    return None
+
+
+# 3GPP TS 27.007's default IPv6 notation (AT+CGPIAF not set): 16 dotted
+# decimal octets, e.g. "32.1.13.184.0.0.0.0.0.0.0.0.0.0.0.1".
+_DOTTED_IPV6_RE = re.compile(r"(?<![\d.])\d{1,3}(?:\.\d{1,3}){15}(?![\d.])")
+
+
+def cgpaddr_is_ipv6_only(response: str) -> bool:
+    """True if ``+CGPADDR`` reports an IPv6 address (colon or 27.007
+    dotted-decimal notation) but no IPv4 one.
+    """
+    if parse_cgpaddr(response) is not None:
+        return False
+    for line in response.splitlines():
+        if "+CGPADDR:" not in line:
+            continue
+        rest = line.split(":", 1)[1]
+        if ":" in rest or _DOTTED_IPV6_RE.search(rest):
+            return True
+    return False
 
 
 def parse_gtdns(response: str) -> list[str]:
@@ -109,7 +206,31 @@ def parse_gtdns(response: str) -> list[str]:
 
 def parse_cpin(response: str) -> bool:
     """Return True if an ``AT+CPIN?`` response reports ``READY``."""
-    return "+CPIN: READY" in response
+    return parse_cpin_state(response) == "READY"
+
+
+def parse_cpin_state(response: str) -> str | None:
+    """Return the SIM state of an ``AT+CPIN?`` response.
+
+    ``"READY"``, ``"SIM PIN"``, ``"SIM PUK"`` etc. from ``+CPIN: <state>``;
+    ``"NOT INSERTED"`` for ``+CME ERROR: SIM not inserted``/``10``; other
+    CME errors are returned as their error text. None if unrecognisable.
+    """
+    match = re.search(r"\+CPIN:\s*([^\r\n]*)", response)
+    if match:
+        return match.group(1).strip() or None
+    match = re.search(r"\+CME ERROR:\s*([^\r\n]*)", response)
+    if match:
+        error = match.group(1).strip()
+        if error.lower() == "sim not inserted" or error == "10":
+            return "NOT INSERTED"
+        return error or None
+    return None
+
+
+def parse_cgact(response: str) -> dict[int, bool]:
+    """Parse ``+CGACT: <cid>,<state>`` lines into {cid: active}."""
+    return {int(cid): state == "1" for cid, state in re.findall(r"\+CGACT:\s*(\d+)\s*,\s*(\d+)", response)}
 
 
 _REGISTERED_STATS = frozenset({1, 5})  # 1 = registered home, 5 = registered roaming
@@ -160,9 +281,14 @@ def validate_pdp_type(pdp_type: str) -> str:
 # --- AT command helpers -----------------------------------------------------
 
 
+def sim_state(port: AtPort) -> str | None:
+    """Send AT+CPIN? and return the SIM state ("READY", "SIM PIN", "NOT INSERTED", ...)."""
+    return parse_cpin_state(port.command("AT+CPIN?", timeout=QUERY_TIMEOUT_S))
+
+
 def sim_ready(port: AtPort) -> bool:
     """Send AT+CPIN? and return whether the SIM reports READY."""
-    return parse_cpin(port.command("AT+CPIN?"))
+    return sim_state(port) == "READY"
 
 
 def define_pdp(port: AtPort, cid: int, pdp_type: str, apn: str) -> str:
@@ -173,17 +299,39 @@ def define_pdp(port: AtPort, cid: int, pdp_type: str, apn: str) -> str:
     """
     validate_pdp_type(pdp_type)
     validate_apn(apn)
-    return port.command(f'AT+CGDCONT={cid},"{pdp_type}","{apn}"')
+    return port.command(f'AT+CGDCONT={cid},"{pdp_type}","{apn}"', timeout=QUERY_TIMEOUT_S)
 
 
 def activate(port: AtPort, cid: int) -> str:
     """Send AT+CGACT=1,<cid> to activate a PDP context."""
-    return port.command(f"AT+CGACT=1,{cid}")
+    return port.command(f"AT+CGACT=1,{cid}", timeout=ACTIVATE_TIMEOUT_S)
 
 
 def deactivate(port: AtPort, cid: int) -> str:
     """Send AT+CGACT=0,<cid> to deactivate a PDP context."""
-    return port.command(f"AT+CGACT=0,{cid}")
+    return port.command(f"AT+CGACT=0,{cid}", timeout=ACTIVATE_TIMEOUT_S)
+
+
+def is_active(port: AtPort, cid: int) -> bool:
+    """Send AT+CGACT? and return whether context ``cid`` is active."""
+    return parse_cgact(port.command("AT+CGACT?", timeout=QUERY_TIMEOUT_S)).get(cid, False)
+
+
+def setup_pdp(port: AtPort, cid: int, pdp_type: str, apn: str) -> tuple[str, str]:
+    """Define and activate a PDP context, returning the (CGDCONT, CGACT) responses.
+
+    If ``cid`` is already active it is deactivated first -- the modem
+    ignores a new APN/PDP type on an active context. Raises ValueError for
+    an invalid APN/PDP type and AtCommandError if any step doesn't answer OK.
+    """
+    validate_pdp_type(pdp_type)
+    validate_apn(apn)
+    if is_active(port, cid):
+        _log.info("PDP context %d is already active; deactivating it so the new APN/PDP type takes effect", cid)
+        check_ok(deactivate(port, cid), f"AT+CGACT=0,{cid}")
+    defined = check_ok(define_pdp(port, cid, pdp_type, apn), "AT+CGDCONT")
+    activated = check_ok(activate(port, cid), f"AT+CGACT=1,{cid}")
+    return defined, activated
 
 
 def valid_assigned_ipv4(value: str | None) -> str | None:
@@ -216,17 +364,20 @@ def ip_address(port: AtPort, cid: int) -> str | None:
     ``valid_assigned_ipv4``) as well as for "no address" -- callers (e.g.
     the reconnect supervisor) already treat None as "no PDP context up".
     """
-    return valid_assigned_ipv4(parse_cgpaddr(port.command(f"AT+CGPADDR={cid}")))
+    return valid_assigned_ipv4(parse_cgpaddr(port.command(f"AT+CGPADDR={cid}", timeout=QUERY_TIMEOUT_S)))
 
 
 def dns(port: AtPort, cid: int) -> list[str]:
     """Send AT+GTDNS=<cid> and return the DNS server addresses, if any."""
-    return parse_gtdns(port.command(f"AT+GTDNS={cid}"))
+    return parse_gtdns(port.command(f"AT+GTDNS={cid}", timeout=QUERY_TIMEOUT_S))
 
 
 def parse_cgsn(response: str) -> str | None:
-    """Parse the IMEI (a bare 14-16 digit string) from an ``AT+CGSN`` response."""
-    match = re.search(r"(\d{14,16})", response)
+    """Parse the IMEI (a bare 14-16 digit string) from an ``AT+CGSN`` response.
+
+    Longer digit runs are not truncated into a match.
+    """
+    match = re.search(r"(?<!\d)(\d{14,16})(?!\d)", response)
     return match.group(1) if match else None
 
 
@@ -238,4 +389,4 @@ def imei(port: AtPort) -> str | None:
     a *different* device that happens to enumerate at the same VID/PID
     afterwards must never be treated as "the same modem, just back".
     """
-    return parse_cgsn(port.command("AT+CGSN"))
+    return parse_cgsn(port.command("AT+CGSN", timeout=QUERY_TIMEOUT_S))

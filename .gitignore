@@ -11,6 +11,9 @@ __pycache__/
 /dist/
 /build/
 
+# Downloaded OpenWrt images and packages for the router tests (hundreds of MB)
+/openwrt/tests/.cache/
+
 # Captured modem logs (may contain IMEI, ICCID, cell IDs)
 *.nma
 *.log
@@ -28,11 +31,6 @@ __pycache__/
 /.claude/
 /AGENTS.md
 /CLAUDE.md
-
-# Test suites (kept out of the published repo)
-/fm350mac/tests/
-/openwrt/tests/
-/tools/tests/
 
 # Benchmark run output (tools/bench-throughput.sh)
 /tools/bench-results/
