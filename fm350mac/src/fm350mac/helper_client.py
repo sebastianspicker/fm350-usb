@@ -291,6 +291,29 @@ def _permission_denied_reason(path: str) -> str:
     return reason
 
 
+def _unauthorized_reason(path: str) -> str:
+    """Why the helper rejected our ``hello`` with ``unauthorized``: it only
+    serves the uid it was installed for (the socket's owner). Root gets past
+    the socket's 0600 mode but is still refused, so ``sudo fm350mac`` needs
+    to drop sudo, not reinstall the helper.
+    """
+    uid = os.getuid()
+    try:
+        owner: int | None = os.stat(path).st_uid
+    except OSError:
+        owner = None
+    shown = "another uid" if owner is None else f"uid {owner}"
+    if uid == 0:
+        return (
+            f"the helper only serves {shown}, not root: run fm350mac without sudo "
+            "(or use fm350mac up --no-helper to run as root without the helper)"
+        )
+    return (
+        f"the helper only serves {shown}, not your uid {uid}; "
+        'reinstall it as this user with sudo "$(command -v fm350mac)" helper install'
+    )
+
+
 def probe_with_reason(
     path: str = HELPER_SOCKET_PATH, timeout: float = PROBE_TIMEOUT_S
 ) -> tuple[HelperClient | None, str | None]:
@@ -314,10 +337,17 @@ def probe_with_reason(
         client.hello()
     except HelperError as exc:
         client.close()
+        if str(exc) == "unauthorized":  # the helper's reject for a peer uid it doesn't serve
+            return None, _unauthorized_reason(path)
         return None, f"helper protocol mismatch: {exc}; reinstall the helper"
     except socket.timeout:
         client.close()
-        return None, f"the helper is not running (hello timed out); see {HELPER_LOG_PATH}"
+        # Connected but no answer: the helper serves one connection at a time,
+        # so a running `up` session looks exactly like this.
+        return None, (
+            "the helper did not answer (hello timed out); it serves one fm350mac session at a time, "
+            f"so another 'fm350mac up' may be running. If not, see {HELPER_LOG_PATH}"
+        )
     except (OSError, ValueError) as exc:
         client.close()
         return None, f"the helper did not answer correctly: {exc}; see {HELPER_LOG_PATH}"

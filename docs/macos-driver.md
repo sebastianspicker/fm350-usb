@@ -129,7 +129,7 @@ Shutdown order (SIGINT/SIGTERM/SIGHUP handlers are installed before the first ne
 
 ### Failure handling and rebuilds
 
-All of this is exercised with `up --loopback`; none of it has run on hardware yet.
+All of this is covered by unit and end-to-end tests with fake USB and AT layers (`up --loopback` uses the plain bridge, without the supervisor or rebuilds). On hardware, unplug/replug recovery was verified on 2026-10-05 (see the plan below); the keepalive watchdog, stall detection and rebuild retry have not fired on hardware yet.
 
 - **Device loss** (the FM350's firmware is known to crash and re-enumerate under real network conditions). The utun stays, routes and DNS are removed, `up` waits up to `--reenum-timeout` (default 180 s) for the modem, waits 15 s for its firmware to settle, then rebuilds AT, RNDIS and the bridge. The modem's IMEI is pinned at first bring-up: if a different IMEI comes back, `up` refuses to rebuild (exit 4). A different USB port only logs a warning. If the modem does not return in time: exit 3.
 - **Bridge failure with the modem still on the bus** (watchdog, stall detection, an endpoint error). A bounded RNDIS-level rebuild without waiting for re-enumeration: at most 3 in a row (the counter resets after a session was stable for 10 minutes), then exit 2. Rebuilds forced by the supervisor's stall detection are not counted toward that cap, by design: a backup link that is down keeps being retried. The rebuild pauses 3 s between the RNDIS HALT and the re-INIT so the modem settles.

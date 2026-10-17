@@ -262,6 +262,9 @@ class Supervisor:
             self._connected_since = None
             return
         self._note_ip(ip)
+        # The next window starts after the cycle (up to 2 x ACTIVATE_TIMEOUT_S):
+        # packets refused while the context was down are not a new stall.
+        self._stall_baseline = (self._time(), stats.rx_packets, stats.tx_timeouts)
 
     def _fail_bridge(self, reason: str) -> None:
         # AsyncBridge.fail() is public; the frozen sync Bridge only has

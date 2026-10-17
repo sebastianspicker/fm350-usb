@@ -13,11 +13,10 @@ First alpha release of `fm350mac`. See the
 for installation, limitations and the trust model. The `v0.1.0a1` tag is
 created at release; until then install from the branch with `@alpha-0.1`.
 
-Helper sha256: <filled in at release>
+Helper sha256: `4973bc87fc9cbb5df508321e538884984ad38c6ee88e8ceaf8206eafde3bb5be`
 
-Current value of `fm350mac/src/fm350mac/helper/fm350mac_helper.py` while
-unreleased (recompute with `shasum -a 256` on the file before tagging):
-`4973bc87fc9cbb5df508321e538884984ad38c6ee88e8ceaf8206eafde3bb5be`.
+This is the sha256 of `fm350mac/src/fm350mac/helper/fm350mac_helper.py` in
+this release (the release workflow refuses to publish if the file differs).
 Compare it with the `helper sha256:` printed by `fm350mac helper install
 --dry-run` and install with `--expect-sha256`. `helper status` also shows the
 installed file's sha256, but that is a consistency check, not an integrity
@@ -37,7 +36,7 @@ proof.
 ### Changed (review fixes)
 
 - **Trust model.** The docs no longer claim that inspecting the helper file or `--dry-run` limits what runs as root: `sudo fm350mac helper install` runs the user-owned interpreter and packages as root. New: `helper install` prints `helper sha256: ...` and accepts `--expect-sha256 HEX` (refuses on a mismatch); `helper status` prints the installed file's sha256 (a consistency check, not an integrity proof); a root install from a user-owned Python prints a `WARNING: running user-owned code as root` message. Root-owned `__pycache__` files may be written into the user's venv.
-- **Install ref.** The install commands and project URLs point at the `v0.1.0a1` tag instead of `main` (still 0.1.0).
+- **Install ref.** The install commands and project URLs point at the `v0.1.0a1` tag instead of `main`, which keeps changing after the release.
 - **Helper errors.** A permission-denied connect names the socket owner uid and your uid. The "reinstall the helper" hint is shown only for a protocol or version mismatch, not for operational refusals. The probe distinguishes `connect timed out`, `connection refused` and `hello timed out`.
 - **`--no-helper` without root** prints `... --no-helper needs root: re-run it with sudo.`
 - **`helper uninstall`** exits 1 when `launchctl bootout` really fails (not when the job was simply not loaded) or the job is still loaded afterwards, and warns when the socket file is left behind.

@@ -61,7 +61,7 @@ Each run creates a folder named `fm350-diag-<date>-<time>/` containing:
 | `journal.jsonl` | Only from stage 1 up: each change, logged before and after it was sent |
 | `restore.txt` | Only for stage 2: the commands that restore the original values, written before anything is changed |
 
-The exit code is 0 when everything is OK, 1 when there's at least one WARN or FAIL, 2 when no modem was found, and 3 when a restore failed.
+The exit code is 0 when everything is OK, 1 when there's at least one WARN or FAIL, 2 when no modem was found, and 3 when a restore failed. If the modem stops answering (no reply to a command within 60 s, 180 s for the operator scan) or rejects a change, the run stops there and reports it in `report.md`, together with the transcript up to that point. A refused operator scan (for example without a SIM) is only a WARN, and stage 1 carries on.
 
 **Sharing a report.** Reports hide the IMEI, IMSI, ICCID and serial number, as well as the tracking area code and cell ID of every cell. `--no-redact` turns that off, so only use it for your own records. Skim the file before you post it anywhere. Your operator and the bands you use still show.
 
@@ -145,7 +145,7 @@ Each experiment tests one setting that we suspected on our module. It reads the 
 
 Notes:
 
-- `fcc-unlock-dell` only runs on a Dell image (`_5025`) unless you pass `--force-oem`, and it skips modules that are already unlocked unless you pass `--even-if-unlocked`. It never sends `AT+GTFCCLOCKMODE`, so the unlock doesn't become permanent. The tool has no restore step for it and doesn't claim one. For other vendors, see mrhaav's [`fm350_fcc_unlock.sh`](https://github.com/mrhaav/openwrt/blob/master/atc/fib-fm350_gl/fm350_fcc_unlock.sh). The Lenovo key is `3df8c719`.
+- `fcc-unlock-dell` only runs on a Dell image (`_5025`) unless you pass `--force-oem`, and it skips modules that are already unlocked unless you pass `--even-if-unlocked`. If it can't read the lock state, it refuses (FAIL) unless you pass `--even-if-unlocked`. It never sends `AT+GTFCCLOCKMODE`, so the unlock doesn't become permanent. The tool has no restore step for it and doesn't claim one. For other vendors, see mrhaav's [`fm350_fcc_unlock.sh`](https://github.com/mrhaav/openwrt/blob/master/atc/fib-fm350_gl/fm350_fcc_unlock.sh). The Lenovo key is `3df8c719`.
 - Experiments that restart the module need it to come back on USB. If it doesn't come back within 120 s, the tool stops and prints `restore.txt`. Unplug the adapter, plug it back in, wait 60 s, then run the commands in `restore.txt` with `tools/fm350_at.py`.
 - We didn't include the APN test (`AT+EIAAPN`/`AT+CGDCONT`) as an experiment. Setting an APN is configuration, not diagnostics. Use `fm350mac connect` or the router scripts for that.
 

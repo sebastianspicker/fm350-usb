@@ -925,7 +925,9 @@ def _usb_device_alive(usb_ctx) -> bool:
         return True
 
 
-def _helper_or_root_error(action: str, reason: str | None = None, no_helper: bool = False) -> int:
+def _helper_or_root_error(
+    action: str, reason: str | None = None, no_helper: bool = False, as_root: bool = False
+) -> int:
     if no_helper:
         # The user already chose the direct/root path: suggesting --no-helper
         # again would be circular.
@@ -933,6 +935,11 @@ def _helper_or_root_error(action: str, reason: str | None = None, no_helper: boo
         return 1
     if reason:
         print(f"helper: {reason}", file=sys.stderr)
+    if as_root:
+        # Already root: "needs either the helper or root" would contradict
+        # itself; the one alternative to the helper is --no-helper.
+        print(f"To run {action} as root without the helper, add --no-helper.", file=sys.stderr)
+        return 1
     print(
         f"{action} needs either the root helper or root. Install the helper once with "
         "'sudo \"$(command -v fm350mac)\" helper install' (see 'fm350mac helper status'), or pass --no-helper "
@@ -1044,7 +1051,7 @@ def cmd_up(
 
     ok, helper_net, reason = _resolve_helper(args, geteuid=geteuid, helper_probe_factory=helper_probe_factory)
     if not ok:
-        return _helper_or_root_error("fm350mac up", reason, no_helper=args.no_helper)
+        return _helper_or_root_error("fm350mac up", reason, no_helper=args.no_helper, as_root=geteuid() == 0)
     if helper_net is not None:
         utun_factory = helper_net.open_utun
         net_config_factory = lambda dry_run: helper_net  # noqa: E731 -- dry_run is always False here
@@ -1405,7 +1412,7 @@ def cmd_up(
                 now = reenum_time_source()
                 if rebuild_deadline is None:
                     rebuild_deadline = now + _REBUILD_BUDGET_S
-                if now + rebuild_backoff > rebuild_deadline:
+                if now >= rebuild_deadline:
                     print(
                         f"could not rebuild the session within {_REBUILD_BUDGET_S:.0f}s; "
                         f"giving up (last error: {cause})",
@@ -1413,11 +1420,15 @@ def cmd_up(
                     )
                     return 3
                 rebuild_attempts += 1
+                # The last wait is cut to the time left, so the final attempt
+                # happens at the end of the budget rather than up to a whole
+                # backoff before it.
+                wait = min(rebuild_backoff, rebuild_deadline - now)
                 _log.warning(
                     "rebuilding the session failed (attempt %d): %s; retrying in %.0fs",
-                    rebuild_attempts, cause, rebuild_backoff,
+                    rebuild_attempts, cause, wait,
                 )
-                reenum_sleep(rebuild_backoff)
+                reenum_sleep(wait)
                 rebuild_backoff = min(rebuild_backoff * 2, _REBUILD_BACKOFF_MAX_S)
                 # A single probe if the modem is there; if it vanished in the
                 # meantime, wait for it to come back first.
@@ -1492,7 +1503,9 @@ def _cmd_up_loopback(
     """
     ok, helper_net, reason = _resolve_helper(args, geteuid=geteuid, helper_probe_factory=helper_probe_factory)
     if not ok:
-        return _helper_or_root_error("fm350mac up --loopback", reason, no_helper=args.no_helper)
+        return _helper_or_root_error(
+            "fm350mac up --loopback", reason, no_helper=args.no_helper, as_root=geteuid() == 0
+        )
     if helper_net is not None:
         utun_factory = helper_net.open_utun
         net_config_factory = lambda dry_run: helper_net  # noqa: E731 -- dry_run is always False here

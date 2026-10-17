@@ -12,14 +12,19 @@
 ## Usage
 
 ```sh
-scp -r openwrt root@192.168.8.1:/root/
-ssh root@192.168.8.1
+scp -O -r openwrt root@192.168.1.1:/root/   # -O: see below
+ssh root@192.168.1.1
 cd /root/openwrt
 ./install.sh --apn internet.telekom          # mrhaav atc handler (default)
 ./install.sh --apn internet.telekom --proto xmm   # modemfeed xmm-modem instead
 ./install.sh --apn internet.telekom --dry-run     # print the uci commands, change nothing
 ./install.sh --apn internet.telekom --no-mwan3    # network + firewall only, no mwan3
 ```
+
+`-O` makes `scp` use the classic SCP protocol: OpenSSH 9 and newer (macOS 13+, current Linux)
+default to SFTP, which OpenWrt's dropbear does not serve, so a plain `scp -r` fails. If your `scp`
+says `unknown option -- O`, it is older and works without it. `192.168.1.1` is vanilla OpenWrt's
+default address; use your router's (GL.iNet firmware: `192.168.8.1`).
 
 After a real run:
 
@@ -28,9 +33,21 @@ After a real run:
 /etc/init.d/firewall reload
 /etc/init.d/mwan3 restart   # unless --no-mwan3
 /etc/init.d/fm350-watchdog start   # unless --no-watchdog; install.sh only enables it
-fm350-status                # confirm registration
+ifstatus wwan               # confirm the modem connected ("up": true)
 mwan3 status                # confirm the failover policy is active
 ```
+
+`fm350-status` (signal, cell, registration) talks to the same tty that the
+`atc` protocol handler uses while `wwan` is up or connecting, so it refuses to
+run then. For a clean read, pause the watchdog and stop `wwan` first:
+
+```sh
+touch /tmp/fm350-watchdog.pause; ifdown wwan
+fm350-status
+ifup wwan; rm /tmp/fm350-watchdog.pause
+```
+
+`fm350-status -f` queries anyway; its replies may then be incomplete.
 
 ### Flags
 
@@ -106,7 +123,7 @@ of the setup guide.
 |---|---|
 | `install.sh` | Installs packages, downloads the FM350 protocol handler, and applies the uci config below. Run as root on the router. |
 | `uninstall.sh` | Removes the uci sections and files added by `install.sh`. Leaves packages installed. |
-| `fm350-status.sh` | Read-only modem status: registration, operator, signal (RSRP/RSRQ/SINR), serving cell and band, temperature, FCC-lock state. `-r` prints the raw AT responses, `-x` masks the cell ID and TAC so you can paste the output publicly. Never changes modem state. Copied to `/usr/bin/fm350-status` by `install.sh`. |
+| `fm350-status.sh` | Read-only modem status: registration, operator, signal (RSRP/RSRQ/SINR), serving cell and band, temperature, FCC-lock state. `-r` prints the raw AT responses, `-x` masks the cell ID and TAC so you can paste the output publicly. Refuses to run while `wwan` is up or connecting (the `atc` handler holds the tty) unless you pass `-f`. Never changes modem state. Copied to `/usr/bin/fm350-status` by `install.sh`. |
 | `files/usr/sbin/fm350-watchdog`, `files/etc/init.d/fm350-watchdog` | Watchdog that restarts `wwan` when the `atc` handler hangs (see below). Installed and enabled by `install.sh` unless you pass `--no-watchdog`. |
 | `files/usr/lib/fm350/at-port.sh` | Shared AT tty lookup (vendor `0e8d` only, `:1.6` before `:1.4`), sourced by `install.sh`, `fm350-status` and the watchdog. Installed to `/usr/lib/fm350/at-port.sh`. |
 | `uci/fm350-watchdog.uci` | Default settings for the watchdog (`/etc/config/fm350_watchdog`). |

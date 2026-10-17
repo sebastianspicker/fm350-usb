@@ -65,8 +65,8 @@ try:
     from fm350mac import at as at_mod
     from fm350mac import cellinfo
     from fm350mac.cli import _parse_int_tuple  # reuse, don't reinvent
-    from fm350mac.redact import _GTCCINFO_ROW_RE
-    from fm350mac.usb_async import LIBUSB_ERROR_ACCESS, LIBUSB_ERROR_BUSY, UsbError
+    from fm350mac.redact import _GTCCINFO_ROW_RE, _REG_LOCATION_RE
+    from fm350mac.usb_async import LIBUSB_ERROR_ACCESS, LIBUSB_ERROR_BUSY, LibusbNotFound, UsbError, UsbNoDevice
 except ImportError:
     print("fm350mac package not importable -- run from within the fm350-usb repo", file=sys.stderr)
     raise
@@ -74,6 +74,12 @@ except ImportError:
 
 class DiagError(Exception):
     """A user-facing fatal error (bad setup, refused precondition)."""
+
+
+# Per-command AT timeout (seconds), unless a caller passes its own (the
+# AT+COPS=? scan does). Bounds how long an unresponsive modem blocks a run;
+# the slowest command this tool sends otherwise is a CFUN change.
+DEFAULT_AT_TIMEOUT_S = 60.0
 
 
 # --- Transports --------------------------------------------------------------
@@ -96,14 +102,27 @@ class LibusbTransport:
 
     def __init__(self, iface_override: int | None = None) -> None:
         self._port = at_mod.AtPort(iface_override=iface_override)
+        self._closed = False
+
+    def _check_open(self) -> None:
+        # After close() the libusb handle is freed (libusb_close/libusb_exit);
+        # using it is undefined behaviour, e.g. a restore step after a failed
+        # re-enumeration. Fail loudly instead.
+        if self._closed:
+            raise DiagError("the AT port is closed (the modem did not come back after a reset)")
 
     def command(self, cmd: str, timeout: float = 240.0) -> str:
+        self._check_open()
         return self._port.command(cmd, timeout=timeout)
 
     def close(self) -> None:
-        self._port.close()
+        # Idempotent, like TtyTransport.close().
+        if not self._closed:
+            self._closed = True
+            self._port.close()
 
     def usb_reset(self) -> bool:
+        self._check_open()
         self._port.usb_device.reset()
         return True
 
@@ -149,8 +168,9 @@ class TtyTransport:
         while time.time() < deadline:
             buf += self._drain(0.05)
             if at_mod._FINAL_RESULT_RE.search(buf):
-                break
-        return buf.strip()
+                return buf.strip()
+        # Like AtPort: partial output is not an answer.
+        raise at_mod.AtTimeoutError(f"no final result code for {cmd!r} within {timeout:g}s", buf.strip())
 
     def close(self) -> None:
         # Idempotent: after a failed re-enumeration the session still holds this
@@ -164,14 +184,23 @@ class TtyTransport:
         return False
 
 
-def _detect_linux_tty() -> str | None:
+def _detect_linux_tty(sysfs: str = "/sys/bus/usb/devices") -> str | None:
     """Glob for the ttyUSB node the kernel 'option' driver creates on the AT
-    interface (6 on most FM350 PIDs, 4 on 0e8d:7126 -- see at.PIDS).
+    interface (6 on most FM350 PIDs, 4 on 0e8d:7126 -- see at.PIDS), on a
+    USB device with vendor 0e8d only (like openwrt's at-port.sh), so another
+    USB-serial adapter's interface 1.6/1.4 is never written to.
     """
     for suffix in ("*:1.6", "*:1.4"):
-        matches = sorted(glob.glob(f"/sys/bus/usb/devices/{suffix}/ttyUSB*"))
-        if matches:
-            return "/dev/" + os.path.basename(matches[0])
+        for match in sorted(glob.glob(f"{sysfs}/{suffix}/ttyUSB*")):
+            iface_dir = os.path.dirname(match)
+            device_dir = iface_dir.rsplit(":", 1)[0]
+            try:
+                with open(os.path.join(device_dir, "idVendor")) as f:
+                    vendor = f.read().strip()
+            except OSError:
+                continue
+            if vendor == "0e8d":
+                return "/dev/" + os.path.basename(match)
     return None
 
 
@@ -294,7 +323,6 @@ _BARE_ID_RE = re.compile(r"\b\d{14,22}[0-9A-Fa-f]?\b")
 # By context: whatever follows these labels is an identifier, whatever its shape.
 _ID_CONTEXT_RE = re.compile(r"(\+(?:ICCID|CCID|CIMI|CGSN)\s*:\s*)[0-9A-Za-z]+")
 _CNUM_RE = re.compile(r'(\+CNUM:\s*(?:"[^"]*")?\s*,\s*)"[^"]*"')
-_CEREG_TAC_CI_RE = re.compile(r'(\+C(?:E|5G)REG:\s*\d+\s*,\s*\d+\s*,\s*)"[0-9A-Fa-f]+"(\s*,\s*)"[0-9A-Fa-f]+"')
 
 
 def redact_gtccinfo(text: str) -> str:
@@ -307,7 +335,9 @@ def redact_gtccinfo(text: str) -> str:
 def redact_text(text: str) -> str:
     """Mask IMEI/IMSI/ICCID, GTCCINFO TAC/cell-id, and CEREG/C5GREG quoted tac/ci."""
     text = redact_gtccinfo(text)
-    text = _CEREG_TAC_CI_RE.sub(r'\1"<redacted>"\2"<redacted>"', text)
+    # fm350mac's regex: both the AT+CEREG? answer (<n>,<stat>,...) and the
+    # unsolicited +CEREG/+C5GREG form (<stat>,...) that AT+CEREG=3 enables.
+    text = _REG_LOCATION_RE.sub(r'\1"<redacted>"\2"<redacted>"', text)
     text = _ID_CONTEXT_RE.sub(r"\1<redacted>", text)
     text = _CNUM_RE.sub(r'\1"<redacted>"', text)
     text = _BARE_ID_RE.sub("<redacted>", text)
@@ -315,6 +345,20 @@ def redact_text(text: str) -> str:
 
 
 # --- Session: the safety-gated AT channel --------------------------------------
+
+
+_FINAL_LINE_RE = re.compile(r"^(?:OK|ERROR|NO CARRIER|\+CME ERROR:.*|\+CMS ERROR:.*)$")
+
+
+def _final_result_code(response: str) -> str | None:
+    """The first final result code line in ``response`` (OK, ERROR, +CME
+    ERROR: ...), or None. The first, not the last: on --tty an unsolicited
+    line can follow the final result code.
+    """
+    for line in response.splitlines():
+        if _FINAL_LINE_RE.match(line.strip()):
+            return line.strip()
+    return None
 
 
 class _JournalWriter:
@@ -362,7 +406,7 @@ class Session:
         """
         self.transport = transport
 
-    def send(self, cmd: str, timeout: float = 240.0) -> str:
+    def send(self, cmd: str, timeout: float = DEFAULT_AT_TIMEOUT_S) -> str:
         level = command_level(cmd)
         if level is None:
             raise SafetyError(f"unknown command, refusing to send: {cmd!r}")
@@ -378,6 +422,10 @@ class Session:
             self._journal_writer().append(
                 {"ts": self._clock(), "level": level, "cmd": cmd, "phase": "result", "response": display}
             )
+            # A write the modem rejected must not be reported as done.
+            final = _final_result_code(display)  # display: redacted unless --no-redact
+            if final != "OK":
+                raise at_mod.AtCommandError(f"{cmd!r} failed: {final or 'no final result code'}", display)
         return response
 
     def write_transcript(self) -> None:
@@ -1075,9 +1123,15 @@ def cmd_volatile(
         checks.append(Check("INFO", f"CEREG=3 reject-cause sampling: {len(reject_samples)} sample(s) collected"))
 
         if not args.skip_scan:
-            scan_response = session.send("AT+COPS=?", timeout=_COPS_SCAN_TIMEOUT_S)
-            operator_count = len(re.findall(r"\(\d+,", scan_response))
-            checks.append(Check("INFO", f"AT+COPS=? found {operator_count} operator(s)"))
+            try:
+                scan_response = session.send("AT+COPS=?", timeout=_COPS_SCAN_TIMEOUT_S)
+            except at_mod.AtCommandError as exc:
+                # A query, not a write: the modem refuses to scan without a
+                # SIM (docs/bench-log.md). Report it and carry on.
+                checks.append(Check("WARN", f"AT+COPS=? scan rejected: {_final_result_code(exc.response)}"))
+            else:
+                operator_count = len(re.findall(r"\(\d+,", scan_response))
+                checks.append(Check("INFO", f"AT+COPS=? found {operator_count} operator(s)"))
 
         if not args.skip_cfun:
             orig_cfun = _parse_int_tuple(snapshot["cfun"])
@@ -1097,6 +1151,7 @@ def cmd_volatile(
                 finally:
                     session.send(f"AT+CFUN={orig_cfun_n}")
 
+        reset_failed = False
         if args.reset:
             session.send("AT+CFUN=15")
             session.transport.close()
@@ -1104,6 +1159,7 @@ def cmd_volatile(
                 transport_factory, 120.0, sleep=sleep, monotonic=monotonic, usb_present_fn=usb_present_fn
             )
             if new_transport is None:
+                reset_failed = True
                 checks.append(Check("WARN", "modem did not disappear and re-enumerate within 120s after AT+CFUN=15"))
             else:
                 session.rebind(new_transport)
@@ -1111,7 +1167,10 @@ def cmd_volatile(
                 session.send("AT+CPIN?")
                 checks.append(Check("OK", "modem re-enumerated and answered AT/AT+CPIN? after reset"))
 
-        if args.usb_reset:
+        if args.usb_reset and reset_failed:
+            # The transport was closed for the reset and never reopened.
+            checks.append(Check("WARN", "USB reset skipped: the modem did not come back after AT+CFUN=15"))
+        elif args.usb_reset:
             if session.transport.usb_reset():
                 session.transport.close()
                 if transport_factory is not None:
@@ -1329,7 +1388,13 @@ def _experiment_fcc_unlock_dell(
 
     fcc_resp = session.send("AT+GTFCCEFFSTATUS?")
     fcc = _parse_int_tuple(fcc_resp)
-    if fcc is not None and len(fcc) >= 2 and fcc[1] == 1 and not even_if_unlocked:
+    readable = fcc is not None and len(fcc) >= 2
+    if not readable and not even_if_unlocked:
+        # The unlock is one-way: don't send it blind (--even-if-unlocked overrides).
+        return [
+            Check("FAIL", f"could not read the FCC lock state from {fcc_resp.strip()!r}; refusing the one-way unlock")
+        ]
+    if readable and fcc[1] == 1 and not even_if_unlocked:
         return [Check("OK", f"already unlocked (mode={fcc[0]}, status={fcc[1]}); nothing to do")]
 
     # No restore: the vendor unlock response is one-way, and this tool has no
@@ -1929,8 +1994,12 @@ def main(argv: list[str] | None = None) -> int:
     def transport_factory() -> Transport:
         return open_transport(tty=args.tty, iface=args.iface)
 
+    sessions: list[Session] = []
+
     def session_factory(level: int) -> Session:
-        return Session(transport_factory(), level, out_dir, redact=args.redact)
+        session = Session(transport_factory(), level, out_dir, redact=args.redact)
+        sessions.append(session)
+        return session
 
     try:
         return args.func(args, transport_factory=transport_factory, session_factory=session_factory, out_dir=out_dir)
@@ -1940,6 +2009,26 @@ def main(argv: list[str] | None = None) -> int:
     except (DiagError, AdbError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
+    except (UsbNoDevice, LibusbNotFound, at_mod.UnknownAtInterface, FileNotFoundError) as exc:
+        print(f"{args.stage}: {exc}", file=sys.stderr)
+        _write_failure_report(out_dir, sessions, args.stage, exc)
+        return 2
+    except (at_mod.AtTimeoutError, at_mod.AtCommandError, UsbError, OSError) as exc:
+        # The modem stopped answering (or, on --tty, dropped off: EIO)
+        # mid-run: keep what was collected.
+        print(f"{args.stage}: {exc}", file=sys.stderr)
+        _write_failure_report(out_dir, sessions, args.stage, exc)
+        return 1
+
+
+def _write_failure_report(out_dir: Path, sessions: list[Session], stage: str, exc: BaseException) -> None:
+    """A FAIL report (plus the transcript so far) for a run that ended on an
+    exception, if a session was opened; then say where it is.
+    """
+    if not sessions:
+        return
+    write_report(out_dir, sessions[-1], f"fm350_diag {stage}", [Check("FAIL", f"{type(exc).__name__}: {exc}")])
+    print(f"partial report written to {out_dir / 'report.md'}", file=sys.stderr)
 
 
 if __name__ == "__main__":

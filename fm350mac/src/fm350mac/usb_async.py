@@ -1165,6 +1165,14 @@ class AsyncEndpoint:
             # the event thread so a slow/blocked clear_halt never delays
             # every other transfer's completion.
             if self.direction == "in":
+                # Counts toward the error streak like CANCELLED/ERROR: an
+                # endpoint that stalls again on every resubmit must go fatal
+                # (and let the supervisor rebuild), not loop with RX dead.
+                self._error_streak += 1
+                if self._error_streak >= self._max_errors:
+                    slot.retired = True
+                    self._mark_fatal(f"{self._error_streak} consecutive transfer errors (status=STALL)")
+                    return
                 slot.pending_resubmit = True
                 threading.Thread(target=self._handle_stall, args=(slot,), daemon=True).start()
             else:

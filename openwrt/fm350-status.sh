@@ -6,11 +6,14 @@
 # human-readable values by default. Never sends anything that changes modem
 # state (no CFUN, no CGACT, no CGDCONT, no FCC unlock).
 #
-# Usage: fm350-status.sh [-r] [-x] [/dev/ttyUSBn]
+# Usage: fm350-status.sh [-r] [-x] [-f] [/dev/ttyUSBn]
 #   -r    Raw mode: print the AT responses as-is, undecoded (the old
 #         default behaviour), instead of the decoded summary.
 #   -x    Redact mode: mask the TAC and cell ID of every cell, in both the
 #         decoded summary and (with -r) the raw GTCCINFO rows.
+#   -f    Query even while netifd's wwan is up or connecting. Without it the
+#         script refuses then: atc.sh holds the same tty, and our queries
+#         could steal its replies (and it ours).
 #   If the device is omitted, it is auto-detected from sysfs (USB interface
 #   :1.6 for 0e8d:7127 mode 41, :1.4 for 0e8d:7126 mode 40).
 #
@@ -33,12 +36,14 @@ set -e
 
 raw_mode=0
 redact=0
+force=0
 
 usage() {
 	cat <<'EOF'
-Usage: fm350-status.sh [-r] [-x] [/dev/ttyUSBn]
+Usage: fm350-status.sh [-r] [-x] [-f] [/dev/ttyUSBn]
   -r    Raw mode: print the AT responses as-is, undecoded.
   -x    Redact mode: mask the TAC and cell ID (also in raw mode).
+  -f    Query even while the wwan interface is up or connecting.
 EOF
 }
 
@@ -50,6 +55,10 @@ while [ $# -gt 0 ]; do
 		;;
 	-x)
 		redact=1
+		shift
+		;;
+	-f)
+		force=1
 		shift
 		;;
 	-h | --help)
@@ -85,16 +94,32 @@ load_at_port_lib() {
 	return 1
 }
 
-# Warn if netifd's wwan is up or connecting: atc.sh then owns the same tty and
-# our AT replies may be stolen by it (and its replies by us).
-warn_if_wwan_active() {
+# Refuse if netifd's wwan is up or connecting: atc.sh then owns the same tty,
+# our AT replies may be stolen by it, and a reply we steal from it can push
+# its state machine on. With -f, only warn.
+check_wwan_idle() {
 	command -v ifstatus >/dev/null 2>&1 || return 0
 	st=$(ifstatus wwan 2>/dev/null) || return 0
 	up=$(printf '%s' "$st" | jsonfilter -e '@.up' 2>/dev/null) || up=""
 	pending=$(printf '%s' "$st" | jsonfilter -e '@.pending' 2>/dev/null) || pending=""
-	if [ "$up" = "true" ] || [ "$pending" = "true" ]; then
-		echo "fm350-status.sh: WARNING: interface wwan is up or connecting; atc.sh shares this tty, so replies below may be incomplete or stolen. Use 'ifdown wwan' first for a clean read." >&2
+	if [ "$up" != "true" ] && [ "$pending" != "true" ]; then
+		return 0
 	fi
+	if [ "$force" -eq 1 ]; then
+		echo "fm350-status.sh: WARNING: interface wwan is up or connecting; atc.sh shares this tty, so replies below may be incomplete or stolen." >&2
+		return 0
+	fi
+	cat >&2 <<'EOF'
+fm350-status.sh: interface wwan is up or connecting, and atc.sh is using this
+tty: querying now could steal its replies and confuse it. Nothing was sent.
+For a clean read, pause the watchdog (it would bring wwan back up) and stop wwan:
+  touch /tmp/fm350-watchdog.pause; ifdown wwan
+  fm350-status
+  ifup wwan; rm /tmp/fm350-watchdog.pause
+To check the connection without touching the tty: ifstatus wwan; logread -e atc
+Or pass -f to query anyway (replies may be incomplete).
+EOF
+	exit 1
 }
 
 # --- decoder: pure awk, no modem/gcom dependency -----------------------------
@@ -370,8 +395,8 @@ main() {
 		exit 1
 	fi
 
+	check_wwan_idle
 	echo "AT device: $device"
-	warn_if_wwan_active
 	echo
 
 	# See run_decode()'s comment above: busybox mktemp needs the template to

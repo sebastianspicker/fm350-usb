@@ -7,13 +7,10 @@ name: Release
 # executes project code; `publish` has write access but only downloads the
 # build's artifact and creates the release.
 #
-# TODO before the first release: pin every action below to a full commit SHA
-# (keep the tag as a trailing comment, e.g. `uses: actions/checkout@<sha> # v4`).
-# Look the SHAs up on GitHub (needs network); do not guess them.
-#   - actions/checkout@v4          (build job; also in ci.yml)
-#   - astral-sh/setup-uv@v6        (build job; also in ci.yml)
-#   - actions/upload-artifact@v4   (build job)
-#   - actions/download-artifact@v4 (publish job)
+# Every action is pinned to a full commit SHA, with its release tag as a
+# trailing comment (same pins in ci.yml). The SHAs were looked up with
+# `git ls-remote https://github.com/<owner>/<action> refs/tags/<tag>`;
+# update both files together.
 on:
   push:
     tags: ["v*"]
@@ -33,7 +30,7 @@ jobs:
     env:
       TAG: ${{ github.ref_name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -52,7 +49,7 @@ jobs:
           exit 1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         with:
           version: "0.12.17"
 
@@ -85,7 +82,7 @@ jobs:
           } > dist/release-notes.md
 
       - name: Upload the artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: dist
           path: |
@@ -107,7 +104,7 @@ jobs:
       GH_REPO: ${{ github.repository }}
     steps:
       - name: Download the artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: dist
           path: dist

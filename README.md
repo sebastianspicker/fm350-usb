@@ -54,12 +54,17 @@ We tested this on one module: the OpenWrt side and the first USB checks on 2026-
 On a router running vanilla OpenWrt 24.10 or newer:
 
 ```sh
-scp -r openwrt root@192.168.1.1:/root/
+scp -O -r openwrt root@192.168.1.1:/root/   # -O: see below
 ssh root@192.168.1.1
 cd /root/openwrt
 ./install.sh --apn <your-apn> --dry-run   # show the uci changes first
 ./install.sh --apn <your-apn>
 ```
+
+`-O` makes `scp` use the classic SCP protocol: OpenSSH 9 and newer (macOS 13+, current Linux)
+default to SFTP, which OpenWrt's dropbear does not serve, so a plain `scp -r` fails. If your `scp`
+says `unknown option -- O`, it is older and works without it. `192.168.1.1` is vanilla OpenWrt's
+default address; use your router's (GL.iNet firmware: `192.168.8.1`).
 
 This installs the FM350 protocol handler (mrhaav's `atc`, or modemfeed's `xmm` with `--proto xmm`), adds a `wwan` interface, and sets up an `mwan3` failover policy. It keeps your existing mwan3 settings: the stock catch-all rules get pointed at the failover policy, and `uninstall.sh` puts them back. It also installs a small watchdog that restarts `wwan` if the protocol handler gets stuck (a known `atc.sh` bug); `--no-watchdog` skips it. `fm350-status` shows decoded signal and cell info on the router.
 

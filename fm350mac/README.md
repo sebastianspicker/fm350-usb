@@ -39,7 +39,7 @@ LTE B3/B7, macOS 27, Apple Silicon.
 | Recovery after unplugging and replugging the modem | Verified: detected in about 1 s, session rebuilt automatically 57 s after the unplug |
 | Non-blocking utun read path | Verified (all hardware runs above) |
 | Sessions longer than 10 minutes; keepalive watchdog, stall detection and rebuild retry actually firing; RNDIS-level rebuild | **Not verified on hardware** |
-| Intel Macs | **Not verified** (the libusb loader also looks in `/usr/local`, but nobody has tried it) |
+| Intel Macs | **Not verified** (the libusb loader also looks in `/usr/local`, but nobody has tried it); `helper install` refuses when Homebrew owns `/usr/local`, see the limitations below |
 
 ## Limitations
 
@@ -48,7 +48,7 @@ LTE B3/B7, macOS 27, Apple Silicon.
 - **`--io sync` is a frozen fallback and unsupported in 0.1.0a1.** It had one unexplained download stall in 6 runs. The default is `--io async`.
 - **`--default-route` and `--dns` are experimental.** They have not run against a real modem; see the metered-SIM warning below.
 - **Throughput is radio-limited and only measured briefly.** The numbers above come from short, capped runs on a weak cell. Treat them as a floor, not a capacity figure. No speed target is claimed.
-- **Intel Macs are untested.**
+- **Intel Macs are untested, and `helper install` refuses there when Homebrew owns `/usr/local`.** The helper goes to `/usr/local/libexec`, and the installer requires every existing parent directory to be root-owned (`/usr/local isn't root-owned (owner is uid N); refusing to install under it`). Intel Homebrew makes `/usr/local` user-owned, so use `up --no-helper` with `sudo` there.
 - **macOS counts received packets twice** in a utun's `netstat -ib` byte counters (a 1 MB download showed about 2.1 MB). Use the `stats:` line, see below.
 - **DHCP on the FM350's RNDIS interface is unreliable.** `fm350mac` takes the IP from `AT+CGPADDR` and assigns it itself.
 - **macOS only, by design.** No Linux or Windows support, no kernel extension, no DriverKit dext.
@@ -72,7 +72,7 @@ fm350mac --version
 
 The `v0.1.0a1` tag is created when the release is published. Until then,
 install from the branch with `@alpha-0.1` instead of `@v0.1.0a1`. Do not
-install without a ref: the default branch (`main`) is still 0.1.0.
+install without a ref: the default branch (`main`) keeps changing after the release.
 
 If `fm350mac: command not found` after `uv tool install`, run
 `uv tool update-shell` and restart the shell.
@@ -377,12 +377,15 @@ subcommand) for details and tracebacks.
 | `no IP address assigned` | context active but no address | check the APN and registration |
 | `no IPv4 address assigned (IPv6-only context; ...)` | the carrier gave only IPv6 (`connect`) | use an IPv4 APN; the data path is IPv4-only |
 | `fm350mac up needs either the root helper or root. ...` | helper not installed or unreachable, and not running as root | install the helper (above), or pass `--no-helper` with `sudo` |
+| `To run fm350mac up as root without the helper, add --no-helper.` | `up` run with `sudo` and the helper unreachable or refusing root (the line above it says why) | run `up` without `sudo`, or add `--no-helper` |
 | `fm350mac up --no-helper needs root: re-run it with sudo.` | `--no-helper` without root | `sudo "$(command -v fm350mac)" up --no-helper ...` |
 | `helper: the helper is not installed (no socket); run: sudo "$(command -v fm350mac)" helper install` | no socket at `/var/run/fm350mac-helper.sock` | run the install command |
 | `helper: the helper is not running (connect timed out); see /var/log/fm350mac-helper.log` | launchd did not accept the connection in time | read the log; retry (the first start of `/usr/bin/python3` can take a few seconds); reinstall |
 | `helper: the helper is not running (connection refused); see /var/log/fm350mac-helper.log` | launchd could not start the helper | read the log; reinstall |
-| `helper: the helper is not running (hello timed out); see /var/log/fm350mac-helper.log` | connected, but the helper did not answer the `hello` | read the log; retry; reinstall |
+| `helper: the helper did not answer (hello timed out); it serves one fm350mac session at a time, so another 'fm350mac up' may be running. If not, see /var/log/fm350mac-helper.log` | connected, but the helper did not answer the `hello`: usually another `up` session (or `helper status` during one) | stop the other session, or ignore it during `helper status`; otherwise read the log, retry, reinstall |
 | `helper: permission denied connecting to /var/run/fm350mac-helper.sock (socket owner uid N, your uid M); if the uids match, the connection was blocked by a sandbox/privacy setting` | the socket belongs to another uid, or something sandboxes the process. If N differs from M the text continues `; the helper was installed for another user: reinstall it as this user with sudo "$(command -v fm350mac)" helper install` | if the uids differ, reinstall as the user who will run `up`; if they match, run `up` from a terminal that is not sandboxed |
+| `helper: the helper only serves uid N, not root: run fm350mac without sudo (or use fm350mac up --no-helper to run as root without the helper)` | `fm350mac up` or `helper status` run with sudo; the helper serves only the user it was installed for | run it without sudo; for `up` with sudo, add `--no-helper` |
+| `helper: the helper only serves uid N, not your uid M; reinstall it as this user with sudo "$(command -v fm350mac)" helper install` | the helper was installed for another user | reinstall as the user who will run `up` |
 | `helper: helper protocol mismatch: ...; reinstall the helper` | old helper, new driver | `sudo "$(command -v fm350mac)" helper install` |
 | `helper: the helper did not answer correctly: ...` | garbled reply | see the log; reinstall |
 | `helper error: <reason>` | the helper refused a request (for example more than 8 host routes) or closed the connection mid-session. Reinstalling would not change it | read the reason; `fm350mac helper status` |
