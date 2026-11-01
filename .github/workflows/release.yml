@@ -1,25 +1,23 @@
 name: Release
 
-# Pushing a tag like v0.1.0a1 builds the wheel and sdist and publishes them,
-# with SHA256SUMS, as a GitHub pre-release. Nothing is uploaded to PyPI.
-#
-# Two jobs: `build` runs with read-only permissions and does everything that
-# executes project code; `publish` has write access but only downloads the
-# build's artifact and creates the release.
-#
-# Every action is pinned to a full commit SHA, with its release tag as a
-# trailing comment (same pins in ci.yml). The SHAs were looked up with
-# `git ls-remote https://github.com/<owner>/<action> refs/tags/<tag>`;
-# update both files together.
+# Releases are manually dispatched from the default branch for an existing tag.
+# Build is read-only; publishing only downloads the verified artifact.
 on:
-  push:
-    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to release (for example v0.1.0a1)
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 jobs:
   build:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    outputs:
+      commit: ${{ steps.release-ref.outputs.commit }}
     name: build the wheel and sdist
     runs-on: ubuntu-latest
     permissions:
@@ -28,25 +26,25 @@ jobs:
       run:
         working-directory: fm350mac
     env:
-      TAG: ${{ github.ref_name }}
+      TAG: ${{ inputs.tag }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Check the tagged commit is on main or an alpha-* branch
+      - name: Validate the existing tag and select its source
+        id: release-ref
         working-directory: .
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([ab][0-9]+|rc[0-9]+)?$ ]] || { echo "invalid version tag" >&2; exit 1; }
+          git show-ref --verify --quiet "refs/tags/${TAG}" || { echo "tag does not exist" >&2; exit 1; }
           commit="$(git rev-parse "refs/tags/${TAG}^{commit}")"
-          for ref in refs/remotes/origin/main refs/remotes/origin/alpha-*; do
-            if git rev-parse --verify --quiet "$ref" >/dev/null && git merge-base --is-ancestor "$commit" "$ref"; then
-              echo "tagged commit ${commit} is an ancestor of ${ref}"
-              exit 0
-            fi
-          done
-          echo "tagged commit ${commit} is not an ancestor of origin/main or an origin/alpha-* branch" >&2
-          exit 1
+          git merge-base --is-ancestor "$commit" "refs/remotes/origin/${DEFAULT_BRANCH}" || { echo "tag is not on the default branch" >&2; exit 1; }
+          printf 'commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"
+          git checkout --detach "$commit"
 
       - name: Install uv
         uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
@@ -93,16 +91,27 @@ jobs:
           if-no-files-found: error
 
   publish:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     name: publish a pre-release
     needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
     env:
-      TAG: ${{ github.ref_name }}
+      TAG: ${{ inputs.tag }}
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify the tag still identifies the built commit
+        env:
+          RELEASE_COMMIT: ${{ needs.build.outputs.commit }}
+        run: |
+          actual="$(git rev-parse "refs/tags/${TAG}^{commit}")"
+          test "$actual" = "$RELEASE_COMMIT" || { echo "tag changed after build" >&2; exit 1; }
       - name: Download the artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:

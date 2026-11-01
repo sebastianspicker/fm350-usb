@@ -7,15 +7,43 @@
 
 This repository holds tools and notes for running a **Fibocom FM350-GL** 5G modem over USB as a backup internet connection for a home router. That includes the **Dell DW5931e**, the Dell-branded version of the same module that comes out of Latitude laptops and turns up cheaply as a used part. You fit the module into a USB-to-M.2 adapter, plug it into a router (or a Mac, for bench testing), and it can take over the internet connection when your main line goes down.
 
+<details>
+<summary>Status and limitations</summary>
+
+fm350-usb is an independent experimental project exploring USB modem
+connectivity and router failover. Developed independently alongside my main
+professional work. The macOS driver remains alpha software; the scripts and
+notes are starting points to adapt, rather than a ready-to-use supported
+connectivity product. Hardware results cover one module and limited macOS
+sessions, while router failover has been checked in emulation.
+
+**Disclaimer.** Results do not guarantee continuous connectivity or
+compatibility with your setup. Validate your modem, router and recovery
+path, review privileged-helper permissions, and take responsibility for
+configuration changes, outages, data loss and cellular data charges.
+
+</details>
+
 The repo has three parts:
 
 - **OpenWrt failover:** scripts that set up the modem as a second WAN on an OpenWrt router and switch traffic to it with `mwan3` when the wired line goes down.
 - **`fm350mac`:** a user-space macOS driver. macOS has no driver for the modem's RNDIS network interface, so this talks to it over libusb and hands packets to a `utun` interface.
 - **Dell DW5931e field guide:** what the Dell OEM firmware changes, how to reach the module's internal root shell, and how to switch it out of "PCIe Advance Mode" (a DIPC mode setting), which AT commands refuse to do.
 
+Use either an OpenWrt router or a Mac test host; these are separate paths for
+the same modem, not simultaneous connections to two hosts.
+
+```mermaid
+flowchart LR
+  A[FM350 modem] -->|USB| B[OpenWrt router with mwan3]
+  B --> C[Backup WAN]
+  A -->|USB| D[Mac running fm350mac]
+  D --> E[Local utun interface]
+```
+
 **Interactive demo:** https://sebastianspicker.github.io/fm350-usb/
 
-## In short
+## What has been checked
 
 - A DW5931e / FM350-GL enumerates over USB in the Waveshare adapter with no flashing or unlock needed — that's what we found on the one unit tested, 2026-09-25 [Dell guide, TL;DR].
 - If the modem hears no cells at all, check the antenna pigtails before anything else. We lost a day chasing firmware causes; the pigtails were the actual problem [Bench log].
@@ -173,6 +201,19 @@ cd fm350mac && uvx ruff check . ../tools                 # macOS driver
 shellcheck openwrt/*.sh                                  # router scripts
 python3 tools/screenshots.py                             # regenerate the README screenshots
 ```
+
+General CI automatically runs only for Dependabot-authored pull requests;
+maintainers can dispatch it manually for other branches. Dependabot checks the
+Python project/uv lock and GitHub Actions weekly. The Release workflow is manual
+from the default branch, requires an existing version tag on that branch, verifies
+the package version and helper digest, and publishes a prerelease only after the
+read-only build succeeds. It does not publish to PyPI.
+
+The Pages demo also publishes only through a manual default-branch workflow.
+Before any approved push, the owner must switch the repository's existing Pages
+source from branch publishing to **GitHub Actions**; adding the workflow alone
+does not disable the legacy automatic deployment. No setting is changed by this
+source update.
 
 ## Not affiliated
 

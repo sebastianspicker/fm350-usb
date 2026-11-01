@@ -36,6 +36,8 @@ __pycache__/
 /.claude/
 /AGENTS.md
 /CLAUDE.md
+/GEMINI.md
+/CODEX.md
 
 # Benchmark run output (tools/bench-throughput.sh)
 /tools/bench-results/
@@ -45,3 +47,16 @@ __pycache__/
 
 # Untracked scratch rewrite of the tree; never commit
 /rewritten/
+
+# Local audit, implementation and task records; public source docs remain tracked.
+/ALPHA_AUDIT_LEDGER.md
+/ALPHA_AUDIT_REPORT.md
+/ALPHA_IMPLEMENTATION_LEDGER.md
+/ALPHA_KNOWN_ISSUES.md
+/ALPHA_PR_DESCRIPTION.md
+/THINGS_TO_DO_LEDGER.md
+
+# Nested assistant workspaces are local state too.
+.agents/
+.claude/
+.codex/

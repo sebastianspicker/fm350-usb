@@ -70,7 +70,9 @@ uv tool install "git+https://github.com/sebastianspicker/fm350-usb@v0.1.0a1#subd
 fm350mac --version
 ```
 
-The `v0.1.0a1` tag is created when the release is published. Until then,
+The `v0.1.0a1` tag must exist before manually dispatching the Release workflow
+from the default branch. The workflow verifies the tag, package version and
+helper digest before publication. Until a reviewed tag is available,
 install from the branch with `@alpha-0.1` instead of `@v0.1.0a1`. Do not
 install without a ref: the default branch (`main`) keeps changing after the release.
 

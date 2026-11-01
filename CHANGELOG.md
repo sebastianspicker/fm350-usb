@@ -8,6 +8,14 @@ versioned separately.
 
 ## [0.1.0a1] - unreleased
 
+- Diagnostics now recognizes running `fm350mac up` sessions with a linear token
+  scan instead of an ambiguous repeated regular expression. The existing session
+  refusal behavior and safety-level gates remain unchanged.
+- CI builds are automatic only for Dependabot-authored PRs or manually dispatched.
+  Release and Pages publishing are manual/default-branch only; release additionally
+  requires an existing package-version tag on that branch. Dependency updates use
+  native Dependabot for the Python project/uv lock and GitHub Actions.
+
 First alpha release of `fm350mac`. See the
 [README](https://github.com/sebastianspicker/fm350-usb/blob/v0.1.0a1/fm350mac/README.md)
 for installation, limitations and the trust model. The `v0.1.0a1` tag is
@@ -31,7 +39,7 @@ proof.
 - **Instrumentation.** A `perf:` line at shutdown (OUT latency histogram, in-flight maximum, slot waits, RX frames per URB), plus a `stats-detail:` debug line with `--verbose`. The `stats:` line, IP bytes only, is the figure to use for real SIM usage.
 - **Error UX.** Expected failures print `fm350mac: <cause>. <next step>` instead of a traceback (libusb missing, modem not found or busy, helper missing or unreachable, SIM PIN/PUK/not inserted, AT or RNDIS timeouts). `--verbose` keeps tracebacks. `up` exit codes: 0 ok, 1 error, 2 bridge failure or usage, 3 modem did not come back or rebuild budget exhausted, 4 modem identity changed, 130 interrupted.
 - `status`, `doctor`, `probe`, `at`, `connect`, `disconnect`, `up --loopback` (in-process fake modem) and `async-selftest` (needs `--yes`).
-- Packaging: dynamic version, PEP 639 license metadata, classifiers, project URLs; CI with a Python 3.11-3.13 matrix, a wheel build check and a tag-triggered pre-release workflow.
+- Packaging: dynamic version, PEP 639 license metadata, classifiers, project URLs; CI lint/helper-compilation and wheel build checks, plus a manually dispatched pre-release workflow.
 
 ### Changed (review fixes)
 
@@ -47,7 +55,7 @@ proof.
 - **Rebuild.** An RNDIS-level rebuild pauses 3 s between halting and re-initialising. The 600 s rebuild budget is measured from the loss of the session.
 - **utun buffers.** `SO_SNDBUF` is raised to 1 MiB; `SO_RCVBUF` stays at the system default.
 - **Async tx lost wakeup** (a slot that retired just before the wait left the tx thread sleeping 50 ms) is fixed, and the benchmark script no longer ends `iperf3 -n` runs on whole-second boundaries.
-- **Release workflow.** Build and publish are separate jobs (the publish job only downloads the artifact and creates the pre-release); the tagged commit must be on `main` or an `alpha-*` branch; the build backend (`hatchling==1.32.4`) and uv are pinned.
+- **Release workflow.** Build and publish are separate jobs (the publish job only downloads the artifact and creates the pre-release); the existing tagged commit must be on the default branch; the build backend (`hatchling==1.32.4`) and uv are pinned.
 - **Docs.** `fm350mac: command not found` after `uv tool install` is covered (`uv tool update-shell`); troubleshooting texts were checked against the code.
 
 ### Verified on hardware (2026-10-05)

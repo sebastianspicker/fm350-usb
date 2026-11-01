@@ -1,9 +1,8 @@
 name: CI
 
 on:
-  push:
-    branches: [main, "alpha-*"]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -14,6 +13,7 @@ concurrency:
 
 jobs:
   fm350mac:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.user.login == 'dependabot[bot]'
     name: fm350mac (macos-latest)
     runs-on: macos-latest
     defaults:
@@ -34,6 +34,7 @@ jobs:
         run: /usr/bin/python3 -I -S -c 'import sys; compile(open(sys.argv[1]).read(), sys.argv[1], "exec")' src/fm350mac/helper/fm350mac_helper.py
 
   build:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.user.login == 'dependabot[bot]'
     name: build and install the wheel (macos-latest)
     runs-on: macos-latest
     defaults:
@@ -67,6 +68,7 @@ jobs:
           "$RUNNER_TEMP/wheel-venv/bin/fm350mac" helper install --dry-run --allowed-uid 501
 
   shellcheck:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.user.login == 'dependabot[bot]'
     name: shellcheck (ubuntu-latest)
     runs-on: ubuntu-latest
     steps:

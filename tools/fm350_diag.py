@@ -780,6 +780,29 @@ _UP_SESSION_WARNING = (
 )
 
 
+def _fm350mac_up_command(command: str) -> bool:
+    """Recognize the existing whitespace-delimited command forms in linear time."""
+    if "fm350_diag" in command:
+        return False
+    words = command.split()
+    for index, word in enumerate(words):
+        if word.rsplit("/", 1)[-1] != "fm350mac":
+            continue
+        cursor = index + 1
+        while cursor < len(words):
+            flag = words[cursor]
+            if not (
+                flag.startswith("-")
+                and len(flag) > 1
+                and all(c.isalnum() or c in "_-" for c in flag[1:])
+            ):
+                break
+            cursor += 1
+        if cursor < len(words) and words[cursor] == "up":
+            return True
+    return False
+
+
 def fm350mac_up_running() -> bool:
     """Best-effort: is another `fm350mac ... up` process alive? (False if `ps` is unavailable.)"""
     try:
@@ -792,7 +815,7 @@ def fm350mac_up_running() -> bool:
             continue
         # The `up` subcommand itself (after optional global flags), not just
         # any command line that mentions both words (e.g. a commit message).
-        if re.search(r"(?:^|[/\s])fm350mac(?:\s+--?[\w-]+)*\s+up(?:\s|$)", command) and "fm350_diag" not in command:
+        if _fm350mac_up_command(command):
             return True
     return False
 
