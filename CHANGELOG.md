@@ -15,6 +15,42 @@ versioned separately.
   Release and Pages publishing are manual/default-branch only; release additionally
   requires an existing package-version tag on that branch. Dependency updates use
   native Dependabot for the Python project/uv lock and GitHub Actions.
+- `fm350mac at` never prints a SIM PIN, with or without `--redact`, and also
+  masks `AT+CLCK`, `AT+CPWD` and `AT+CPIN2` arguments. It exits 1 when a command
+  ends in `ERROR`, `+CME ERROR` or `+CMS ERROR`; the remaining commands are
+  still sent.
+- When the root helper does not answer in time, the driver closes the
+  connection instead of reading the late reply as the next answer. The helper
+  then undoes that session's routes and DNS. A lost helper connection ends a
+  supervised session. A failed utun address change falls back to setting the
+  new address directly and is otherwise retried on the next poll.
+- `--apn` rejects a trailing newline. `doctor` reads each command's own reply
+  line, so an unsolicited `+CEREG:` before it no longer causes a false WARN.
+  `up --loopback` handles signals from before its first network change and
+  names the flags it ignores. RNDIS packets whose data overlaps their header
+  are rejected; empty ones are skipped without dropping the rest of the
+  transfer.
+- Router scripts:
+  - **Watchdog:** restarts `wwan` after a transient SIM error such as
+    `SIM busy` or `SIMreadfailure`. It still never restarts after an error
+    that mentions a PIN, PUK, password, denial or a missing SIM. It no
+    longer commits other staged network changes, and it times itself with
+    the uptime instead of the wall clock.
+  - **Hotplug script:** checks the vendor ID, binds with interface class
+    `ff`, and takes no paths from the environment.
+  - **Install and uninstall:** leave a `50-fm350_driver` file they did not
+    install alone; older copies of ours are still replaced and removed.
+  - **`fm350-status`:** shows the SIM state.
+- Diagnostics and bench tools:
+  - **Backups:** a backup never writes into an existing folder.
+  - **Git-ignore:** backups and run folders are git-ignored wherever the tool
+    runs.
+  - **Exit codes:** `experiment` exits 1 on WARN or FAIL.
+  - **Redaction:** console output is redacted like the report, using the
+    driver's redactor.
+  - **Stage 3:** `dipc` changes are restored if adb fails mid-write.
+  - **Loopback benchmark:** labels its single row `sync (loopback)`.
+  - **`--full-tunnel`:** always needs a typed `yes` or `--yes`.
 
 First alpha release of `fm350mac`. See the
 [README](https://github.com/sebastianspicker/fm350-usb/blob/v0.1.0a1/fm350mac/README.md)

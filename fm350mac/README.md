@@ -231,9 +231,9 @@ each range the modem returns.
 | `--dry-run` | no side effects: only read-only AT queries, nothing run on the system; prints the AT and system commands it would run; needs no root and no helper |
 | `--redact` | mask the assigned IP, DNS servers and IMEI in logs |
 | `--no-helper` | do not use the root helper; run the direct path (needs `sudo`) |
-| `--loopback` | in-process fake modem: no SIM, no USB. Answers ARP/ICMP for any destination (addressed as `192.0.2.2`) and adds only a host route to `198.51.100.1`; ignores `--default-route`/`--route-host` |
+| `--loopback` | in-process fake modem: no SIM, no USB. Answers ARP/ICMP for any destination (addressed as `192.0.2.2`) and adds only a host route to `198.51.100.1`; always uses the sync bridge and ignores `--default-route`, `--route-host`, `--dns`, `--io` and `--no-supervise` |
 | `--supervise` / `--no-supervise` | reconnect supervisor (default on) or a plain wait loop |
-| `--reenum-timeout SECONDS` | how long to wait for the modem to come back after a USB disconnect (default 180) |
+| `--reenum-timeout SECONDS` | how long to wait for the modem to come back after a USB disconnect (default 180); only with `--supervise`, since `--no-supervise` ends the session on a disconnect |
 | `--io async\|sync` | async (default) or the frozen, unsupported sync fallback |
 | `--rx-urbs N` / `--tx-urbs N` | bulk transfers kept in flight per direction with `--io async` (1..64, default 8) |
 | `--cid N`, `--pdp IP` | PDP context id; PDP type (only `IP`) |
@@ -366,11 +366,12 @@ subcommand) for details and tracebacks.
 | `the modem is in use by another process ...` | another tool (for example `fm350_diag`) or a second `fm350mac up` holds the USB interfaces | close it and retry |
 | `USB error: ...` | any other libusb failure | replug the modem and retry; `--verbose` for details |
 | `unknown AT interface for USB product id ... The modem is in an unsupported USB mode ...` | the USB product id has no known AT interface | pass `--iface N` to `fm350mac at` |
-| `<cmd>: timed out waiting for a final result code` (`at`; exit 1) | the modem sent no `OK`/`ERROR` for that command: wedged or gone | unplug and replug the modem |
+| `<cmd>: timed out waiting for a final result code` (`at`; exit 1) | the modem sent no `OK`/`ERROR` for that command: wedged or gone. `at` also exits 1 if any command ended in `ERROR`/`+CME ERROR`/`+CMS ERROR` (the remaining commands are still sent) | unplug and replug the modem |
 | `status: no final result code for 'AT...' within Ns` (also `doctor:`, `connect:`, `disconnect:`; exit 1) | the same, in those commands. `status --watch` prints `status: ...; retrying` and keeps going. `connect`'s PDP setup step prints the text without the `connect:` prefix | unplug and replug the modem |
 | `modem did not answer: no final result code for 'AT...' within Ns` (`up`; exit 1) | an AT query during `up` timed out | unplug and replug the modem |
 | `the modem did not answer (...)` | the same condition in other commands | unplug and replug the modem |
 | `RNDIS control channel did not respond; unplug/replug the modem` | RNDIS control exchange timed out | unplug and replug |
+| `RNDIS error: <detail>; unplug/replug the modem` | the RNDIS control exchange failed in another way (for example a malformed or rejected reply) | unplug and replug |
 | `no SIM detected: check the SIM tray` | `AT+CPIN?` reports NOT INSERTED | reseat the SIM |
 | `SIM is PIN-locked: unlock it in a phone first (or disable the PIN there), or with fm350mac at 'AT+CPIN="<pin>"' -- note that the PIN then ends up in your shell history; 3 wrong PINs lock the SIM` | SIM PIN is set | preferably unlock or disable the PIN in a phone. Typing it into `fm350mac at` works, but the shell keeps it in its history (the tool masks it in its own output) |
 | `SIM is PUK-locked: unlock with the PUK in a phone` | too many wrong PINs | unlock in a phone |

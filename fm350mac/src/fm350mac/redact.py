@@ -15,7 +15,7 @@ REDACTED = "REDACTED"
 # +GTCCINFO row fields are always ``<IsServiceCell>,<rat>,<mcc>,<mnc>,<tac>,
 # <cellid>,...`` (see cellinfo.py's field tables), so TAC/cell ID are always
 # the 5th/6th comma-separated values on any cell row.
-_GTCCINFO_ROW_RE = re.compile(r"(?m)^(\d+,\d+,[^,\r\n]*,[^,\r\n]*,)[^,\r\n]*(,)[^,\r\n]*(,)")
+_GTCCINFO_ROW_RE = re.compile(r"(?m)^([ \t]*\d+[ \t]*,[ \t]*\d+[ \t]*,[^,\r\n]*,[^,\r\n]*,)[^,\r\n]*(,)[^,\r\n]*(,)")
 
 _CNUM_RE = re.compile(r'(\+CNUM:\s*"[^"]*"\s*,\s*")[^"]*(")')
 _ID_PREFIX_RE = re.compile(r"(\+(?:CIMI|CGSN|GSN|ICCID|CCID):[ \t]*)\S+")
@@ -34,9 +34,10 @@ _DOTTED_ADDRESS_PARTS = frozenset({8, 16, 32})
 # +CREG/+CGREG/+CEREG/+C5GREG with <n>=2/3 (or as a URC) carry the TAC/LAC
 # and cell ID as quoted hex strings after <stat>.
 _REG_LOCATION_RE = re.compile(r'(\+C(?:G|E|5G)?REG:[ \t]*\d+(?:[ \t]*,[ \t]*\d+)?[ \t]*,[ \t]*)"[0-9A-Fa-f]*"([ \t]*,[ \t]*)"[0-9A-Fa-f]*"')
-# AT+CPIN=<pin>[,<newpin>] (also a bare "+CPIN=..." echo fragment): every
-# argument, quoted or not, is a PIN or PUK.
-_CPIN_SET_RE = re.compile(r'(?i)((?:AT)?\+CPIN[ \t]*=[ \t]*)(?:"[^"\r\n]*"?|\d+)(?:[ \t]*,[ \t]*(?:"[^"\r\n]*"?|\d+))*')
+# AT+CPIN=<pin>[,<newpin>], AT+CPIN2=, AT+CLCK=<fac>,<mode>,<passwd> and
+# AT+CPWD=<fac>,<old>,<new> (also a bare "+CPIN=..." echo fragment): every
+# argument, quoted or not, is masked together.
+_CPIN_SET_RE = re.compile(r'(?i)((?:AT)?\+(?:CPIN2?|CLCK|CPWD)[ \t]*=[ \t]*)(?:"[^"\r\n]*"?|\w+)(?:[ \t]*,[ \t]*(?:"[^"\r\n]*"?|\w+))*')
 # A PIN echoed back as a +CPIN: value (the state names like READY/SIM PIN
 # are words, never digits).
 _CPIN_ECHO_RE = re.compile(r'(\+CPIN:[ \t]*)"?\d{4,8}"?(?![\w"])')
@@ -57,22 +58,20 @@ def redact_gtccinfo(text: str) -> str:
     return _GTCCINFO_ROW_RE.sub(rf"\1{REDACTED}\2{REDACTED}\3", text)
 
 
-def _ip_replacement(match: re.Match, parser, private_hint: bool) -> str:
+def _ip_replacement(match: re.Match, parser) -> str:
     try:
         addr = parser(match.group(0))
     except ValueError:
         return match.group(0)
     if addr.is_unspecified:
         return match.group(0)
-    if private_hint and (addr.is_private or addr.is_link_local):
-        return f"{REDACTED}(private)"
     return REDACTED
 
 
-def _dotted_replacement(match: re.Match, private_hint: bool) -> str:
+def _dotted_replacement(match: re.Match) -> str:
     parts = match.group(0).split(".")
     if len(parts) == 4:
-        return _ip_replacement(match, ipaddress.IPv4Address, private_hint)
+        return _ip_replacement(match, ipaddress.IPv4Address)
     if len(parts) not in _DOTTED_ADDRESS_PARTS or any(int(p) > 255 for p in parts):
         return match.group(0)
     if not any(int(p) for p in parts):
@@ -80,15 +79,14 @@ def _dotted_replacement(match: re.Match, private_hint: bool) -> str:
     return REDACTED
 
 
-def redact_text(text: str, *, private_hint: bool = False) -> str:
+def redact_text(text: str) -> str:
     """Return ``text`` with identifying values masked as ``REDACTED``.
 
     Masks SIM PINs (see redact_pin), +CNUM numbers, +CIMI/+CGSN/+GSN/+ICCID/+CCID values, ICCIDs
     anywhere, bare 14-16 digit IMEI/IMSI lines, TAC/cell ID in +GTCCINFO
     rows and +C(E|G|5G)REG location fields, and IPv4/IPv6 addresses
     (including 27.007's dotted IPv6 and address+mask forms; ``0.0.0.0``/``::``
-    are kept). With ``private_hint`` an address in a private/link-local
-    range is masked as ``REDACTED(private)`` instead.
+    are kept).
     """
     text = redact_pin(text)
     text = _CNUM_RE.sub(rf"\1{REDACTED}\2", text)
@@ -97,6 +95,6 @@ def redact_text(text: str, *, private_hint: bool = False) -> str:
     text = _BARE_ID_LINE_RE.sub(rf"\1{REDACTED}\2", text)
     text = redact_gtccinfo(text)
     text = _REG_LOCATION_RE.sub(rf'\1"{REDACTED}"\2"{REDACTED}"', text)
-    text = _DOTTED_RE.sub(lambda m: _dotted_replacement(m, private_hint), text)
-    text = _IPV6_RE.sub(lambda m: _ip_replacement(m, ipaddress.IPv6Address, private_hint), text)
+    text = _DOTTED_RE.sub(lambda m: _dotted_replacement(m), text)
+    text = _IPV6_RE.sub(lambda m: _ip_replacement(m, ipaddress.IPv6Address), text)
     return text

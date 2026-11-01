@@ -240,7 +240,8 @@ def parse_query_cmplt(msg: bytes) -> QueryCmplt:
         raise RndisError(status, "QUERY_CMPLT")
     start = 8 + buf_offset
     end = start + buf_len
-    if start < 8 or end > len(msg):
+    # InformationBufferOffset counts from byte 8; data can't overlap the 24-byte header.
+    if (buf_len and start < 24) or end > len(msg):
         raise RndisError(STATUS_INVALID_DATA, "QUERY_CMPLT: buffer offset/length out of range")
     return QueryCmplt(request_id=request_id, status=status, buffer=bytes(msg[start:end]))
 
@@ -360,9 +361,11 @@ def unpack_packets_counted(buf: bytes, alignment_factor: int = 0) -> tuple[list[
             return frames, 1  # truncated/malformed
         data_start = pos + 8 + data_offset
         data_end = data_start + data_length
-        if data_start < pos or data_end > pos + msg_length or data_end < data_start:
+        # DataOffset counts from byte 8, so data can't start inside the header.
+        if data_offset < _PACKET_HEADER_LEN - 8 or data_end > pos + msg_length:
             return frames, 1  # malformed offsets
-        frames.append(bytes(buf[data_start:data_end]))
+        if data_length:  # an empty PACKET_MSG carries nothing; the ones after it still count
+            frames.append(bytes(buf[data_start:data_end]))
         pos += msg_length
         pos = (pos + align - 1) & ~(align - 1)
     # Leftover bytes shorter than a header: padding if all zero, else malformed.

@@ -1,5 +1,5 @@
 # Modem backups hold the IMEI and RF calibration of one physical unit. Never commit them.
-/backups/
+backups/
 
 # Python
 __pycache__/
@@ -43,7 +43,10 @@ __pycache__/
 /tools/bench-results/
 
 # fm350_diag.py run output (reports/transcripts/journals may hold operator or cell data)
-/fm350-diag-*/
+fm350-diag-*/
+# Also when written elsewhere with --out/--dest: journals and backup archives.
+journal.jsonl
+*.tar
 
 # Untracked scratch rewrite of the tree; never commit
 /rewritten/
@@ -55,6 +58,7 @@ __pycache__/
 /ALPHA_KNOWN_ISSUES.md
 /ALPHA_PR_DESCRIPTION.md
 /THINGS_TO_DO_LEDGER.md
+/REPO_AUDIT_LEDGER.md
 
 # Nested assistant workspaces are local state too.
 .agents/

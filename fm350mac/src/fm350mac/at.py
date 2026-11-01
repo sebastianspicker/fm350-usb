@@ -131,7 +131,7 @@ class AtPort:
             raise AtTimeoutError(f"{cmd!r} not sent: stop requested")
         stale = self._drain(_STALE_DRAIN_TIMEOUT_MS, deadline=time.monotonic() + 0.05)
         if stale.strip():
-            _log.debug("discarded stale AT output before %r: %r", cmd, stale)
+            _log.debug("discarded stale AT output before %r: %r", redact_pin(cmd), redact_pin(stale))
         self.usb_device.bulk_out(self.ep_out, (cmd + "\r").encode())
         buf = ""
         deadline = time.monotonic() + timeout
@@ -141,7 +141,7 @@ class AtPort:
             if final:
                 trailing = buf[final.end():]
                 if trailing.strip():
-                    _log.debug("discarded AT output after %r's final result code: %r", cmd, trailing)
+                    _log.debug("discarded AT output after %r's final result code: %r", redact_pin(cmd), redact_pin(trailing))
                 return buf[: final.end()].strip()
             if stop_event is not None and stop_event.is_set():
                 raise AtTimeoutError(f"{cmd!r} abandoned: stop requested", buf.strip())
@@ -292,7 +292,7 @@ VALID_PDP_TYPES = frozenset({"IP", "IPV6", "IPV4V6"})
 
 def validate_apn(apn: str) -> str:
     """Validate an APN against a conservative allow-list. Raises ValueError otherwise."""
-    if not _APN_RE.match(apn):
+    if not _APN_RE.fullmatch(apn):
         raise ValueError(f"invalid APN: {apn!r}")
     return apn
 
@@ -310,11 +310,6 @@ def validate_pdp_type(pdp_type: str) -> str:
 def sim_state(port: AtPort) -> str | None:
     """Send AT+CPIN? and return the SIM state ("READY", "SIM PIN", "NOT INSERTED", ...)."""
     return parse_cpin_state(port.command("AT+CPIN?", timeout=QUERY_TIMEOUT_S))
-
-
-def sim_ready(port: AtPort) -> bool:
-    """Send AT+CPIN? and return whether the SIM reports READY."""
-    return sim_state(port) == "READY"
 
 
 def define_pdp(port: AtPort, cid: int, pdp_type: str, apn: str) -> str:
@@ -339,10 +334,8 @@ def deactivate(
     """Send AT+CGACT=0,<cid> to deactivate a PDP context.
 
     ``timeout``/``stop_event`` let a shutdown bound the wait (see
-    ``AtPort.command``); ``stop_event`` is only passed on when given.
+    ``AtPort.command``).
     """
-    if stop_event is None:
-        return port.command(f"AT+CGACT=0,{cid}", timeout=timeout)
     return port.command(f"AT+CGACT=0,{cid}", timeout=timeout, stop_event=stop_event)
 
 

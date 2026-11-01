@@ -572,9 +572,9 @@ def cmd_helper_status(
     except OSError:
         packaged_bytes = None  # source unreadable: nothing to compare
     if installed_bytes is not None and packaged_bytes is not None and installed_bytes != packaged_bytes:
-        print("installed helper is out of date — run `fm350mac helper install`")
+        print("installed helper is out of date — run sudo \"$(command -v fm350mac)\" helper install")
 
-    client, reason = helper_client.as_probe_result(helper_probe())
+    client, reason = helper_probe()
     if client is None:
         print(f"helper        : {reason}")
         return 1

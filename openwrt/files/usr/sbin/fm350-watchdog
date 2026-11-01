@@ -57,16 +57,21 @@
 #     exists elsewhere (ttyUSB renumbering), the port is re-resolved before
 #     each ifup and network.<interface>.device is updated if it changed.
 #   - SIM/PIN safety: if ifstatus shows an error code that atc.sh raised with
-#     proto_notify_error + proto_block_restart for a SIM/PIN/registration
-#     problem (PINmissing, PINerror, SIMreadfailure, REG_DENIED, or a raw
-#     "+CME ERROR" text such as "SIM not inserted" - see atc.sh around
-#     'Check SIMcard and PIN status' and 'REG_DENIED'), the watchdog never
-#     restarts: with a configured pincode every restart would send
-#     AT+CPIN="..." again, and a wrong PIN burns SIM PIN attempts until the
-#     SIM is PUK-locked. It logs this once per episode. Matching is a
-#     case-insensitive substring test for pin, puk, sim or denied in the
-#     error codes; that mapping is an assumption taken from the atc.sh
-#     revision pinned in install.sh and is not verified on hardware.
+#     proto_notify_error + proto_block_restart for a PIN/PUK/registration
+#     problem (PINmissing, PINerror - which atc.sh also uses for SIM PUK and
+#     other CPIN states - REG_DENIED, or a raw "+CME ERROR" text such as
+#     "SIM not inserted"; see atc.sh around 'Check SIMcard and PIN status' and
+#     'REG_DENIED'), the watchdog never restarts: with a configured pincode
+#     every restart would send AT+CPIN="..." again, and a wrong PIN burns SIM
+#     PIN attempts until the SIM is PUK-locked. It logs this once per episode.
+#     Matching is a case-insensitive substring test for pin, puk, password,
+#     denied or "not inserted" in the error codes, so an unknown PIN-related
+#     text (e.g. a raw "SIM PIN required" or "incorrect password") still
+#     blocks: the mapping is an assumption taken from the atc.sh revision
+#     pinned in install.sh and is not verified on hardware.
+#     SIMreadfailure and other raw CME texts without those words (e.g. "SIM
+#     busy") do restart: atc.sh raises them before any PIN is sent, a restart
+#     just re-queries AT+CPIN?, and the backoff bounds the rate.
 #
 # Deliberately no `set -e`: this is a long-running daemon and any failing
 # ifstatus/jsonfilter/uci call must degrade to "unknown", never kill it.
@@ -108,8 +113,9 @@ log() {
 	logger -t fm350-watchdog "$*"
 }
 
+# Monotonic seconds since boot: immune to NTP stepping the wall clock.
 now() {
-	date +%s
+	uptime_s
 }
 
 # Always succeeds; prints nothing for an unset option.
@@ -217,6 +223,11 @@ sync_device() {
 	resolved=$(fm350_find_at_device) || return 0
 	[ "$resolved" = "$dev" ] && return 0
 	[ -e "$dev" ] && fm350_is_at_port "$dev" && return 0
+	# uci commit would also commit the admin's unrelated staged changes.
+	if [ -n "$(uci -q changes network)" ]; then
+		log "network has uncommitted changes; not updating network.$interface.device ($dev -> $resolved)"
+		return 0
+	fi
 	log "AT port changed: network.$interface.device $dev -> $resolved"
 	if uci set "network.$interface.device=$resolved" && uci commit network; then
 		reload_network
@@ -237,14 +248,14 @@ interface_errors() {
 	ifstatus "$interface" 2>/dev/null | jsonfilter -e '@.errors[*].code' 2>/dev/null || true
 }
 
-# True (0) if netifd reports a SIM/PIN/registration-denied error (atc.sh's
-# deliberate proto_block_restart states, see the header comment).
+# True (0) if netifd reports a PIN/PUK/registration-denied/no-SIM error
+# (atc.sh's deliberate proto_block_restart states, see the header comment).
 sim_blocked() {
 	errs=$(interface_errors) || errs=""
 	[ -n "$errs" ] || return 1
 	errs=$(printf '%s' "$errs" | tr '[:upper:]' '[:lower:]') || errs=""
 	case "$errs" in
-	*pin* | *puk* | *sim* | *denied*) return 0 ;;
+	*pin* | *puk* | *password* | *denied* | *"not inserted"*) return 0 ;;
 	esac
 	return 1
 }
@@ -262,7 +273,7 @@ restart_interface() {
 
 # tick() - one decision-and-maybe-act cycle. Reads/writes the globals
 # pending_since, up_since, backoff, next_allowed_restart (all seconds since
-# the epoch, 0 meaning "not currently tracked/no backoff yet") and
+# boot, 0 meaning "not currently tracked/no backoff yet") and
 # sim_block_logged (0/1).
 tick() {
 	n=$(now) || n=0

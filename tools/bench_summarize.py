@@ -107,6 +107,11 @@ def _mb(nbytes: float | None) -> str:
     return f"{nbytes / 1e6:.2f}" if nbytes is not None else "n/a"
 
 
+def _cell(text: str) -> str:
+    """One Markdown table cell: '|' escaped, line breaks flattened to spaces."""
+    return text.replace("|", "\\|").replace("\r", " ").replace("\n", " ")
+
+
 _HEADER = (
     "| Mode | Direction | Protocol | Mbit/s | MB transferred | Retransmits | UDP loss "
     "| CPU % (fm350mac) | utun MB | Error |"
@@ -172,7 +177,7 @@ def summarize(results_dir: Path) -> str:
         lines.append("| (no results found) | | | | | | | | | |")
     else:
         for row in rows:
-            lines.append("| " + " | ".join(row) + " |")
+            lines.append("| " + " | ".join(_cell(c) for c in row) + " |")
         total_utun_str = _mb(total_utun) if any_utun else "n/a"
         lines.append(f"| **total** | | | | {_mb(total_bytes)} | | | | {total_utun_str} | |")
 

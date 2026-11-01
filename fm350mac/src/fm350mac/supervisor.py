@@ -21,6 +21,7 @@ from enum import Enum, auto
 
 from . import at as at_mod
 from .bridge import Bridge
+from .helper_client import HelperConnectionLost
 from .netconfig import NetConfig
 
 _log = logging.getLogger(__name__)
@@ -391,15 +392,34 @@ class Supervisor:
     def _note_ip(self, ip: str) -> None:
         if self.current_ip is not None and ip != self.current_ip:
             _log.warning("IP changed: %s -> %s", self.current_ip, ip)
-            self.stats.ip_changes += 1
             try:
-                self.net.reconfigure_address(self.ifname, self.current_ip, ip)
+                try:
+                    self.net.reconfigure_address(self.ifname, self.current_ip, ip)
+                except HelperConnectionLost:
+                    raise
+                except Exception:
+                    # A half-applied change (old address deleted, new one not added) would fail
+                    # every retry at the delete, so set the new address outright.
+                    _log.exception("failed to reconfigure utun address; setting it afresh")
+                    self.net.configure_interface(self.ifname, ip)
+            except HelperConnectionLost as exc:
+                # The helper connection is gone (it undoes our routes on close): end the session.
+                _log.exception("helper connection lost while reconfiguring the utun address")
+                self._fail_bridge(f"helper connection lost: {exc}")
+                return
             except Exception:
-                _log.exception("failed to reconfigure utun address")
+                # Keep the old IP: the next poll sees the change again and retries.
+                _log.exception("failed to set the utun address")
+                return
+            self.stats.ip_changes += 1  # once per applied change, not per retry
             self.bridge.set_our_ip(ip)
             if self._refresh_dns is not None:
                 try:
                     self._refresh_dns(ip)
+                except HelperConnectionLost as exc:
+                    _log.exception("helper connection lost while refreshing DNS")
+                    self._fail_bridge(f"helper connection lost: {exc}")
+                    return
                 except Exception:
                     _log.exception("failed to refresh DNS after IP change")
         self.current_ip = ip

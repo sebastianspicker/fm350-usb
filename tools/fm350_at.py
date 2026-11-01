@@ -21,8 +21,12 @@ if _FM350MAC_SRC.is_dir():
 
 try:
     from fm350mac.at import AtPort
+    from fm350mac.redact import redact_pin
 except ImportError:
     AtPort = None
+
+    def redact_pin(text: str) -> str:  # standalone pyusb fallback: mask CPIN/CLCK/CPWD arguments
+        return re.sub(r'(?i)(\+(?:CPIN2?|CLCK|CPWD)[ \t]*=)[^\r\n]*', r'\1"REDACTED"', text)
 
 
 def _main_fm350mac(args) -> None:
@@ -33,8 +37,8 @@ def _main_fm350mac(args) -> None:
     )
     try:
         for cmd in args.commands:
-            print(f">>> {cmd}")
-            print(port.command(cmd))
+            print(f">>> {redact_pin(cmd)}")
+            print(redact_pin(port.command(cmd)))
     finally:
         port.close()
 
@@ -100,8 +104,8 @@ def _main_standalone(args) -> None:
     try:
         drain(ep_in)  # discard unsolicited output
         for cmd in args.commands:
-            print(f">>> {cmd}")
-            print(send(ep_out, ep_in, cmd))
+            print(f">>> {redact_pin(cmd)}")
+            print(redact_pin(send(ep_out, ep_in, cmd)))
     finally:
         usb.util.release_interface(dev, iface_num)
         usb.util.dispose_resources(dev)
@@ -117,9 +121,20 @@ def _has_final_result(text: str) -> bool:
     return _FINAL_RESULT_RE.search(text.replace("\r\n", "\n").replace("\r", "\n")) is not None
 
 
+def _iface_arg(value: str) -> int:
+    """argparse ``type=``: an interface number in 0..31 (same bound as ``fm350mac at --iface``)."""
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {value!r}") from None
+    if not 0 <= number <= 31:
+        raise argparse.ArgumentTypeError(f"{number} is out of range (0..31)")
+    return number
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--iface", type=int, help="override AT interface number")
+    ap.add_argument("--iface", type=_iface_arg, help="override AT interface number (0..31)")
     ap.add_argument("commands", nargs="+")
     args = ap.parse_args()
     if AtPort is not None:

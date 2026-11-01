@@ -183,8 +183,13 @@ uci -q delete mwan3.fm350_install_state || true
 uci -q commit mwan3 || true
 
 if [ -f /etc/hotplug.d/usb/50-fm350_driver ]; then
-	log "removing /etc/hotplug.d/usb/50-fm350_driver"
-	rm -f /etc/hotplug.d/usb/50-fm350_driver
+	# Ours: the marker, or (older copies without it) our logger tag.
+	if grep -q -e 'fm350-usb: installed by' -e 'logger -t fm350-driver' /etc/hotplug.d/usb/50-fm350_driver; then
+		log "removing /etc/hotplug.d/usb/50-fm350_driver"
+		rm -f /etc/hotplug.d/usb/50-fm350_driver
+	else
+		log "keeping /etc/hotplug.d/usb/50-fm350_driver (not installed by fm350-usb)"
+	fi
 fi
 
 if [ -f /usr/bin/fm350-status ]; then

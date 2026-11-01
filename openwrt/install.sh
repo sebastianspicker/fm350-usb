@@ -287,9 +287,18 @@ fi
 if device=$(fm350_find_at_device); then
 	log "AT command device detected: $device"
 else
-	device=/dev/ttyUSB4
-	log "WARNING: could not detect the FM350 AT tty from sysfs (is it plugged in?)."
-	log "WARNING: defaulting network.wwan.device to '$device'; edit /etc/config/network if wrong."
+	device=$(uci -q get network.wwan.device 2>/dev/null) || device=""
+	case "$device" in
+	/dev/tty*)
+		log "WARNING: could not detect the FM350 AT tty from sysfs (is it plugged in?)."
+		log "WARNING: keeping the configured network.wwan.device '$device'."
+		;;
+	*)
+		device=/dev/ttyUSB4
+		log "WARNING: could not detect the FM350 AT tty from sysfs (is it plugged in?)."
+		log "WARNING: defaulting network.wwan.device to '$device'; edit /etc/config/network if wrong."
+		;;
+	esac
 fi
 
 # --- uci helpers --------------------------------------------------------------
@@ -656,7 +665,10 @@ kernel_lt_6_6() {
 
 if kernel_lt_6_6; then
 	log "kernel $(uname -r) < 6.6: installing hotplug driver for option1 new_id binding"
-	if [ "$dry_run" -eq 1 ]; then
+	# Ours: the marker, or (older copies without it) our logger tag.
+	if [ -e /etc/hotplug.d/usb/50-fm350_driver ] && ! grep -q -e 'fm350-usb: installed by' -e 'logger -t fm350-driver' /etc/hotplug.d/usb/50-fm350_driver; then
+		log "keeping existing /etc/hotplug.d/usb/50-fm350_driver (not installed by fm350-usb)"
+	elif [ "$dry_run" -eq 1 ]; then
 		log "[dry-run] would copy $FILES_DIR/etc/hotplug.d/usb/50-fm350_driver to /etc/hotplug.d/usb/50-fm350_driver"
 	else
 		mkdir -p /etc/hotplug.d/usb

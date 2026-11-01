@@ -14,6 +14,8 @@
 # Loopback mode (no SIM, no USB device; today's dry run against the
 # in-process fake modem, see fm350mac/src/fm350mac/loopback.py):
 #   tools/bench-throughput.sh --loopback
+# `up --loopback` always uses the sync bridge and ignores --io, so loopback
+# mode runs once (labelled "sync (loopback)") and --modes does not apply.
 #
 # --dry-run prints the plan (every command that would run) without
 # touching the system, in either mode.
@@ -29,12 +31,14 @@ SUMMARIZE="$SCRIPT_DIR/bench_summarize.py"
 VENV_PYTHON="$REPO_ROOT/fm350mac/.venv/bin/python3"
 
 LOOPBACK_PEER="198.51.100.1"
+LOOPBACK_MODES=(sync)  # `up --loopback` has no async bridge
 
 # Estimates above this many bytes need --yes (or an interactive confirmation).
 CONFIRM_THRESHOLD_BYTES=50000000
 
 # -- defaults, overridable on the command line -------------------------------
 MODES=(async)
+MODES_GIVEN=0
 TESTS=(down up)
 MAX_BYTES_ARG="5M"
 MAX_BYTES=5000000
@@ -77,13 +81,16 @@ Options:
                        run time is derived from --max-bytes so it stays within the cap
                        (iperf3 ignores -n for UDP, so a rate above --max-bytes * 8 per
                        second is lowered to that)
-  --modes LIST         comma-separated bridge modes to test (default: async)
+  --modes LIST         comma-separated bridge modes to test (default: async);
+                       ignored with --loopback (always the sync bridge)
   --yes                don't ask for confirmation when the estimated worst-case
-                       data use is above 50 MB
+                       data use is above 50 MB, nor for --full-tunnel
   --full-tunnel        route the Mac's DEFAULT route through the tunnel
                        (fm350mac up --default-route). All Mac traffic then uses
-                       the SIM; background syncs/updates can eat the data plan
-  --results-dir DIR    where to write results (default: tools/bench-results/<timestamp>-<pid>-<kind>)
+                       the SIM; background syncs/updates can eat the data plan.
+                       Always asks for a typed 'yes' (or --yes), whatever the size
+  --results-dir DIR    where to write results (default: tools/bench-results/<timestamp>-<pid>-<kind>);
+                       refused if it already exists and is not empty
   --ping-count N       --loopback only: pings per bridge mode (default: 500)
   --ping-interval SEC  --loopback only: ping -i value (default: 0.01)
   --ping-size BYTES    --loopback only: ping -s value (default: 1400)
@@ -99,8 +106,8 @@ server really points at the tunnel's utun and that `up` is still alive,
 and it records the bytes that went over the utun during each test.
 
 Loopback mode instead pings the fake modem's peer (198.51.100.1) and
-reports loss, average RTT and packets/s per bridge mode -- no iperf3 or
-SIM needed.
+reports loss, average RTT and packets/s for the sync bridge (the only one
+`up --loopback` has) -- no iperf3 or SIM needed.
 EOF
 }
 
@@ -137,6 +144,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --modes)
             IFS=',' read -r -a MODES <<< "$2"
+            MODES_GIVEN=1
             shift 2
             ;;
         --yes) YES=1; shift ;;
@@ -167,6 +175,10 @@ for mode in "${MODES[@]}"; do
         exit 2
     fi
 done
+
+if [[ "$LOOPBACK" -eq 1 && "$MODES_GIVEN" -eq 1 ]]; then
+    echo "WARNING: --modes is ignored with --loopback (\`up --loopback\` always uses the sync bridge)" >&2
+fi
 
 if [[ "${#TESTS[@]}" -eq 0 ]]; then
     echo "--tests must include down, up or udp" >&2
@@ -225,7 +237,9 @@ else
     fi
 fi
 
+RESULTS_DIR_IS_DEFAULT=0
 if [[ -z "$RESULTS_DIR" ]]; then
+    RESULTS_DIR_IS_DEFAULT=1
     kind="iperf3"
     [[ "$LOOPBACK" -eq 1 ]] && kind="loopback"
     RESULTS_DIR="$SCRIPT_DIR/bench-results/$(date '+%Y%m%d-%H%M%S')-$$-$kind"
@@ -636,10 +650,28 @@ confirm_budget() {
     return 1
 }
 
+# --full-tunnel moves the Mac's default route onto the SIM: ask for explicit
+# consent whatever the size estimate. Returns 1 if the run must not proceed.
+confirm_full_tunnel() {
+    [[ "$FULL_TUNNEL" -eq 1 ]] || return 0
+    if [[ "$YES" -eq 1 ]]; then
+        return 0
+    fi
+    if [[ -t 0 ]]; then
+        local answer=""
+        read -r -p "--full-tunnel sends ALL of this Mac's traffic over the SIM. Type 'yes' to continue: " answer || true
+        [[ "$answer" == "yes" ]] && return 0
+        log "aborted"
+        return 1
+    fi
+    log "ERROR: --full-tunnel needs explicit consent; pass --yes to proceed"
+    return 1
+}
+
 capture_status() {
     local out="$1"
     if [[ "$STATUS_JSON_SUPPORTED" -eq 1 ]]; then
-        "$FM350MAC" status --json > "$out" 2>&1 || true
+        "$FM350MAC" status --json --redact > "$out" 2>&1 || true
     fi
 }
 
@@ -647,7 +679,7 @@ start_up_real() {
     local mode="$1"
     DEFAULT_ROUTE_BEFORE="$(default_route_signature)"
     UTUNS_BEFORE="$(list_utuns)"
-    local -a cmd=("$FM350MAC" up --apn "$APN" --io "$mode")
+    local -a cmd=("$FM350MAC" up --apn "$APN" --io "$mode" --redact)
     if [[ "$FULL_TUNNEL" -eq 1 ]]; then
         cmd+=(--default-route)
     else
@@ -759,9 +791,10 @@ parse_ping_log() {
 
 run_loopback_mode() {
     local -a summary_rows=()
-    for mode in "${MODES[@]}"; do
+    # `up --loopback` is always the sync bridge (it ignores --io): run once.
+    for mode in "${LOOPBACK_MODES[@]}"; do
         UTUNS_BEFORE="$(list_utuns)"
-        local -a cmd=("$FM350MAC" up --apn "$APN" --loopback --io "$mode")
+        local -a cmd=("$FM350MAC" up --apn "$APN" --loopback --redact)
         local up_log="$RESULTS_DIR/up-loopback-$mode.log"
         log "starting: ${cmd[*]}"
         BENCH_STARTED=1
@@ -813,7 +846,7 @@ run_loopback_mode() {
         else
             pps="n/a"
         fi
-        summary_rows+=("| $mode | ${PING_TRANSMITTED:-n/a} | ${PING_RECEIVED:-n/a} | ${PING_LOSS_PCT:-n/a}% | ${PING_AVG_MS:-n/a} | $pps |")
+        summary_rows+=("| sync (loopback) | ${PING_TRANSMITTED:-n/a} | ${PING_RECEIVED:-n/a} | ${PING_LOSS_PCT:-n/a}% | ${PING_AVG_MS:-n/a} | $pps |")
     done
 
     {
@@ -834,22 +867,21 @@ print_plan() {
          "the status-before/-after capture below runs only if it's supported"
     echo
     if [[ "$LOOPBACK" -eq 1 ]]; then
-        for mode in "${MODES[@]}"; do
-            echo "mode=$mode:"
-            echo "  $FM350MAC up --apn $APN --loopback --io $mode"
-            echo "  wait for the utun (from the 'utun interface:' log line) and the route to $LOOPBACK_PEER (up to ${UP_WAIT_TIMEOUT}s)"
-            echo "  ping -i $PING_INTERVAL -s $PING_SIZE -c $PING_COUNT $LOOPBACK_PEER"
-            echo "  kill -INT <up pid>; verify utun and the $LOOPBACK_PEER host route are gone"
-            echo
-        done
-        echo "Then: write $RESULTS_DIR/loopback-summary.md (loss/RTT/packets-per-second per mode)."
+        echo "mode=sync (loopback; the only bridge \`up --loopback\` has, --modes does not apply):"
+        echo "  $FM350MAC up --apn $APN --loopback --redact"
+        echo "  wait for the utun (from the 'utun interface:' log line) and the route to $LOOPBACK_PEER (up to ${UP_WAIT_TIMEOUT}s)"
+        echo "  ping -i $PING_INTERVAL -s $PING_SIZE -c $PING_COUNT $LOOPBACK_PEER"
+        echo "  kill -INT <up pid>; verify utun and the $LOOPBACK_PEER host route are gone"
+        echo
+        echo "Then: write $RESULTS_DIR/loopback-summary.md (loss/RTT/packets-per-second, row 'sync (loopback)')."
     else
         local server_ip="${SERVER_IP:-$SERVER}"
         local route_arg="--route-host $server_ip"
         if [[ "$FULL_TUNNEL" -eq 1 ]]; then
             route_arg="--default-route"
             echo "WARNING: --full-tunnel moves the Mac's whole default route onto the SIM for the" \
-                 "duration of the run; every other app's traffic is billed to it too."
+                 "duration of the run; every other app's traffic is billed to it too." \
+                 "A real run asks for a typed 'yes' (or --yes)."
             echo
         fi
         echo "Pre-flight: $(describe_estimate)"
@@ -859,8 +891,8 @@ print_plan() {
         echo
         for mode in "${MODES[@]}"; do
             echo "mode=$mode:"
-            echo "  $FM350MAC status --json > status-before-$mode.json   # if --json is supported; before 'up'"
-            echo "  $FM350MAC up --apn $APN --io $mode $route_arg"
+            echo "  $FM350MAC status --json --redact > status-before-$mode.json   # if --json is supported; before 'up'"
+            echo "  $FM350MAC up --apn $APN --io $mode $route_arg --redact"
             echo "  wait for the utun (from the 'utun interface:' log line) and the route to $server_ip (up to ${UP_WAIT_TIMEOUT}s)"
             local spec direction proto
             for spec in $(test_specs); do
@@ -879,7 +911,7 @@ print_plan() {
                 echo "  iperf3 -c $server_ip -p $PORT -i 0.1 $cap --json$flags   # $proto $direction"
             done
             echo "  kill -INT <up pid>; verify utun and the default route are restored"
-            echo "  $FM350MAC status --json > status-after-$mode.json   # if --json is supported; after teardown"
+            echo "  $FM350MAC status --json --redact > status-after-$mode.json   # if --json is supported; after teardown"
             echo
         done
         echo "Then: python3 $SUMMARIZE $RESULTS_DIR > $RESULTS_DIR/SUMMARY.md"
@@ -927,7 +959,15 @@ if [[ "$LOOPBACK" -ne 1 ]]; then
         log "WARNING: --full-tunnel: the Mac's DEFAULT route moves onto the SIM for this run." \
             "ALL traffic (updates, sync, backups) is billed to it. Use only on an unmetered SIM."
     fi
+    confirm_full_tunnel || exit 2
     confirm_budget || exit 2
+fi
+
+# Never reuse a results dir: stale *.json/sim-*.txt would end up in SUMMARY.md.
+# (The default path is freshly timestamped, so it can't exist.)
+if [[ "$RESULTS_DIR_IS_DEFAULT" -ne 1 && -d "$RESULTS_DIR" ]] && [[ -n "$(ls -A -- "$RESULTS_DIR")" ]]; then
+    echo "refusing: --results-dir $RESULTS_DIR already exists and is not empty; pick a new directory" >&2
+    exit 2
 fi
 
 mkdir -p "$RESULTS_DIR"

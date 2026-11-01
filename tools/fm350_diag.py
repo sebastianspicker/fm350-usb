@@ -65,7 +65,8 @@ try:
     from fm350mac import at as at_mod
     from fm350mac import cellinfo
     from fm350mac.cli import _parse_int_tuple  # reuse, don't reinvent
-    from fm350mac.redact import _GTCCINFO_ROW_RE, _REG_LOCATION_RE
+    from fm350mac.redact import REDACTED
+    from fm350mac.redact import redact_text as _fm350mac_redact
     from fm350mac.usb_async import LIBUSB_ERROR_ACCESS, LIBUSB_ERROR_BUSY, LibusbNotFound, UsbError, UsbNoDevice
 except ImportError:
     print("fm350mac package not importable -- run from within the fm350-usb repo", file=sys.stderr)
@@ -320,28 +321,11 @@ def command_level(cmd: str) -> int | None:
 # IMEI/IMSI/ICCID: bare 14-22 digit runs, optionally with one trailing hex pad
 # digit (ICCIDs are often padded with "F").
 _BARE_ID_RE = re.compile(r"\b\d{14,22}[0-9A-Fa-f]?\b")
-# By context: whatever follows these labels is an identifier, whatever its shape.
-_ID_CONTEXT_RE = re.compile(r"(\+(?:ICCID|CCID|CIMI|CGSN)\s*:\s*)[0-9A-Za-z]+")
-_CNUM_RE = re.compile(r'(\+CNUM:\s*(?:"[^"]*")?\s*,\s*)"[^"]*"')
-
-
-def redact_gtccinfo(text: str) -> str:
-    """Mask the TAC and cell-id fields of any +GTCCINFO row (reuses cli.py's
-    row regex -- same field layout, just a different replacement token).
-    """
-    return "\n".join(_GTCCINFO_ROW_RE.sub(r"\1<redacted>\2<redacted>\3", line) for line in text.splitlines())
 
 
 def redact_text(text: str) -> str:
-    """Mask IMEI/IMSI/ICCID, GTCCINFO TAC/cell-id, and CEREG/C5GREG quoted tac/ci."""
-    text = redact_gtccinfo(text)
-    # fm350mac's regex: both the AT+CEREG? answer (<n>,<stat>,...) and the
-    # unsolicited +CEREG/+C5GREG form (<stat>,...) that AT+CEREG=3 enables.
-    text = _REG_LOCATION_RE.sub(r'\1"<redacted>"\2"<redacted>"', text)
-    text = _ID_CONTEXT_RE.sub(r"\1<redacted>", text)
-    text = _CNUM_RE.sub(r'\1"<redacted>"', text)
-    text = _BARE_ID_RE.sub("<redacted>", text)
-    return text
+    """fm350mac's redactor, plus bare 14-22 digit IDs anywhere in a line."""
+    return _BARE_ID_RE.sub(REDACTED, _fm350mac_redact(text))
 
 
 # --- Session: the safety-gated AT channel --------------------------------------
@@ -414,7 +398,14 @@ class Session:
             raise SafetyError(f"{cmd!r} requires level {level}, this session is level {self.level}")
         if level >= 1:
             self._journal_writer().append({"ts": self._clock(), "level": level, "cmd": cmd, "phase": "intent"})
-        response = self.transport.command(cmd, timeout=timeout)
+        try:
+            response = self.transport.command(cmd, timeout=timeout)
+        except at_mod.AtTimeoutError:
+            if level >= 1:  # close the intent: the command's outcome is unknown
+                self._journal_writer().append(
+                    {"ts": self._clock(), "level": level, "cmd": cmd, "phase": "result", "response": "timeout"}
+                )
+            raise
         self.sent_levels[level] = self.sent_levels.get(level, 0) + 1
         display = redact_text(response) if self.redact else response
         self.transcript.append((cmd, display))
@@ -445,7 +436,6 @@ _ADB_BACKUP_DIRS = ("nvram", "nvdata", "nvcfg", "protect_f", "protect_s", "mdota
 
 _ADB_LEVEL0_EXACT: frozenset[str] = frozenset(
     {
-        "id",
         "cat /etc/vendor_info",
         "cat /mnt/vendor/nvdata/md_cmn/dipc_config",
         "cat /mnt/vendor/nvdata/md_cmn/dipc_config.orig",
@@ -597,7 +587,7 @@ def check_oem_image(pkgver_response: str) -> Check:
 
 
 def check_dipc(dipcmode_response: str) -> Check:
-    dipc = _parse_int_tuple(dipcmode_response)
+    dipc = _parse_int_tuple(dipcmode_response, "GTDIPCMODE")
     if dipc is None:
         return Check("WARN", f"GTDIPCMODE?: unparseable response {dipcmode_response!r}")
     if dipc[0] == 1:
@@ -608,7 +598,7 @@ def check_dipc(dipcmode_response: str) -> Check:
 
 
 def check_fcc_lock(fcceffstatus_response: str, oem_image_is_dell: bool) -> Check:
-    fcc = _parse_int_tuple(fcceffstatus_response)
+    fcc = _parse_int_tuple(fcceffstatus_response, "GTFCCEFFSTATUS")
     if fcc is None or len(fcc) < 2:
         return Check("WARN", f"GTFCCEFFSTATUS?: unparseable response {fcceffstatus_response!r}")
     if fcc[1] == 1:
@@ -623,7 +613,7 @@ def check_fcc_lock(fcceffstatus_response: str, oem_image_is_dell: bool) -> Check
 
 
 def check_cfun(cfun_response: str) -> Check:
-    cfun = _parse_int_tuple(cfun_response)
+    cfun = _parse_int_tuple(cfun_response, "CFUN")
     if cfun is None:
         return Check("WARN", f"CFUN?: unparseable response {cfun_response!r}")
     if cfun[0] == 1:
@@ -645,14 +635,14 @@ def check_sim(cpin_response: str, dualsim_response: str | None = None) -> list[C
     else:
         checks.append(Check("WARN", f"SIM: not ready ({cpin_response.strip()!r})"))
     if dualsim_response is not None:
-        dualsim = _parse_int_tuple(dualsim_response)
+        dualsim = _parse_int_tuple(dualsim_response, "GTDUALSIM")
         if dualsim is not None and dualsim[0] != 0:
             checks.append(Check("WARN", f"GTDUALSIM slot {dualsim[0]} selected (expected slot 0)"))
     return checks
 
 
 def check_anttuner(anttuningen_response: str) -> Check:
-    anttuningen = _parse_int_tuple(anttuningen_response)
+    anttuningen = _parse_int_tuple(anttuningen_response, "GTANTTUNINGEN")
     if anttuningen is None:
         return Check("WARN", f"GTANTTUNINGEN?: unparseable response {anttuningen_response!r}")
     if anttuningen[0] == 0:
@@ -870,13 +860,22 @@ def write_report(out_dir: Path, session: Session, title: str, checks: list[Check
     session.write_transcript()
 
 
-def _print_suggestions(checks: list[Check]) -> None:
+def _console(text: str, redact: bool) -> str:
+    return redact_text(text) if redact else text
+
+
+def _print_checks(checks: list[Check], redact: bool) -> None:
+    for c in checks:
+        print(_console(f"[{c.level}] {c.message}", redact))
+
+
+def _print_suggestions(checks: list[Check], redact: bool = True) -> None:
     worst = [c for c in checks if c.level == "FAIL"] or [c for c in checks if c.level == "WARN"]
     if not worst:
         return
     print("\nSuggested next step:")
     for c in worst:
-        print(f"- {c.message}")
+        print(_console(f"- {c.message}", redact))
 
 
 # --- read ----------------------------------------------------------------------
@@ -991,21 +990,24 @@ def _run_adb_read_checks(adb: Adb, out_dir: Path, redact: bool = True) -> list[C
     if not adb.available():
         return [Check("INFO", "adb not found on PATH; skipping ADB checks")]
     checks: list[Check] = []
-    devices_output = adb.devices()
-    checks.append(check_adb_device_state(devices_output))
-    if "\tdevice" not in devices_output:
-        return checks
     def clean(text: str) -> str:
         return redact_text(text) if redact else text
 
-    vendor_info = clean(adb.run("cat /etc/vendor_info"))
-    checks.append(Check("INFO", f"vendor_info: {vendor_info.strip()}"))
-    dipc_text = adb.run("cat /mnt/vendor/nvdata/md_cmn/dipc_config")
-    dipc_config = parse_dipc_config(dipc_text)
-    if dipc_config is not None:
-        checks.append(Check("INFO", f"dipc_config: {dipc_config}"))
-    logread = clean(adb.run("logread | grep -E 'MIPC_NW_RADIO_STATE|NW_REGISTER_STATE|IMEI CHECK' | tail -n 30"))
-    checks.append(check_radio_state(logread))
+    try:
+        devices_output = adb.devices()
+        checks.append(check_adb_device_state(devices_output))
+        if "\tdevice" not in devices_output:
+            return checks
+        vendor_info = clean(adb.run("cat /etc/vendor_info"))
+        checks.append(Check("INFO", f"vendor_info: {vendor_info.strip()}"))
+        dipc_text = adb.run("cat /mnt/vendor/nvdata/md_cmn/dipc_config")
+        dipc_config = parse_dipc_config(dipc_text)
+        if dipc_config is not None:
+            checks.append(Check("INFO", f"dipc_config: {dipc_config}"))
+        logread = clean(adb.run("logread | grep -E 'MIPC_NW_RADIO_STATE|NW_REGISTER_STATE|IMEI CHECK' | tail -n 30"))
+        checks.append(check_radio_state(logread))
+    except AdbError as exc:
+        checks.append(Check("WARN", f"adb failed: {exc}"))
     return checks
 
 
@@ -1032,9 +1034,8 @@ def cmd_read(
             adb = adb_factory() if adb_factory else Adb()
             adb_checks = _run_adb_read_checks(adb, out_dir, redact=session.redact)
         checks = _diagnose(snapshot, samples, adb_checks)
-        for check in checks:
-            print(f"[{check.level}] {check.message}")
-        _print_suggestions(checks)
+        _print_checks(checks, session.redact)
+        _print_suggestions(checks, session.redact)
         write_report(out_dir, session, "fm350_diag read", checks)
         return 1 if any(c.level in ("WARN", "FAIL") for c in checks) else 0
     finally:
@@ -1095,7 +1096,7 @@ def _cereg_mode(response: str) -> int:
     ``_parse_int_tuple``: it returns None as soon as the quoted tac/ci fields
     of a ``<n>=2/3`` response appear, which would "restore" 2 or 3 as 0.
     """
-    match = re.search(r"^\+CEREG:\s*([0-5])\b", response, re.MULTILINE)
+    match = re.search(r"^\+CEREG:\s*([0-5])\s*,\s*\d", response, re.MULTILINE)
     return int(match.group(1)) if match else 0
 
 
@@ -1125,7 +1126,7 @@ def cmd_volatile(
         snapshot = _collect_snapshot(session)
         before_samples = _collect_samples(session, args.duration, args.interval, sleep, monotonic)
 
-        cmee = _parse_int_tuple(snapshot.get("cmee", ""))
+        cmee = _parse_int_tuple(snapshot.get("cmee", ""), "CMEE")
         orig_cmee = cmee[0] if cmee and cmee[0] in (0, 1, 2) else None
         cmee_note: Check | None = None
         if orig_cmee is None:
@@ -1153,11 +1154,11 @@ def cmd_volatile(
                 # SIM (docs/bench-log.md). Report it and carry on.
                 checks.append(Check("WARN", f"AT+COPS=? scan rejected: {_final_result_code(exc.response)}"))
             else:
-                operator_count = len(re.findall(r"\(\d+,", scan_response))
+                operator_count = len(re.findall(r'\(\d+\s*,\s*"', scan_response))
                 checks.append(Check("INFO", f"AT+COPS=? found {operator_count} operator(s)"))
 
         if not args.skip_cfun:
-            orig_cfun = _parse_int_tuple(snapshot["cfun"])
+            orig_cfun = _parse_int_tuple(snapshot["cfun"], "CFUN")
             orig_cfun_n = orig_cfun[0] if orig_cfun else None
             if orig_cfun_n not in (1, 4):
                 # Only cycle what we can put back: AT+CFUN=1/4 are the allowlisted restores.
@@ -1196,12 +1197,22 @@ def cmd_volatile(
         elif args.usb_reset:
             if session.transport.usb_reset():
                 session.transport.close()
-                if transport_factory is not None:
-                    session.rebind(transport_factory())
-                checks.append(Check("OK", "issued a USB device reset"))
+                if transport_factory is None:
+                    checks.append(Check("OK", "issued a USB device reset"))
+                else:
+                    # A device reset need not drop the modem off the bus (unlike
+                    # AT+CFUN=15), so skip the disappear/reappear steps and just
+                    # poll until the port opens again.
+                    new_transport = _wait_for_reenumeration(
+                        transport_factory, 60.0, sleep=sleep, monotonic=monotonic, usb_present_fn=None
+                    )
+                    if new_transport is None:
+                        checks.append(Check("WARN", "modem did not come back within 60s after the USB reset"))
+                    else:
+                        session.rebind(new_transport)
+                        checks.append(Check("OK", "issued a USB device reset"))
 
-        for c in checks:
-            print(f"[{c.level}] {c.message}")
+        _print_checks(checks, session.redact)
         write_report(out_dir, session, "fm350_diag volatile", checks)
         return 1 if any(c.level in ("WARN", "FAIL") for c in checks) else 0
     finally:
@@ -1302,11 +1313,11 @@ def run_experiment(
 
 def _run_fmode(session: Session, out_dir: Path, measure, reenumerate):
     def parse_orig(resp: str):
-        t = _parse_int_tuple(resp)
+        t = _parse_int_tuple(resp, "GTFMODE")
         return (t[0], t[1]) if t and len(t) >= 2 else None
 
     def parse_verify(resp: str):
-        t = _parse_int_tuple(resp)
+        t = _parse_int_tuple(resp, "GTFMODE")
         return (t[0], t[1]) if t and len(t) >= 2 else None
 
     return run_experiment(
@@ -1328,11 +1339,11 @@ def _run_fmode(session: Session, out_dir: Path, measure, reenumerate):
 
 def _run_anttuner(session: Session, out_dir: Path, measure, reenumerate):
     def parse_orig(resp: str):
-        t = _parse_int_tuple(resp)
+        t = _parse_int_tuple(resp, "GTANTTUNINGEN")
         return t[0] if t else None
 
     def parse_verify(resp: str):
-        t = _parse_int_tuple(resp)
+        t = _parse_int_tuple(resp, "GTANTTUNINGEN")
         return t[0] if t else None
 
     return run_experiment(
@@ -1410,7 +1421,7 @@ def _experiment_fcc_unlock_dell(
         return [Check("FAIL", "refusing: firmware is not the Dell _5025 OEM image (use --force-oem to override)")]
 
     fcc_resp = session.send("AT+GTFCCEFFSTATUS?")
-    fcc = _parse_int_tuple(fcc_resp)
+    fcc = _parse_int_tuple(fcc_resp, "GTFCCEFFSTATUS")
     readable = fcc is not None and len(fcc) >= 2
     if not readable and not even_if_unlocked:
         # The unlock is one-way: don't send it blind (--even-if-unlocked overrides).
@@ -1434,7 +1445,7 @@ def _experiment_fcc_unlock_dell(
     response = fcc_unlock_response(challenge)
     session.send(f"AT+GTFCCLOCKVER={response}")
     new_fcc_resp = session.send("AT+GTFCCEFFSTATUS?")
-    new_fcc = _parse_int_tuple(new_fcc_resp)
+    new_fcc = _parse_int_tuple(new_fcc_resp, "GTFCCEFFSTATUS")
     if new_fcc is not None and len(new_fcc) >= 2 and new_fcc[1] == 1:
         return [Check("OK", f"FCC status after unlock attempt: {new_fcc}")]
     return [Check("WARN", f"FCC status after unlock attempt: {new_fcc_resp.strip()!r} (still locked?)")]
@@ -1531,7 +1542,7 @@ def cmd_experiment(
         )
         return 1
     except Exception as exc:
-        print(f"experiment failed{restored_note}: {exc}")
+        print(_console(f"experiment failed{restored_note}: {exc}", session.redact))
         write_report(
             out_dir,
             session,
@@ -1545,10 +1556,9 @@ def cmd_experiment(
     if before or after:
         checks.append(Check("INFO", f"before: {_summarize_samples(before)}"))
         checks.append(Check("INFO", f"after: {_summarize_samples(after)}"))
-    for c in checks:
-        print(f"[{c.level}] {c.message}")
+    _print_checks(checks, session.redact)
     write_report(out_dir, session, f"fm350_diag experiment {args.name}", checks)
-    return 0
+    return 1 if any(c.level in ("WARN", "FAIL") for c in checks) else 0
 
 
 # --- backup ------------------------------------------------------------------
@@ -1573,8 +1583,12 @@ def cmd_backup(args: argparse.Namespace, *, adb_factory: Callable[[], Adb] | Non
     if not adb.available():
         print("adb not found on PATH", file=sys.stderr)
         return 2
-    dest = Path(args.dest) if args.dest else Path("backups") / f"fm350-{datetime.now().strftime('%Y%m%d-%H%M')}"
-    dest.mkdir(parents=True, exist_ok=True)
+    dest = Path(args.dest) if args.dest else Path("backups") / f"fm350-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    try:
+        dest.mkdir(parents=True, exist_ok=False)
+    except FileExistsError:
+        print(f"refusing: {dest} already exists; pass a new --dest", file=sys.stderr)
+        return 2
     print("WARNING: this backup contains the IMEI and RF calibration of this exact unit.")
     print("Never share it, and never restore it onto another unit.")
     for name in _ADB_BACKUP_DIRS:
@@ -1718,9 +1732,17 @@ def cmd_dipc_status(
             checks.append(check_dipc(session.send("AT+GTDIPCMODE?")))
         finally:
             session.transport.close()
-    for c in checks:
-        print(f"[{c.level}] {c.message}")
+    _print_checks(checks, getattr(args, "redact", True))
     return 1 if any(c.level in ("WARN", "FAIL") for c in checks) else 0
+
+
+def _dipc_try_restore(adb: Adb, orig_name: str, expected: str) -> bool:
+    """Put the pre-change dipc_config back; True only if the readback matches."""
+    try:
+        adb.run(_dipc_restore_cmd(orig_name), level=3)
+        return adb.run("cat " + _DIPC_PATH, level=0) == expected
+    except AdbError:
+        return False
 
 
 def cmd_dipc_set_dual(
@@ -1801,13 +1823,18 @@ def cmd_dipc_set_dual(
         print("refusing: pushed dipc_config.new doesn't match DUAL_CONTENT byte for byte; nothing changed", file=sys.stderr)
         return 3
 
-    adb.run(_DIPC_INSTALL_NEW, level=3)
-    adb.run(_DIPC_RM_NEW, level=3)
-    readback = adb.run("cat " + _DIPC_PATH, level=0)
+    try:
+        adb.run(_DIPC_INSTALL_NEW, level=3)
+        adb.run(_DIPC_RM_NEW, level=3)
+        readback = adb.run("cat " + _DIPC_PATH, level=0)
+    except AdbError as exc:
+        if _dipc_try_restore(adb, orig_name, current_text):
+            print(f"adb failed during the write ({exc}); restored the pre-change content", file=sys.stderr)
+        else:
+            print("RESTORE FAILED -- inspect the module manually over adb", file=sys.stderr)
+        return 3
     if readback != DUAL_CONTENT:
-        adb.run(_dipc_restore_cmd(orig_name), level=3)
-        verify = adb.run("cat " + _DIPC_PATH, level=0)
-        if verify != current_text:
+        if not _dipc_try_restore(adb, orig_name, current_text):
             print("RESTORE FAILED -- inspect the module manually over adb", file=sys.stderr)
             return 3
         print("write to dipc_config didn't take effect; restored the pre-change content", file=sys.stderr)
@@ -1860,8 +1887,12 @@ def cmd_dipc_revert(
         print("aborted")
         return 1
 
-    adb.run(_dipc_restore_cmd(orig_name), level=3)
-    readback = adb.run("cat " + _DIPC_PATH)
+    try:
+        adb.run(_dipc_restore_cmd(orig_name), level=3)
+        readback = adb.run("cat " + _DIPC_PATH)
+    except AdbError as exc:
+        print(f"adb failed ({exc}); the restore did not complete -- inspect the module manually over adb", file=sys.stderr)
+        return 3
     if readback != orig_content:
         print("RESTORE FAILED: readback does not match the .orig file -- inspect the module manually", file=sys.stderr)
         return 3
@@ -1946,7 +1977,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_experiment.set_defaults(func=_run_experiment)
 
     p_backup = sub.add_parser("backup", help="read-only ADB NV backup (level-0 ADB)")
-    p_backup.add_argument("--dest", help="backup directory (default: backups/fm350-YYYYmmdd-HHMM/)")
+    p_backup.add_argument("--dest", help="backup directory, must not exist yet (default: backups/fm350-YYYYmmdd-HHMMSS/)")
     p_backup.add_argument("--raw", action="store_true", help="also dump every /dev/mtdblockN")
     p_backup.set_defaults(func=_run_backup)
 
@@ -2030,16 +2061,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"refused: {exc}", file=sys.stderr)
         return 2
     except (DiagError, AdbError) as exc:
-        print(str(exc), file=sys.stderr)
+        print(_console(str(exc), args.redact), file=sys.stderr)
         return 2
     except (UsbNoDevice, LibusbNotFound, at_mod.UnknownAtInterface, FileNotFoundError) as exc:
-        print(f"{args.stage}: {exc}", file=sys.stderr)
+        print(_console(f"{args.stage}: {exc}", args.redact), file=sys.stderr)
         _write_failure_report(out_dir, sessions, args.stage, exc)
         return 2
     except (at_mod.AtTimeoutError, at_mod.AtCommandError, UsbError, OSError) as exc:
         # The modem stopped answering (or, on --tty, dropped off: EIO)
         # mid-run: keep what was collected.
-        print(f"{args.stage}: {exc}", file=sys.stderr)
+        print(_console(f"{args.stage}: {exc}", args.redact), file=sys.stderr)
         _write_failure_report(out_dir, sessions, args.stage, exc)
         return 1
 

@@ -94,19 +94,34 @@ load_at_port_lib() {
 	return 1
 }
 
+# Warn only: a running, unpaused watchdog may restart the interface while we
+# query (uses $wd_iface/$wd_enabled set by check_wwan_idle).
+warn_watchdog() {
+	# Not installed (install.sh --no-watchdog): nothing can restart it.
+	uci -q get fm350_watchdog.main >/dev/null 2>&1 || return 0
+	[ "$wd_enabled" = "0" ] && return 0
+	[ -e "${FM350_WATCHDOG_PAUSE_FILE:-/tmp/fm350-watchdog.pause}" ] && return 0
+	echo "fm350-status.sh: WARNING: fm350-watchdog is not paused and may restart $wd_iface during these queries." >&2
+}
+
 # Refuse if netifd's wwan is up or connecting: atc.sh then owns the same tty,
 # our AT replies may be stolen by it, and a reply we steal from it can push
 # its state machine on. With -f, only warn.
 check_wwan_idle() {
 	command -v ifstatus >/dev/null 2>&1 || return 0
-	st=$(ifstatus wwan 2>/dev/null) || return 0
+	wd_iface=$(uci -q get fm350_watchdog.main.interface 2>/dev/null) || wd_iface=""
+	[ -n "$wd_iface" ] || wd_iface=wwan
+	wd_enabled=$(uci -q get fm350_watchdog.main.enabled 2>/dev/null) || wd_enabled=""
+	st=$(ifstatus "$wd_iface" 2>/dev/null) || return 0
 	up=$(printf '%s' "$st" | jsonfilter -e '@.up' 2>/dev/null) || up=""
 	pending=$(printf '%s' "$st" | jsonfilter -e '@.pending' 2>/dev/null) || pending=""
 	if [ "$up" != "true" ] && [ "$pending" != "true" ]; then
+		warn_watchdog
 		return 0
 	fi
 	if [ "$force" -eq 1 ]; then
-		echo "fm350-status.sh: WARNING: interface wwan is up or connecting; atc.sh shares this tty, so replies below may be incomplete or stolen." >&2
+		echo "fm350-status.sh: WARNING: interface $wd_iface is up or connecting; atc.sh shares this tty, so replies below may be incomplete or stolen." >&2
+		warn_watchdog
 		return 0
 	fi
 	cat >&2 <<'EOF'
@@ -265,6 +280,18 @@ section == "ATI" && /Model:/ {
 	sub(/^.*Model: */, "", model)
 	sub(/\r.*$/, "", model)
 	if (manufacturer != "") printf "Modem: %s %s\n", manufacturer, model
+}
+section == "AT+CPIN?" && /\+CPIN:/ {
+	line = $0
+	sub(/^.*\+CPIN:[ \t]*/, "", line)
+	sub(/\r$/, "", line)
+	print "SIM: " line
+}
+section == "AT+CPIN?" && /CME ERROR:/ {
+	line = $0
+	sub(/^.*CME ERROR:[ \t]*/, "", line)
+	sub(/\r$/, "", line)
+	print "SIM: error " line
 }
 section == "AT+CEREG?" && /\+CEREG:/ {
 	line = $0

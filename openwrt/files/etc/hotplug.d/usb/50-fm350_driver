@@ -1,4 +1,5 @@
 #!/bin/sh
+# fm350-usb: installed by openwrt/install.sh
 # Hotplug helper: bind the in-kernel `option` serial driver to the Fibocom
 # FM350-GL's vendor-specific USB interfaces (0e8d:7126 mode 40, 0e8d:7127
 # mode 41).
@@ -11,18 +12,19 @@
 #
 # Does nothing if the option1 driver isn't present, or if a ttyUSB device for
 # the modem's AT interface is already bound (avoids rebinding on every
-# hotplug event for an unrelated interface of the same device).
+# hotplug event for an unrelated interface of the same device). The check is
+# vendor-aware (/usr/lib/fm350/at-port.sh); without that file it just binds.
+# Both paths are fixed on purpose: this runs as root, so it never takes a path
+# to source or write from the environment (tests rewrite them in a copy).
 
 [ "$ACTION" = add ] || exit 0
 
 case "$PRODUCT" in
 	e8d/7126/*)
-		usb_id="0e8d 7126"
-		iface_suffix=":1.4"
+		usb_id="0e8d 7126 ff"
 		;;
 	e8d/7127/*)
-		usb_id="0e8d 7127"
-		iface_suffix=":1.6"
+		usb_id="0e8d 7127 ff"
 		;;
 	*)
 		exit 0
@@ -32,13 +34,16 @@ esac
 driver_dir=/sys/bus/usb-serial/drivers/option1
 [ -d "$driver_dir" ] || exit 0
 
-# Already bound: an AT-capable ttyUSB exists under the vendor interface.
-for dev in /sys/bus/usb/devices/*"$iface_suffix"; do
-	[ -d "$dev" ] || continue
-	for tty in "$dev"/ttyUSB*; do
-		[ -e "$tty" ] && exit 0
-	done
-done
+# Already bound: an FM350 AT port (vendor 0e8d) has a ttyUSB node.
+at_port_lib=/usr/lib/fm350/at-port.sh
+if [ -r "$at_port_lib" ]; then
+	# shellcheck source=/dev/null # files/usr/lib/fm350/at-port.sh
+	. "$at_port_lib"
+	fm350_find_at_device >/dev/null && exit 0
+fi
 
-echo "$usb_id" > "$driver_dir/new_id" 2>/dev/null
-logger -t fm350-driver "bound option1 driver for $usb_id"
+if echo "$usb_id" 2>/dev/null > "$driver_dir/new_id"; then
+	logger -t fm350-driver "bound option1 driver for $usb_id"
+else
+	logger -t fm350-driver "could not bind option1 driver for $usb_id"
+fi

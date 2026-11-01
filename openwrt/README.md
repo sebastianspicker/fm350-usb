@@ -218,11 +218,15 @@ again at each start and three failures PUK-lock the SIM (a carrier-issued PUK
 is then needed, and ten wrong PUKs destroy the SIM). The watchdog restarts
 `wwan`, so it must never do that blindly: it reads `ifstatus wwan`'s
 `errors[].code` and does **not** restart (it logs once per episode) when a code
-contains `pin`, `puk`, `sim` or `denied`, case-insensitively. This covers the
-codes `atc.sh` passes to `proto_notify_error` right before
-`proto_block_restart` in the pinned revision: `PINmissing`, `PINerror`,
-`SIMreadfailure`, `REG_DENIED`, and raw `+CME ERROR` texts such as
-`SIM not inserted`. Assumption: these codes show up in `ifstatus` as
+contains `pin`, `puk`, `password`, `denied` or `not inserted`,
+case-insensitively. This covers the codes `atc.sh` passes to
+`proto_notify_error` right before `proto_block_restart` in the pinned
+revision: `PINmissing`, `PINerror` (also used for `SIM PUK` and other CPIN
+states), `REG_DENIED`, the raw `+CME ERROR` text `SIM not inserted`, and any
+other raw text that mentions a PIN or password (fail closed).
+`SIMreadfailure` and other raw texts such as `SIM busy` do restart: `atc.sh`
+raises them before any PIN is sent, a restart only re-queries `AT+CPIN?`, and
+the backoff bounds the rate. Assumption: these codes show up in `ifstatus` as
 `errors[].code`; this is unverified on hardware, and `SESSION_FAILED` (bad
 APN) is still retried with backoff. Prefer a SIM with the PIN disabled, and do
 not set `pincode` until you have checked the PIN by hand.

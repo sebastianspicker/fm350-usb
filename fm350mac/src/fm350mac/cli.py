@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
-import ipaddress
 import json
 import logging
 import os
@@ -35,7 +34,6 @@ from .bridge import Bridge
 from .helper_client import (
     HelperError,
     HelperNetConfig,
-    as_probe_result,
     helper_version_warning,
 )
 from .helper_client import is_version_mismatch as is_helper_version_mismatch
@@ -165,16 +163,8 @@ def _sha256_arg(value: str) -> str:
 
 
 def _maybe_redact(args: argparse.Namespace, text: str) -> str:
-    return redact_text(text) if getattr(args, "redact", False) else text
-
-
-def _validate_ipv4(value: str, context: str) -> str:
-    """Validate ``value`` as an IPv4 address before it reaches netconfig. Raises ValueError."""
-    try:
-        ipaddress.IPv4Address(value)
-    except ValueError as exc:
-        raise ValueError(f"invalid {context}: {value!r}") from exc
-    return value
+    # A SIM PIN is masked always; everything else only with --redact.
+    return redact_text(text) if getattr(args, "redact", False) else redact_pin(text)
 
 
 def _route_host_arg(value: str) -> str:
@@ -225,10 +215,12 @@ def cmd_probe(
                 f"max_transfer_size={init.max_transfer_size} "
                 f"packet_alignment_factor={init.packet_alignment_factor}"
             )
-            for name, oid in _PROBE_OIDS:
-                value = device.query(oid)
-                print(f"{name:26} {_format_oid_value(name, value)}")
-            device.halt()
+            try:
+                for name, oid in _PROBE_OIDS:
+                    value = device.query(oid)
+                    print(f"{name:26} {_format_oid_value(name, value)}")
+            finally:
+                device.halt()
     finally:
         # RndisUsb only releases its own interfaces (0/1): it shares the
         # underlying UsbDevice handle with an AT port elsewhere in this
@@ -240,19 +232,24 @@ def cmd_probe(
 def cmd_at(args: argparse.Namespace, *, at_port_factory=None) -> int:
     """Send raw AT commands to the vendor serial interface. No root needed."""
     port = at_port_factory() if at_port_factory else at_mod.AtPort(iface_override=args.iface)
+    rc = 0
     try:
         for cmd in args.commands:
-            print(f">>> {cmd}")
+            print(f">>> {redact_pin(cmd)}")
             try:
-                print(_maybe_redact(args, port.command(cmd)))
+                response = port.command(cmd)
             except at_mod.AtTimeoutError as exc:
                 if exc.response:
                     print(_maybe_redact(args, exc.response))
-                print(f"{cmd}: timed out waiting for a final result code", file=sys.stderr)
+                print(f"{redact_pin(cmd)}: timed out waiting for a final result code", file=sys.stderr)
                 return 1
+            print(_maybe_redact(args, response))
+            last = response.strip().splitlines()[-1].strip() if response.strip() else ""
+            if last == "ERROR" or last.startswith(("+CME ERROR", "+CMS ERROR")):
+                rc = 1  # keep sending the rest, but report the failure
     finally:
         port.close()
-    return 0
+    return rc
 
 
 DEFAULT_WATCH_INTERVAL_S = 2.0
@@ -261,8 +258,8 @@ DEFAULT_WATCH_INTERVAL_S = 2.0
 # well under a second on real hardware; capping the per-command timeout well
 # below AtPort.command()'s 240s default bounds how long one stuck query can
 # block --watch's refresh loop (which, unlike `up`, has no cooperative stop
-# flag -- see supervisor.py's _run_signal_guarded -- so a stuck command is
-# only recoverable by Ctrl-C actually landing between commands).
+# flag) so a stuck command is only recoverable by Ctrl-C actually landing
+# between commands.
 _QUERY_TIMEOUT_S = 10.0
 
 
@@ -292,11 +289,6 @@ _STATUS_COMMANDS = (
     ("gtccinfo", "AT+GTCCINFO?"),
     ("gtsenrdtemp", "AT+GTSENRDTEMP=0"),
 )
-
-def _collect_status(port) -> dict[str, str]:
-    """Send the read-only AT queries status/doctor share, and return the raw responses."""
-    return _query_all(port, _STATUS_COMMANDS)
-
 
 def _build_status_report(responses: dict[str, str]) -> dict:
     cereg_stat = at_mod.parse_registration(responses["cereg"])
@@ -380,7 +372,8 @@ def _format_status(report: dict, redact: bool) -> str:
     ]
     operator = report["operator"]
     if operator is not None and operator.name:
-        lines.append(f"Operator: {operator.name} ({operator.act_name or operator.act})")
+        act = operator.act_name or operator.act
+        lines.append(f"Operator: {operator.name} ({act})" if act is not None else f"Operator: {operator.name}")
     else:
         lines.append("Operator: none")
     serving = report["serving_cell"]
@@ -442,7 +435,7 @@ def _signal_bar(dbm: float | None, lo: float = -120.0, hi: float = -60.0, width:
 
 
 def _print_status_once(port, args: argparse.Namespace) -> dict:
-    responses = _collect_status(port)
+    responses = _query_all(port, _STATUS_COMMANDS)
     report = _build_status_report(responses)
     if args.json:
         print(json.dumps(_serialize_report(report, args.redact), indent=2))
@@ -510,9 +503,8 @@ def cmd_status(args: argparse.Namespace, *, at_port_factory=at_mod.AtPort, sleep
 
 # --- doctor: read-only diagnostic checks ------------------------------------
 
-# Commands doctor sends. All are queries (``?``) except the ones listed in
-# _DOCTOR_ALLOWED_EQUALS_COMMANDS below -- see test_cli_e2e.py's assertion
-# that doctor never sends a write/set command.
+# Commands doctor sends. All are queries -- see test_cli_e2e.py's assertion
+# that doctor never sends a write/set command (no "=").
 _DOCTOR_COMMANDS = (
     ("pkgver", "AT+GTPKGVER?"),
     ("dipcmode", "AT+GTDIPCMODE?"),
@@ -527,11 +519,6 @@ _DOCTOR_COMMANDS = (
     ("gtccinfo", "AT+GTCCINFO?"),
 )
 
-# Read-type commands that happen to use "=" (e.g. AT+GTSENRDTEMP=<sensor_id>
-# selects which sensor to read, it doesn't change any setting) are the only
-# ones allowed to contain "="; everything else must be a plain query.
-_DOCTOR_ALLOWED_EQUALS_COMMANDS = frozenset({"AT+GTSENRDTEMP=0"})
-
 
 @dataclasses.dataclass
 class DoctorCheck:
@@ -541,19 +528,19 @@ class DoctorCheck:
     message: str
 
 
-def _parse_int_tuple(response: str) -> tuple[int, ...] | None:
+def _parse_int_tuple(response: str, prefix: str | None = None) -> tuple[int, ...] | None:
     """Pull the comma-separated integers out of a ``+FOO: 1,2,3`` response.
 
-    Error results (``+CME ERROR: 3``, ``+CMS ERROR: ...``) return None rather
-    than being read as data.
+    With ``prefix`` (e.g. ``"GTFMODE"``) only a ``+GTFMODE:`` line counts, so
+    a URC kept ahead of the reply isn't read as data. Without it the first
+    numeric ``+X:`` line is used. Error results (``+CME ERROR: 3``,
+    ``+CMS ERROR: ...``) return None rather than being read as data.
     """
-    match = re.search(r"^\+(?!CME ERROR|CMS ERROR)[A-Z0-9]+:\s*([\d,\-]+)", response, re.MULTILINE)
+    name = re.escape(prefix) if prefix else r"(?!CME ERROR|CMS ERROR)[A-Z0-9]+"
+    match = re.search(rf"^\+{name}:\s*(-?\d+(?:\s*,\s*-?\d+)*)", response, re.MULTILINE)
     if not match:
         return None
-    try:
-        return tuple(int(v) for v in match.group(1).split(","))
-    except ValueError:
-        return None
+    return tuple(int(v) for v in match.group(1).split(","))
 
 
 _OEM_IMAGE_NAMES = {"5025": "Dell DW5931e"}
@@ -571,7 +558,7 @@ def _doctor_checks(responses: dict[str, str]) -> list[DoctorCheck]:
     else:
         checks.append(DoctorCheck("INFO", f"firmware package: {pkgver}"))
 
-    dipc = _parse_int_tuple(responses["dipcmode"])
+    dipc = _parse_int_tuple(responses["dipcmode"], "GTDIPCMODE")
     if dipc is None:
         checks.append(DoctorCheck("WARN", f"GTDIPCMODE?: unparseable response {redact_text(responses['dipcmode'])!r}"))
     elif dipc[0] == 1:
@@ -581,7 +568,7 @@ def _doctor_checks(responses: dict[str, str]) -> list[DoctorCheck]:
     else:
         checks.append(DoctorCheck("WARN", f"DIPC mode {dipc[0]}: USB is disabled in this mode"))
 
-    fcc = _parse_int_tuple(responses["fcceffstatus"])
+    fcc = _parse_int_tuple(responses["fcceffstatus"], "GTFCCEFFSTATUS")
     if fcc is None or len(fcc) < 2:
         checks.append(DoctorCheck("WARN", f"GTFCCEFFSTATUS?: unparseable response {redact_text(responses['fcceffstatus'])!r}"))
     elif fcc[1] == 1:
@@ -589,7 +576,7 @@ def _doctor_checks(responses: dict[str, str]) -> list[DoctorCheck]:
     else:
         checks.append(DoctorCheck("WARN", f"FCC lock: locked (mode={fcc[0]}, status={fcc[1]})"))
 
-    fmode = _parse_int_tuple(responses["fmode"])
+    fmode = _parse_int_tuple(responses["fmode"], "GTFMODE")
     if fmode is None or len(fmode) < 2:
         checks.append(DoctorCheck("WARN", f"GTFMODE?: unparseable response {redact_text(responses['fmode'])!r}"))
     else:
@@ -600,7 +587,7 @@ def _doctor_checks(responses: dict[str, str]) -> list[DoctorCheck]:
             f"GNSS hw-pin control {'enabled' if m else 'disabled'})",
         ))
 
-    usbmode = _parse_int_tuple(responses["usbmode"])
+    usbmode = _parse_int_tuple(responses["usbmode"], "GTUSBMODE")
     if usbmode is None:
         checks.append(DoctorCheck("WARN", f"GTUSBMODE?: unparseable response {redact_text(responses['usbmode'])!r}"))
     else:
@@ -616,7 +603,7 @@ def _doctor_checks(responses: dict[str, str]) -> list[DoctorCheck]:
         # `status` shows the current access technology from +COPS.
         checks.append(DoctorCheck("INFO", f"RAT mode: {erat.rat_mode_name} (ERAT mode {erat.rat_mode})"))
 
-    anttuningen = _parse_int_tuple(responses["anttuningen"])
+    anttuningen = _parse_int_tuple(responses["anttuningen"], "GTANTTUNINGEN")
     if anttuningen is None:
         checks.append(DoctorCheck("WARN", f"GTANTTUNINGEN?: unparseable response {redact_text(responses['anttuningen'])!r}"))
     elif anttuningen[0] == 0:
@@ -624,7 +611,7 @@ def _doctor_checks(responses: dict[str, str]) -> list[DoctorCheck]:
     else:
         checks.append(DoctorCheck("OK", f"antenna tuner enabled (GTANTTUNINGEN={anttuningen[0]})"))
 
-    cfun = _parse_int_tuple(responses["cfun"])
+    cfun = _parse_int_tuple(responses["cfun"], "CFUN")
     if cfun is None:
         checks.append(DoctorCheck("WARN", f"CFUN?: unparseable response {redact_text(responses['cfun'])!r}"))
     elif cfun[0] == 1:
@@ -756,20 +743,6 @@ def _log_bridge_stats(bridge: Bridge | AsyncBridge) -> None:
 _SHUTDOWN_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 
 
-def _run_signal_guarded(stop) -> None:
-    """Install SIGINT/SIGTERM/SIGHUP handlers that call ``stop()``, for the
-    duration of the caller's blocking wait. Handlers are process-global in
-    Python, so this is only safe to call once per invocation (used by
-    ``up --loopback``; ``up`` itself uses ``_ShutdownGuard``).
-    """
-
-    def _on_signal(_signum, _frame):
-        stop()
-
-    for sig in _SHUTDOWN_SIGNALS:
-        signal.signal(sig, _on_signal)
-
-
 class _ShutdownGuard:
     """SIGINT/SIGTERM/SIGHUP handling for ``up``, installed before the first
     network change so a signal at any point still runs the full cleanup
@@ -825,6 +798,8 @@ def _quiesce_net(net) -> None:
     for name in ("clear_dns", "remove_default_route", "remove_host_routes"):
         try:
             getattr(net, name)()
+        except HelperError as exc:
+            _log.warning("net.%s() failed: %s", name, exc)
         except Exception:
             _log.exception("net.%s() failed", name)
 
@@ -967,7 +942,7 @@ def _resolve_helper(
         if geteuid() != 0:
             return False, None, None
         return True, None, None
-    client, reason = as_probe_result(helper_probe_factory())
+    client, reason = helper_probe_factory()
     if client is None:
         return False, None, reason
     warning = helper_version_warning(client)
@@ -1044,8 +1019,9 @@ def cmd_up(
         _log.warning("--default-route is experimental and unverified on hardware")
     if args.dns:
         _log.warning("--dns is experimental and unverified on hardware")
-    if getattr(args, "io", "async") == "sync":
-        _log.warning("--io sync is a frozen fallback and unsupported in 0.1.0a1")
+    io_mode = getattr(args, "io", "async")
+    if io_mode == "sync":
+        _log.warning("--io sync is a frozen fallback and unsupported in %s", __version__)
     if not route_hosts and not args.default_route and not args.dry_run:
         _log.warning("no routes requested: nothing will use the tunnel (use --route-host IP or --default-route)")
 
@@ -1138,11 +1114,6 @@ def cmd_up(
                             raise _RebuildError("no IP address assigned")
                         print("no IP address assigned", file=sys.stderr)
                         return 1
-                    try:
-                        ip = _validate_ipv4(ip, "IP address from AT+CGPADDR")
-                    except ValueError as exc:
-                        print(exc, file=sys.stderr)
-                        return 1
                 # Always query DNS (read-only) so the log shows what the
                 # carrier handed out; it is only *applied* with --dns.
                 try:
@@ -1219,7 +1190,7 @@ def cmd_up(
                 if not args.dry_run and utun is not None:
                     our_ip = socket.inet_aton(ip)
                     # Alignment 0: Linux rndis_host ignores it on RX, and 0 is what was verified on hardware.
-                    if args.io == "async":
+                    if io_mode == "async":
                         bridge = AsyncBridge(
                             usb_ctx, utun, our_mac, our_ip, max_transfer_size=max_transfer_size,
                             rx_urbs=args.rx_urbs, tx_urbs=args.tx_urbs,
@@ -1239,7 +1210,7 @@ def cmd_up(
                     rebuild_attempts = 0
                     rebuild_backoff = _REBUILD_BACKOFF_INITIAL_S
                     rebuild_deadline = None
-                    _log.info("bridge running (--io %s); Ctrl-C to stop", args.io)
+                    _log.info("bridge running (--io %s); Ctrl-C to stop", io_mode)
 
                     if args.supervise:
                         sup_kwargs = {}
@@ -1510,14 +1481,30 @@ def _cmd_up_loopback(
         utun_factory = helper_net.open_utun
         net_config_factory = lambda dry_run: helper_net  # noqa: E731 -- dry_run is always False here
 
-    if args.default_route or getattr(args, "route_host", None):
-        print("--loopback ignores --default-route/--route-host: only a host route to 198.51.100.1 is added", file=sys.stderr)
+    ignored = [
+        flag for flag, given in (
+            ("--default-route", args.default_route),
+            ("--route-host", getattr(args, "route_host", None)),
+            ("--dns", args.dns),
+            ("--io", getattr(args, "io", "async") != "async"),
+            ("--no-supervise", not args.supervise),
+        ) if given
+    ]
+    if ignored:
+        print(
+            f"--loopback ignores {'/'.join(ignored)}: it always uses the sync bridge and "
+            "adds only a host route to 198.51.100.1",
+            file=sys.stderr,
+        )
 
     net = net_config_factory(dry_run=args.dry_run)
     utun: Utun | None = None
     bridge: Bridge | None = None
+    shutdown = _ShutdownGuard()
 
     try:
+        # Before the first network change, same as cmd_up (see _ShutdownGuard).
+        shutdown.install()
         if args.dry_run:
             utun_name = "utun-dry-run"
         else:
@@ -1535,7 +1522,7 @@ def _cmd_up_loopback(
             bridge.start()
             _log.info("loopback bridge running; ping %s to test, Ctrl-C to stop", loopback.PEER_IP)
             stop_flag = threading.Event()
-            _run_signal_guarded(stop_flag.set)
+            shutdown.stop = stop_flag.set
             while not stop_flag.is_set() and not bridge.failed.is_set():
                 time.sleep(0.5)
             if bridge.failed.is_set():
@@ -1545,6 +1532,7 @@ def _cmd_up_loopback(
             print("dry-run: skipping utun/bridge pump")
         return 0
     finally:
+        shutdown.cleaning = True
         if bridge is not None:
             try:
                 bridge.stop()
@@ -1562,6 +1550,7 @@ def _cmd_up_loopback(
                 _log.exception("utun.close() failed")
         if helper_net is not None:
             helper_net.close()
+        shutdown.restore()
 
 
 _SELFTEST_RX_URBS = 8
@@ -1835,11 +1824,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_up.add_argument("--no-supervise", dest="supervise", action="store_false", help="just sleep until Ctrl-C/failure")
     p_up.add_argument(
         "--reenum-timeout", type=_positive_float_arg(0.0), default=DEFAULT_REENUM_TIMEOUT_S,
-        help=f"seconds to wait for the modem to re-enumerate after a USB disconnect (default: {DEFAULT_REENUM_TIMEOUT_S:.0f})",
+        help=f"seconds to wait for the modem to re-enumerate after a USB disconnect, with --supervise only "
+        f"(default: {DEFAULT_REENUM_TIMEOUT_S:.0f})",
     )
     p_up.add_argument(
         "--io", choices=("sync", "async"), default="async",
-        help="async (default) or sync (frozen fallback, unsupported in 0.1.0a1)",
+        help=f"async (default) or sync (frozen fallback, unsupported in {__version__})",
     )
     p_up.add_argument(
         "--rx-urbs", type=_int_range_arg(1, 64), default=DEFAULT_RX_URBS,
@@ -1911,7 +1901,9 @@ def _expected_failure_message(exc: BaseException, args: argparse.Namespace) -> s
         return f"helper error: {exc}. Check `fm350mac helper status`; reinstall with sudo \"$(command -v fm350mac)\" helper install"
     if isinstance(exc, at_mod.AtTimeoutError):
         return f"the modem did not answer ({_maybe_redact(args, str(exc))}). Unplug/replug the modem and retry"
-    if isinstance(exc, (rndis.RndisError, TimeoutError)):
+    if isinstance(exc, rndis.RndisError):
+        return f"RNDIS error: {exc}; unplug/replug the modem"
+    if isinstance(exc, TimeoutError):
         return "RNDIS control channel did not respond; unplug/replug the modem"
     return None
 

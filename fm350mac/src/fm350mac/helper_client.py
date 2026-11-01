@@ -41,6 +41,14 @@ class HelperError(Exception):
     """The helper rejected a request, or the connection failed/closed."""
 
 
+class HelperConnectionLost(HelperError):
+    """The connection to the helper is gone (closed by either side)."""
+
+
+class HelperTimeout(HelperConnectionLost):
+    """The helper did not answer in time; the client closed the connection."""
+
+
 # Error texts that mean this driver and the installed helper don't speak the
 # same protocol (client- or helper-side), as opposed to an operational
 # refusal like "at most 8 host routes per connection".
@@ -92,6 +100,7 @@ class HelperClient:
         self._reader = _LineReader(sock)
         self.pid: int | None = None
         self.helper_version: str | None = None  # None: not yet said hello, or an older helper without it
+        self._closed = False
 
     @classmethod
     def connect(cls, path: str = HELPER_SOCKET_PATH, timeout: float = 5.0) -> "HelperClient":
@@ -112,16 +121,28 @@ class HelperClient:
         Raises HelperError if the helper reports failure or the connection
         drops.
         """
+        if self._closed:
+            raise HelperConnectionLost("the helper connection is closed")
         payload = {"op": op}
         payload.update(fields)
-        self._sock.sendall((json.dumps(payload) + "\n").encode())
-        line = self._reader.read_line()
+        try:
+            self._sock.sendall((json.dumps(payload) + "\n").encode())
+            line = self._reader.read_line()
+        except socket.timeout:
+            raise self._timed_out(op) from None
         if line is None:
-            raise HelperError("the helper closed the connection")
+            raise HelperConnectionLost("the helper closed the connection")
         resp = json.loads(line.decode())
         if not resp.get("ok"):
             raise HelperError(resp.get("error", f"{op} failed"))
         return resp
+
+    def _timed_out(self, op: str) -> HelperTimeout:
+        # The protocol has no request ids: a late reply would be read as the
+        # answer to the next request. Closing makes the helper undo this
+        # connection's routes, DNS and address, so it fails safe.
+        self.close()
+        return HelperTimeout(f"the helper did not answer {op!r} in time; connection closed")
 
     def hello(self) -> dict:
         """Send `hello`, check the protocol version, and record the helper's pid."""
@@ -139,11 +160,16 @@ class HelperClient:
         API as the direct/root code path. Max one call per connection (the
         helper rejects a second).
         """
+        if self._closed:
+            raise HelperConnectionLost("the helper connection is closed")
         payload = {"op": "open_utun"}
-        self._sock.sendall((json.dumps(payload) + "\n").encode())
-        data, ancdata, _flags, _addr = self._sock.recvmsg(_MAX_MESSAGE_BYTES, _FD_CMSG_SPACE)
+        try:
+            self._sock.sendall((json.dumps(payload) + "\n").encode())
+            data, ancdata, _flags, _addr = self._sock.recvmsg(_MAX_MESSAGE_BYTES, _FD_CMSG_SPACE)
+        except socket.timeout:
+            raise self._timed_out("open_utun") from None
         if not data:
-            raise HelperError("the helper closed the connection during open_utun")
+            raise HelperConnectionLost("the helper closed the connection during open_utun")
         resp = json.loads(data.split(b"\n", 1)[0].decode())
         if not resp.get("ok"):
             raise HelperError(resp.get("error", "open_utun failed"))
@@ -157,6 +183,7 @@ class HelperClient:
         return Utun(sock, resp["ifname"])
 
     def close(self) -> None:
+        self._closed = True
         try:
             self._sock.close()
         except OSError:
@@ -256,20 +283,6 @@ def helper_version_warning(client: Any) -> str | None:
     )
 
 
-_REASON_UNREACHABLE = "not reachable (not installed, not running, or a protocol mismatch)"
-
-
-def as_probe_result(result: Any) -> tuple[Any, str | None]:
-    """Normalize a probe factory's return value to ``(client | None, reason)``.
-    Accepts both ``probe()``'s ``client | None`` and ``probe_with_reason()``'s tuple.
-    """
-    if isinstance(result, tuple):
-        return result
-    if result is None:
-        return None, _REASON_UNREACHABLE
-    return result, None
-
-
 def _permission_denied_reason(path: str) -> str:
     """Why connecting to the helper socket at ``path`` was refused: report
     its owner uid and ours. A differing owner means the helper was installed
@@ -317,8 +330,9 @@ def _unauthorized_reason(path: str) -> str:
 def probe_with_reason(
     path: str = HELPER_SOCKET_PATH, timeout: float = PROBE_TIMEOUT_S
 ) -> tuple[HelperClient | None, str | None]:
-    """Like ``probe()``, but returns ``(client, None)`` or ``(None, reason)``
-    with a human-readable reason the helper is unreachable.
+    """Connect to the helper and complete a `hello` round trip. Returns
+    ``(client, None)`` or ``(None, reason)`` with a human-readable reason
+    the helper is unreachable.
     """
     try:
         client = HelperClient.connect(path, timeout=timeout)
@@ -335,12 +349,7 @@ def probe_with_reason(
         return None, f"cannot connect to the helper: {exc}"
     try:
         client.hello()
-    except HelperError as exc:
-        client.close()
-        if str(exc) == "unauthorized":  # the helper's reject for a peer uid it doesn't serve
-            return None, _unauthorized_reason(path)
-        return None, f"helper protocol mismatch: {exc}; reinstall the helper"
-    except socket.timeout:
+    except HelperTimeout:
         client.close()
         # Connected but no answer: the helper serves one connection at a time,
         # so a running `up` session looks exactly like this.
@@ -348,26 +357,12 @@ def probe_with_reason(
             "the helper did not answer (hello timed out); it serves one fm350mac session at a time, "
             f"so another 'fm350mac up' may be running. If not, see {HELPER_LOG_PATH}"
         )
+    except HelperError as exc:
+        client.close()
+        if str(exc) == "unauthorized":  # the helper's reject for a peer uid it doesn't serve
+            return None, _unauthorized_reason(path)
+        return None, f"helper protocol mismatch: {exc}; reinstall the helper"
     except (OSError, ValueError) as exc:
         client.close()
         return None, f"the helper did not answer correctly: {exc}; see {HELPER_LOG_PATH}"
     return client, None
-
-
-def probe(path: str = HELPER_SOCKET_PATH, timeout: float = PROBE_TIMEOUT_S) -> HelperClient | None:
-    """Try to connect to the helper and complete a `hello` round trip.
-    Returns a ready-to-use, hello-verified HelperClient, or None if the
-    helper isn't installed, isn't running, or doesn't answer -- the caller
-    decides what that means (cli.py's ``up`` prints a message and exits;
-    ``helper status`` just reports it).
-    """
-    try:
-        client = HelperClient.connect(path, timeout=timeout)
-    except OSError:
-        return None
-    try:
-        client.hello()
-    except (HelperError, OSError, ValueError):
-        client.close()
-        return None
-    return client

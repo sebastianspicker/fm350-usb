@@ -108,7 +108,7 @@ python3 tools/fm350_diag.py backup            # NV partitions, a few MB
 python3 tools/fm350_diag.py backup --raw      # also a raw image of every flash partition (~530 MB)
 ```
 
-This only reads from the module, over ADB. It writes a `tar` archive of each NV directory (`nvram nvdata nvcfg protect_f protect_s mdota mdota2 mdota3`) and `/proc/mtd`, plus a checksum of every file in `SHA256SUMS`, to `backups/fm350-<date>-<time>/`. Git ignores that folder.
+This only reads from the module, over ADB. It writes a `tar` archive of each NV directory (`nvram nvdata nvcfg protect_f protect_s mdota mdota2 mdota3`) and `/proc/mtd`, plus a checksum of every file in `SHA256SUMS`, to `backups/fm350-<date>-<time>/` (down to the second). It refuses to write into a folder that already exists (exit code 2); pass a new `--dest`. Git ignores that folder.
 
 **The backup contains your IMEI and your module's RF calibration.** Don't share it, and never restore it onto a different module. Stage 3 won't run without it.
 
