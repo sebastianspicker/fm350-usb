@@ -67,9 +67,9 @@ The `dipcd` daemon validates the file at boot (`check_dipc_config`, `fibo_check_
 
 ## Hardware notes
 
-- **Adapter:** Waveshare USB TO M.2 B KEY (3042/3052, nano-SIM slot 1, 4× SMA). Waveshare doesn't list the FM350 as supported, but in our tests the adapter passed USB 3 SuperSpeed (5 Gbps) and the SIM slot and all four RF paths worked.
+- **Adapter:** earlier adapter: Waveshare USB TO M.2 B KEY (3042/3052, nano-SIM slot 1, 4× SMA). Waveshare doesn't list the FM350 as supported, but in our tests the adapter passed USB 3 SuperSpeed (5 Gbps) and the SIM slot and all four RF paths worked. Since 2026-11-05 we use the Waveshare USB 3.2 Gen1 5G DONGLE instead (SIM1 slot, SIM2 wired to an onboard eSIM, see the [Hardware guide](hardware.md)).
 - **Antenna cables (pigtails):** our original IPEX/MHF4-to-SMA pigtails were defective. With them, the module measured nothing: `AT+CESQ` returned all 99/255, `AT+GTCCINFO?` was empty, and GNSS acquired 0 satellites even under open sky. The GNSS AGC (automatic gain control) levels didn't change between indoors and outdoors. That last sign is the useful one: if moving outdoors doesn't change the receiver gain, the problem is in the RF chain, not in the configuration. See [Troubleshooting](#no-cells-at-all-cesq-all-99255-gtccinfo-empty).
-- **Power:** idle worked on a bus-powered USB 3 hub (896 mA allocated) [Bench log]. For real traffic, use the adapter's second, power-only USB plug. See the [Hardware guide](hardware.md) for the full power budget [Hardware].
+- **Power:** idle worked on a bus-powered USB 3 hub (896 mA allocated) [Bench log]. For real traffic, use the earlier adapter's second, power-only USB plug (the 5G DONGLE has an optional 5-12 V DC jack instead). See the [Hardware guide](hardware.md) for the full power budget [Hardware].
 
 ## Step 1: check that it enumerates
 
@@ -136,7 +136,7 @@ shasum -a 256 * > SHA256SUMS
 
 The backup contains your IMEI and calibration. **Don't publish it**, and don't restore it onto a different unit.
 
-If `adb devices` shows **`offline`** after a modem reset (`AT+CFUN=15`), `adb kill-server` alone doesn't fix it. A USB port reset does (for example libusb `libusb_reset_device`, or unplug and replug), followed by `adb start-server`.
+If `adb devices` shows **`offline`** after a modem reset (`AT+CFUN=15`), ADB stays offline whenever the module boots while the Mac's ADB server is running, even after an unplug and replug. Run `adb kill-server` before the module restarts and `adb start-server` only once it's up. If it's already offline, a USB port reset (for example libusb `libusb_reset_device`) is the remedy, but it may leave the module's log daemon (`logread_agent`) spinning, so replug before measurements.
 
 ## Step 4 (optional): switch from PCIe Advance Mode to dual mode
 

@@ -9,6 +9,7 @@
 #     section if the installer had to create it
 #   - "wwan" from the wan firewall zone's network list (unless it was already
 #     there before install.sh ran), and the "Allow modem RA" firewall rule
+#     older installers added
 #   - your own network.wwan / mwan3 wwan, wan_m1, wwan_m2, failover, default
 #     sections, if install.sh had to replace them: restored from the copies
 #     it saved in /etc/fm350-usb; likewise a default_rule_v6 it removed or
@@ -27,7 +28,8 @@
 #   - the use_policy override install.sh applied to the stock
 #     "default_rule_v4"/"https" mwan3 rules, restored from the
 #     fm350_orig_policy option it saved
-#   - /etc/hotplug.d/usb/50-fm350_driver
+#   - /etc/hotplug.d/usb/50-fm350_driver and 60-fm350_reenum
+#   - the paths install.sh added to /etc/sysupgrade.conf
 #   - /usr/bin/fm350-status
 #   - fm350-watchdog: stops+disables the service, then removes
 #     /etc/init.d/fm350-watchdog, /usr/sbin/fm350-watchdog and its uci config
@@ -39,6 +41,7 @@ set -e
 
 # Where install.sh saved user sections it replaced (see install.sh).
 STATE_DIR=/etc/fm350-usb
+SYSUPGRADE_CONF=/etc/sysupgrade.conf
 
 log() { echo "uninstall.sh: $*"; }
 
@@ -199,6 +202,27 @@ if [ -f /etc/hotplug.d/usb/50-fm350_driver ]; then
 	else
 		log "keeping /etc/hotplug.d/usb/50-fm350_driver (not installed by fm350-usb)"
 	fi
+fi
+
+if [ -f /etc/hotplug.d/usb/60-fm350_reenum ]; then
+	if grep -q 'fm350-usb: installed by' /etc/hotplug.d/usb/60-fm350_reenum; then
+		log "removing /etc/hotplug.d/usb/60-fm350_reenum"
+		rm -f /etc/hotplug.d/usb/60-fm350_reenum
+	else
+		log "keeping /etc/hotplug.d/usb/60-fm350_reenum (not installed by fm350-usb)"
+	fi
+fi
+
+# The lines install.sh added to the sysupgrade keep-list (same paths as there).
+if [ -f "$SYSUPGRADE_CONF" ]; then
+	log "removing our paths from $SYSUPGRADE_CONF"
+	printf '%s\n' /usr/lib/fm350/at-port.sh /usr/bin/fm350-status "$STATE_DIR" \
+		/usr/sbin/fm350-watchdog /etc/init.d/fm350-watchdog /etc/hotplug.d/usb/50-fm350_driver \
+		/etc/hotplug.d/usb/60-fm350_reenum /etc/rc.d/S95fm350-watchdog /etc/rc.d/K10fm350-watchdog \
+		>"$SYSUPGRADE_CONF.paths"
+	grep -vxFf "$SYSUPGRADE_CONF.paths" "$SYSUPGRADE_CONF" >"$SYSUPGRADE_CONF.new" || true
+	mv "$SYSUPGRADE_CONF.new" "$SYSUPGRADE_CONF"
+	rm -f "$SYSUPGRADE_CONF.paths"
 fi
 
 if [ -f /usr/bin/fm350-status ]; then

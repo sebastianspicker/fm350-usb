@@ -15,11 +15,11 @@ from pathlib import Path
 # Make the sibling fm350mac/src tree importable without installing the package.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "fm350mac" / "src"))
 
-from fm350mac.at import AtPort  # noqa: E402
+from fm350mac.at import AtPort, is_ok  # noqa: E402
 from fm350mac.redact import redact_pin  # noqa: E402
 
 
-def _main_fm350mac(args) -> None:
+def _main_fm350mac(args) -> int:
     port = AtPort(iface_override=args.iface)
     print(
         f"# 0e8d:{port.usb_device.pid:04x} AT interface {port.iface_num} "
@@ -28,9 +28,13 @@ def _main_fm350mac(args) -> None:
     try:
         for cmd in args.commands:
             print(f">>> {redact_pin(cmd)}")
-            print(redact_pin(port.command(cmd)))
+            response = port.command(cmd)
+            print(redact_pin(response))
+            if not is_ok(response):  # restore.txt replays depend on stopping here
+                return 1
     finally:
         port.close()
+    return 0
 
 
 def _iface_arg(value: str) -> int:
@@ -48,8 +52,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--iface", type=_iface_arg, help="override AT interface number (0..31)")
     ap.add_argument("commands", nargs="+")
-    _main_fm350mac(ap.parse_args())
+    return _main_fm350mac(ap.parse_args())
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

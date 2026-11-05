@@ -24,7 +24,7 @@ Track your own results as you go through the steps below.
 - [ ] Check that the SIM works in a phone (data, PIN known or disabled).
 - [ ] Note the carrier APN (e.g. Telekom `internet.telekom`, Vodafone `web.vodafone.de`, O2 `internet`).
 - [ ] Back up the Flint 2 config (GL admin panel: System, then Backup/Restore) before you change firmware.
-- [ ] Have a separate 5 V ≥ 2 A USB charger for the auxiliary power plug.
+- [ ] Have a separate 5 V ≥ 2 A charger for the auxiliary power (the DC jack, or the power-only plug of the earlier adapter).
 
 See [Hardware](hardware.md#power-budget) for why the auxiliary power plug matters.
 
@@ -33,8 +33,8 @@ See [Hardware](hardware.md#power-budget) for why the auxiliary power plug matter
 1. Open the Waveshare case. Insert the FM350-GL into the M.2 slot and fix it with the screw.
 2. Put the included thermal pad between the module and the aluminium lid.
 3. Connect the 4 IPEX-4 pigtails to the module's antenna pads (MAIN/AUX/MIMO; all four are needed for 4×4). Press straight down until they click.
-4. Insert the nano-SIM. Close the case and attach the 4 antennas.
-5. Connect the dual-plug cable: the data+power plug goes into the Flint 2 USB 3.0 port, and the power-only plug goes into the 5 V charger.
+4. Insert the nano-SIM (SIM1). Close the case and attach the 4 antennas.
+5. Power it. The Waveshare USB 3.2 Gen1 5G DONGLE has no dual-plug cable: plug its USB-C into the Flint 2 USB 3.0 port, and optionally feed the 5-12 V DC jack from a charger. With the earlier USB TO M.2 B KEY adapter, the data+power plug goes into the Flint 2 and the power-only plug into the 5 V charger.
 
 Expected: the power LED is on. The network LED starts blinking once the modem registers (it can't register while FCC-locked).
 
@@ -169,13 +169,9 @@ opkg install luci-proto-atc_*.ipk atc-fib-fm350_gl_*.ipk
 
 In LuCI, create an interface with protocol `ATC`, choose the AT port and APN, and assign it to the `wan` firewall zone.
 
-If the modem crashes and re-enumerates, add the helper script:
+If the modem crashes and re-enumerates, `install.sh` installs `/etc/hotplug.d/usb/60-fm350_reenum`, which restarts `wwan` (nothing to download).
 
-```sh
-wget -O /etc/hotplug.d/usb/60-fm350_crash https://raw.githubusercontent.com/mrhaav/openwrt/master/atc/fib-fm350_gl/60-fm350_crash
-```
-
-For IPv6 DNS through Router Advertisements, add a firewall rule that allows ICMPv6 from `fe80::1` on `wan` (see the mrhaav README).
+Only if you use an `IPV4V6` PDP context (install.sh sets up IPv4 only): for IPv6 DNS through Router Advertisements, add a firewall rule that allows ICMPv6 from `fe80::1` on `wan` (see the mrhaav README).
 
 ### Common to both
 

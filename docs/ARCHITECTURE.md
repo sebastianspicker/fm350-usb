@@ -221,13 +221,12 @@ netifd handler (downloaded by `install.sh`) runs the AT dialogue and brings
 section it owns with `fm350_owned='1'`, and records the originals it changes
 under `/etc/fm350-usb` and in `fm350_orig_policy` options, so
 [uninstall.sh](../openwrt/uninstall.sh) restores them exactly. The
-`--proto xmm` alternative applies `network-xmm.uci` instead and leaves the
-handler install to you. Details: [openwrt/README.md](../openwrt/README.md).
+`--proto xmm` option is gone (the watchdog and decoder are atc-specific). Details: [openwrt/README.md](../openwrt/README.md).
 
 Where in the code:
 
 - [openwrt/install.sh](../openwrt/install.sh), [openwrt/uninstall.sh](../openwrt/uninstall.sh)
-- [openwrt/uci/](../openwrt/uci/): `network-atc.uci`, `network-xmm.uci`, `firewall.uci`, `mwan3.uci`, `fm350-watchdog.uci`
+- [openwrt/uci/](../openwrt/uci/): `network-atc.uci`, `firewall.uci`, `mwan3.uci`, `fm350-watchdog.uci`
 - [openwrt/files/usr/lib/fm350/at-port.sh](../openwrt/files/usr/lib/fm350/at-port.sh): finds the modem's AT tty, shared by install, status and watchdog
 - [openwrt/fm350-status.sh](../openwrt/fm350-status.sh): read-only status, installed as `/usr/bin/fm350-status`
 
@@ -282,6 +281,8 @@ There is no database. Everything persistent is a config file or a log:
 | Mac | `/var/log/fm350mac-helper.log` | helper log | launchd |
 | Mac | `State:/Network/Service/fm350mac/DNS` | DNS servers (only with `--dns`, removed on exit) | helper via `scutil` |
 | Router | `/etc/config/{network,firewall,mwan3,fm350_watchdog}` | uci sections marked `fm350_owned` | `install.sh` |
+| Router | `network.fm350_install_state`, `mwan3.fm350_install_state` (uci sections) | the original values `uninstall.sh` restores | `install.sh` |
+| Router | `mwan3.wan.fm350_added_track_ip` (uci option) | the track IPs `install.sh` added, so `uninstall.sh` removes only those | `install.sh` |
 | Router | `/etc/fm350-usb/` | snapshots of original settings for rollback | `install.sh`, read by `uninstall.sh` |
 | Router | `/tmp/fm350-watchdog.pause` | pauses the watchdog until reboot | you, by hand |
 
@@ -350,4 +351,5 @@ In the order a newcomer would read it:
 | [tools/fm350_diag.py](../tools/fm350_diag.py) | Staged diagnostics with an AT/adb command allowlist ([diagnostics.md](diagnostics.md)) |
 | [tools/fm350_at.py](../tools/fm350_at.py) | Send raw AT commands from a Mac |
 | [tools/bench-throughput.sh](../tools/bench-throughput.sh), [bench_summarize.py](../tools/bench_summarize.py) | Capped iperf3 benchmarks of `fm350mac` and their summary |
+| [tools/module-telemetry.sh](../tools/module-telemetry.sh) | Streams the module's syslog, supply voltage and temperatures over ADB while another command runs ([diagnostics.md](diagnostics.md#recording-the-module-during-a-test-toolsmodule-telemetrysh)) |
 | [docs/index.html](index.html) | Static interactive demo published to GitHub Pages |

@@ -52,10 +52,18 @@
 #     enumerating; see /usr/lib/fm350/at-port.sh), the watchdog neither
 #     restarts nor advances its pending-since clock, and it zeroes
 #     pending_since/up_since, so unplugging the modem doesn't burn down the
-#     backoff and a replug doesn't trigger an immediate restart. If the
+#     backoff. After such an absence the first pending period uses a short
+#     $reenum_threshold (90 s) instead of pending_threshold: a modem that
+#     crashed and re-enumerated is not going to recover by itself. If the
 #     configured path is gone or isn't an FM350 AT port any more but one
 #     exists elsewhere (ttyUSB renumbering), the port is re-resolved before
-#     each ifup and network.<interface>.device is updated if it changed.
+#     each restart and network.<interface>.device is updated if it changed;
+#     then the network reload restarts the interface and no ifdown/ifup
+#     follows it.
+#   - The FM350 USB device's sysfs devnum changing while netifd still reports
+#     the interface "up" (the modem re-enumerated between two ticks; atc.sh
+#     keeps the interface up on tty EOF): one restart, outside the
+#     pending/backoff clocks.
 #   - SIM/PIN safety: if ifstatus shows an error code that atc.sh raised with
 #     proto_notify_error + proto_block_restart for a PIN/PUK/registration
 #     problem (PINmissing, PINerror - which atc.sh also uses for SIM PUK and
@@ -64,11 +72,13 @@
 #     'REG_DENIED'), the watchdog never restarts: with a configured pincode
 #     every restart would send AT+CPIN="..." again, and a wrong PIN burns SIM
 #     PIN attempts until the SIM is PUK-locked. It logs this once per episode.
-#     Matching is a case-insensitive substring test for pin, puk, password,
-#     denied or "not inserted" in the error codes, so an unknown PIN-related
-#     text (e.g. a raw "SIM PIN required" or "incorrect password") still
-#     blocks: the mapping is an assumption taken from the atc.sh revision
-#     pinned in install.sh and is not verified on hardware.
+#     Matching is a case-insensitive substring test for pin, puk or password
+#     in the error codes, so an unknown PIN-related text (e.g. a raw "SIM PIN
+#     required" or "incorrect password") still blocks: the mapping is an
+#     assumption taken from the atc.sh revision pinned in install.sh and is
+#     not verified on hardware. REG_DENIED and "SIM not inserted" can be
+#     transient (modem crash, temporary reject) and atc.sh raises them before
+#     any PIN is sent, so they are retried, but at most once per backoff_max.
 #     SIMreadfailure and other raw CME texts without those words (e.g. "SIM
 #     busy") do restart: atc.sh raises them before any PIN is sent, a restart
 #     just re-queries AT+CPIN?, and the backoff bounds the rate.
@@ -95,6 +105,9 @@
 # (busybox) compatible.
 
 PAUSE_FILE=${FM350_WATCHDOG_PAUSE_FILE:-/tmp/fm350-watchdog.pause}
+# pending_threshold replacement for the first pending period after the modem
+# was absent (crashed and re-enumerated).
+reenum_threshold=90
 AT_PORT_LIB=${FM350_AT_PORT_LIB:-/usr/lib/fm350/at-port.sh}
 
 if [ -r "$AT_PORT_LIB" ]; then
@@ -107,10 +120,12 @@ else
 	# re-resolved.
 	fm350_find_at_device() { uci_get "network.$interface.device"; }
 	fm350_is_at_port() { return 0; }
+	fm350_usb_devnum() { return 1; }
 fi
 
+# Modem text reaches the log: drop control characters (keeps tab and newline).
 log() {
-	logger -t fm350-watchdog "$*"
+	logger -t fm350-watchdog "$(printf '%s' "$*" | tr -d '\000-\010\013-\037\177')"
 }
 
 # Monotonic seconds since boot: immune to NTP stepping the wall clock.
@@ -248,21 +263,22 @@ interface_errors() {
 	ifstatus "$interface" 2>/dev/null | jsonfilter -e '@.errors[*].code' 2>/dev/null || true
 }
 
-# True (0) if netifd reports a PIN/PUK/registration-denied/no-SIM error
-# (atc.sh's deliberate proto_block_restart states, see the header comment).
+# Classifies netifd's error codes (atc.sh's deliberate proto_block_restart
+# states, see the header comment): 0 = PIN/PUK/password, never restart;
+# 2 = REG_DENIED / SIM not inserted, retry at most once per backoff_max;
+# 1 = neither.
 sim_blocked() {
 	errs=$(interface_errors) || errs=""
 	[ -n "$errs" ] || return 1
 	errs=$(printf '%s' "$errs" | tr '[:upper:]' '[:lower:]') || errs=""
 	case "$errs" in
-	*pin* | *puk* | *password* | *denied* | *"not inserted"*) return 0 ;;
+	*pin* | *puk* | *password*) return 0 ;;
+	*denied* | *"not inserted"*) return 2 ;;
 	esac
 	return 1
 }
 
-restart_interface() {
-	log "$interface pending for ${elapsed}s, restarting it (backoff was ${backoff}s)"
-	sync_device
+bounce_interface() {
 	if ! ifdown "$interface" 2>/dev/null; then
 		log "ifdown $interface failed; continuing with ifup and backoff"
 	fi
@@ -271,10 +287,25 @@ restart_interface() {
 	fi
 }
 
+# Re-resolves the AT port, then restarts the interface. If that changed
+# network.<interface>.device, the network reload already restarts it, and an
+# ifdown/ifup right behind the reload would race it: none follows.
+restart_interface() {
+	before=$(uci_get "network.$interface.device")
+	sync_device
+	if [ "$(uci_get "network.$interface.device")" != "$before" ]; then
+		log "$interface restarts through the network reload (AT port changed)"
+		return 0
+	fi
+	bounce_interface
+}
+
 # tick() - one decision-and-maybe-act cycle. Reads/writes the globals
 # pending_since, up_since, backoff, next_allowed_restart (all seconds since
-# boot, 0 meaning "not currently tracked/no backoff yet") and
-# sim_block_logged (0/1).
+# boot, 0 meaning "not currently tracked/no backoff yet"), soft_retry_at
+# (same unit: earliest next retry of a REG_DENIED/not-inserted error),
+# port_id (the modem's USB devnum, "" if unknown) and sim_block_logged and
+# recovering (0/1; recovering = the modem was absent since it was last up).
 tick() {
 	n=$(now) || n=0
 
@@ -283,7 +314,9 @@ tick() {
 		up_since=0
 		backoff=0
 		next_allowed_restart=0
+		soft_retry_at=0
 		sim_block_logged=0
+		recovering=0
 		return 0
 	fi
 
@@ -293,14 +326,28 @@ tick() {
 		# instead of triggering an immediate restart.
 		pending_since=0
 		up_since=0
+		port_id=""
+		recovering=1
 		return 0
 	fi
+
+	id=$(fm350_usb_devnum) || id=""
+	changed=0
+	[ -n "$id" ] && [ -n "$port_id" ] && [ "$id" != "$port_id" ] && changed=1
+	[ -z "$id" ] || port_id=$id
 
 	up=$(interface_up) || up=""
 
 	if [ "$up" = "true" ]; then
 		pending_since=0
 		sim_block_logged=0
+		recovering=0
+		soft_retry_at=0
+		if [ "$changed" -eq 1 ]; then
+			log "$interface is up but the modem re-enumerated (USB devnum $id), restarting it"
+			restart_interface
+			return 0
+		fi
 		[ "$up_since" -eq 0 ] && up_since=$n
 		if [ "$backoff" -gt 0 ] && [ $((n - up_since)) -ge "$backoff_reset_after" ]; then
 			backoff=0
@@ -316,20 +363,36 @@ tick() {
 	fi
 
 	elapsed=$((n - pending_since))
-	[ "$elapsed" -lt "$pending_threshold" ] && return 0
+	threshold=$pending_threshold
+	[ "$recovering" -eq 1 ] && threshold=$reenum_threshold
+	[ "$elapsed" -lt "$threshold" ] && return 0
 	[ "$n" -lt "$next_allowed_restart" ] && return 0
 	[ "$(uptime_s)" -lt "$boot_grace" ] && return 0
 
-	if sim_blocked; then
+	blocked=0
+	sim_blocked || blocked=$?
+	if [ "$blocked" -eq 0 ]; then
 		if [ "$sim_block_logged" -eq 0 ]; then
-			log "$interface is blocked by a SIM/PIN/registration error ($(interface_errors | tr '\n' ' ')); not restarting it (a restart could burn SIM PIN attempts)"
+			log "$interface is blocked by a SIM/PIN error ($(interface_errors | tr '\n' ' ')); not restarting it (a restart could burn SIM PIN attempts)"
 			sim_block_logged=1
 		fi
 		return 0
 	fi
+	if [ "$blocked" -eq 2 ]; then
+		if [ "$n" -lt "$soft_retry_at" ]; then
+			if [ "$sim_block_logged" -eq 0 ]; then
+				log "$interface reports a registration/SIM error ($(interface_errors | tr '\n' ' ')); retrying at most every ${backoff_max}s"
+				sim_block_logged=1
+			fi
+			return 0
+		fi
+		soft_retry_at=$((n + backoff_max))
+	fi
 	sim_block_logged=0
 
+	log "$interface pending for ${elapsed}s, restarting it (backoff was ${backoff}s)"
 	restart_interface
+	recovering=0
 
 	if [ "$backoff" -eq 0 ]; then
 		backoff=$pending_threshold
@@ -347,6 +410,9 @@ main() {
 	up_since=0
 	backoff=0
 	next_allowed_restart=0
+	soft_retry_at=0
+	port_id=""
+	recovering=0
 	sim_block_logged=0
 	log "starting: interface=$interface check_interval=${check_interval}s pending_threshold=${pending_threshold}s backoff_max=${backoff_max}s backoff_reset_after=${backoff_reset_after}s boot_grace=${boot_grace}s"
 	while true; do

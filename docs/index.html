@@ -356,7 +356,7 @@
         <button id="foBtnUpstream" class="warn">Upstream dead (link up)</button>
         <button id="foBtnRestore" class="ok" disabled>Restore</button>
       </div>
-      <p class="note">Simulation using timings measured in the QEMU test (<code>openwrt/tests/qemu-failover-test.sh</code>), not a live router: link-down failover 5 s / failback 4 s, upstream-dead failover 13 s / failback 16 s. Cutting the second uplink while already on backup shows the "both down" case mwan3 calls <code>unreachable</code>.</p>
+      <p class="note">Simulation, not a live router. Timings follow the shipped mwan3 defaults (<code>wan</code> probed every 5 s, down after 5 misses, up after 10 successes; the QEMU test in <code>openwrt/tests/qemu-failover-test.sh</code> measured the earlier, faster settings): link-down failover 5 s / failback 50 s, upstream-dead failover 25 s / failback 50 s (calculated). Cutting the second uplink while already on backup shows the "both down" case mwan3 calls <code>unreachable</code>.</p>
     </div>
 
     <div class="demo">
@@ -401,7 +401,7 @@
   "use strict";
 
   /* --- Failover timeline demo ----------------------------------------- */
-  var TIMINGS = { link: { fail: 5, back: 4 }, upstream: { fail: 13, back: 16 } };
+  var TIMINGS = { link: { fail: 5, back: 50 }, upstream: { fail: 25, back: 50 } };
 
   var foWan = document.getElementById("foWan");
   var foWwan = document.getElementById("foWwan");

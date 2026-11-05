@@ -20,6 +20,8 @@ Stages (subcommands):
                manual recovery commands before touching anything).
                Exception: `experiment fcc-unlock-dell` sends a one-way
                vendor unlock response and has NO restore step.
+  usb-reset    level 0, resets the USB device (fixes ADB `offline`); nothing
+               else on the modem changes.
   backup       read-only ADB NV backup (IMEI + RF calibration -- never
                share it, never restore it onto another unit).
   dipc         switch/revert the on-module DIPC config file (level 3, ADB
@@ -37,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import fcntl
 import glob
 import hashlib
 import json
@@ -44,8 +47,10 @@ import os
 import re
 import select
 import shutil
+import signal
 import subprocess
 import sys
+import tarfile
 import tempfile
 import termios
 import time
@@ -64,7 +69,7 @@ if _FM350MAC_SRC.is_dir():
 try:
     from fm350mac import at as at_mod
     from fm350mac import cellinfo
-    from fm350mac.cli import _parse_int_tuple  # reuse, don't reinvent
+    from fm350mac.cli import _parse_int_tuple, _sim_problem  # reuse, don't reinvent
     from fm350mac.redact import REDACTED
     from fm350mac.redact import redact_text as _fm350mac_redact
     from fm350mac.usb_async import LIBUSB_ERROR_ACCESS, LIBUSB_ERROR_BUSY, LibusbNotFound, UsbError, UsbNoDevice
@@ -143,6 +148,7 @@ class TtyTransport:
     def __init__(self, path: str) -> None:
         self.path = path
         self.fd = os.open(path, os.O_RDWR | os.O_NOCTTY)
+        fcntl.ioctl(self.fd, termios.TIOCEXCL)  # no second opener (e.g. a running `up`) on this AT port
         tty_mod.setraw(self.fd)
         attrs = termios.tcgetattr(self.fd)
         # Python's termios has no cfsetispeed/cfsetospeed: ispeed/ospeed are attrs[4]/[5].
@@ -400,7 +406,9 @@ class Session:
             self._journal_writer().append({"ts": self._clock(), "level": level, "cmd": cmd, "phase": "intent"})
         try:
             response = self.transport.command(cmd, timeout=timeout)
-        except at_mod.AtTimeoutError:
+        except at_mod.AtTimeoutError as exc:
+            partial = redact_text(exc.response) if self.redact else exc.response
+            self.transcript.append((cmd, "\n".join(["[timed out: no final result code]", partial]).strip()))
             if level >= 1:  # close the intent: the command's outcome is unknown
                 self._journal_writer().append(
                     {"ts": self._clock(), "level": level, "cmd": cmd, "phase": "result", "response": "timeout"}
@@ -487,8 +495,14 @@ class Adb:
     numbers are the tool's own constants/parsed-from-modem-output, not argv).
     """
 
-    def __init__(self, binary: str | None = None) -> None:
+    def __init__(self, binary: str | None = None, journal: _JournalWriter | None = None) -> None:
         self.binary = binary if binary is not None else shutil.which("adb")
+        self.journal = journal  # level-3 writes are journaled here, like Session does for AT writes
+
+    def _journal(self, cmd: str, phase: str, response: str | None = None) -> None:
+        if self.journal is not None:
+            record = {"ts": time.time(), "level": 3, "cmd": cmd, "phase": phase}
+            self.journal.append(record if response is None else {**record, "response": response})
 
     def available(self) -> bool:
         return self.binary is not None
@@ -502,8 +516,26 @@ class Adb:
             raise AdbError(f"adb devices failed: {exc}") from exc
         return result.stdout
 
-    def run(
-        self, cmd: str, level: int = 0, *, binary_output: bool = False, timeout: float = _ADB_TIMEOUT_S
+    def run(self, cmd: str, level: int = 0, **kwargs) -> bytes | str:
+        if level != 3:
+            return self._run(cmd, level, **kwargs)
+        self._journal(cmd, "intent")
+        try:
+            result = self._run(cmd, level, **kwargs)
+        except Exception as exc:
+            self._journal(cmd, "result", f"error: {exc}")
+            raise
+        self._journal(cmd, "result", "ok")
+        return result
+
+    def _run(
+        self,
+        cmd: str,
+        level: int,
+        *,
+        binary_output: bool = False,
+        timeout: float = _ADB_TIMEOUT_S,
+        to_file: Path | None = None,
     ) -> bytes | str:
         if level == 0:
             allowed = cmd in _ADB_LEVEL0_EXACT or any(p.fullmatch(cmd) for p in _ADB_LEVEL0_PATTERNS)
@@ -515,12 +547,20 @@ class Adb:
             raise SafetyError(f"adb command not allowlisted at level {level}: {cmd!r}")
         if not self.available():
             raise AdbError("adb not found on PATH")
+        argv = [self.binary, "exec-out", cmd]
         try:
-            result = subprocess.run([self.binary, "exec-out", cmd], capture_output=True, timeout=timeout)
+            if to_file is None:
+                result = subprocess.run(argv, capture_output=True, timeout=timeout)
+            else:  # a raw mtdblock dump is hundreds of MB: straight to disk, not into memory
+                with to_file.open("wb") as fh:
+                    result = subprocess.run(argv, stdout=fh, stderr=subprocess.PIPE, timeout=timeout)
         except subprocess.TimeoutExpired as exc:
             raise AdbError(f"adb timed out after {timeout:.0f}s: {cmd!r}") from exc
-        if result.returncode != 0 and not result.stdout:
+        produced = result.stdout if to_file is None else to_file.stat().st_size
+        if result.returncode != 0 and not produced:
             raise AdbError(f"adb failed (exit {result.returncode}): {cmd!r}: {result.stderr!r}")
+        if to_file is not None:
+            return ""
         return result.stdout if binary_output else result.stdout.decode(errors="replace")
 
     def push(self, local: Path, remote: str) -> None:
@@ -528,10 +568,13 @@ class Adb:
             raise SafetyError(f"adb push destination not allowlisted: {remote!r}")
         if not self.available():
             raise AdbError("adb not found on PATH")
+        self._journal(f"push {remote}", "intent")
         try:
             subprocess.run([self.binary, "push", str(local), remote], capture_output=True, timeout=_ADB_TIMEOUT_S, check=True)
         except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+            self._journal(f"push {remote}", "result", f"error: {exc}")
             raise AdbError(f"adb push failed: {exc}") from exc
+        self._journal(f"push {remote}", "result", "ok")
 
 
 # --- Shared data shapes ---------------------------------------------------------
@@ -572,6 +615,10 @@ _NO_CELLS_HINT = (
     "No cell measured on any sample. Check antenna pigtails and MHF4 connectors FIRST -- on our unit "
     "this exact symptom was defective pigtails, after a day of ruling out firmware causes "
     "(see docs/diagnostics.md)"
+)
+_NO_SIM_NO_CELLS_HINT = (
+    "No cell measured, but the SIM is not ready: the FM350 does not search for cells without a SIM "
+    "(CEREG stays 0,0), so this says nothing about the antennas. Insert a SIM and re-run"
 )
 
 
@@ -621,17 +668,34 @@ def check_cfun(cfun_response: str) -> Check:
     return Check("WARN", f"radio off (CFUN={cfun[0]}); `volatile` cycles CFUN back to 1")
 
 
+def _sim_state(cpin_response: str) -> str | None:
+    """The SIM state of an ``AT+CPIN?`` response ("READY", "SIM PIN", "NOT INSERTED"
+    also for ``+CME ERROR: 10``, ...); "ERROR" for the bare ERROR a CMEE=0 modem answers.
+    """
+    state = at_mod.parse_cpin_state(cpin_response)
+    if state is None and cpin_response.strip().endswith("ERROR"):
+        return "ERROR"
+    return state
+
+
 def check_sim(cpin_response: str, dualsim_response: str | None = None) -> list[Check]:
     checks: list[Check] = []
-    if "+CPIN: READY" in cpin_response:
+    state = _sim_state(cpin_response)
+    if state == "READY":
         checks.append(Check("OK", "SIM: ready"))
-    elif "not inserted" in cpin_response.lower():
+    elif state == "NOT INSERTED":
         checks.append(
             Check(
                 "FAIL",
-                "SIM not inserted: reseat the SIM, power-cycle, and check the Waveshare wires slot 1 only",
+                "SIM not inserted: reseat the SIM, power-cycle, and check that AT+GTDUALSIM? selects "
+                "the slot the SIM is in (0 = SIM1)",
             )
         )
+    elif state == "ERROR":
+        # With CMEE=0 the modem answers a bare ERROR and hides the reason.
+        checks.append(Check("WARN", "SIM: not ready (AT+CPIN? answered ERROR; most often no SIM inserted)"))
+    elif state:
+        checks.append(Check("WARN", f"SIM: {_sim_problem(state)}"))
     else:
         checks.append(Check("WARN", f"SIM: not ready ({cpin_response.strip()!r})"))
     if dualsim_response is not None:
@@ -674,12 +738,20 @@ def check_temperature(temperature_c: float | None) -> Check | None:
     return Check("OK", f"temperature {temperature_c:.1f} C")
 
 
-def check_cells(samples: list[Sample]) -> Check:
+def check_cells(samples: list[Sample], *, sim_state: str | None) -> Check:
     if not samples:
         return Check("WARN", "no samples collected")
     no_cell_count = sum(1 for s in samples if s.no_cells)
     if no_cell_count == len(samples):
-        return Check("FAIL", _NO_CELLS_HINT)
+        if sim_state == "READY":
+            return Check("FAIL", _NO_CELLS_HINT)
+        if sim_state in ("NOT INSERTED", "ERROR"):
+            return Check("INFO", _NO_SIM_NO_CELLS_HINT)
+        return Check(
+            "WARN",
+            f"No cell measured, and the {_sim_problem(sim_state)}: the FM350 does not search for cells "
+            "until the SIM is ready, so this says nothing about the antennas",
+        )
     if no_cell_count:
         return Check("WARN", f"cells measured in only {len(samples) - no_cell_count}/{len(samples)} samples")
     return Check("OK", f"cells measured in {len(samples)}/{len(samples)} samples")
@@ -689,20 +761,34 @@ def _serving_rsrp(cell: "cellinfo.LteCell | cellinfo.NrCell") -> float | None:
     return cell.rsrp_dbm if isinstance(cell, cellinfo.LteCell) else cell.ss_rsrp_dbm
 
 
+def _serving_name(cell: "cellinfo.LteCell | cellinfo.NrCell") -> str:
+    if isinstance(cell, cellinfo.LteCell):
+        return f"LTE B{cell.band}"
+    return f"NR {cell.band or 'unknown'}"
+
+
 def check_registration(samples: list[Sample], ceer_response: str | None = None) -> Check:
-    for sample in samples:
-        if at_mod.is_registered(sample.cereg_stat) or at_mod.is_registered(sample.c5greg_stat):
-            serving = cellinfo.serving_cell(sample.cells)
-            if serving is None:
-                return Check("OK", f"registered ({len(sample.cells)} cell(s), no serving cell reported)")
-            neighbours = len(sample.cells) - 1
-            rat = "LTE" if isinstance(serving, cellinfo.LteCell) else "NR"
-            band = f"B{serving.band}" if isinstance(serving, cellinfo.LteCell) else (serving.band or "unknown")
-            rsrp = _serving_rsrp(serving)
-            msg = f"registered: {rat} {band}, RSRP {rsrp} dBm, {neighbours} neighbour(s)"
-            if rsrp is not None and rsrp < -110:
-                return Check("WARN", f"{msg} (weak signal, RSRP < -110 dBm)")
-            return Check("OK", msg)
+    registered = [
+        s for s in samples if at_mod.is_registered(s.cereg_stat) or at_mod.is_registered(s.c5greg_stat)
+    ]
+    if registered:
+        # The last registered sample is the current cell; the first may be one the modem has left.
+        last = registered[-1]
+        serving = cellinfo.serving_cell(last.cells)
+        if serving is None:
+            return Check("OK", f"registered ({len(last.cells)} cell(s), no serving cell reported)")
+        neighbours = len(last.cells) - 1
+        rsrp = _serving_rsrp(serving)
+        msg = f"registered: {_serving_name(serving)}, RSRP {rsrp} dBm, {neighbours} neighbour(s)"
+        first = cellinfo.serving_cell(registered[0].cells)
+        if first is not None and _serving_name(first) != _serving_name(serving):
+            msg = (
+                f"registered: first {_serving_name(first)}, RSRP {_serving_rsrp(first)} dBm, then "
+                f"{_serving_name(serving)}, RSRP {rsrp} dBm, {neighbours} neighbour(s)"
+            )
+        if rsrp is not None and rsrp < -110:
+            return Check("WARN", f"{msg} (weak signal, RSRP < -110 dBm)")
+        return Check("OK", msg)
     if any(not s.no_cells for s in samples):
         stat_name = _REG_STAT_NAMES.get(samples[-1].cereg_stat, f"stat={samples[-1].cereg_stat}")
         msg = f"cells seen but never registered (last CEREG stat: {stat_name})"
@@ -723,7 +809,7 @@ def check_adb_device_state(devices_output: str) -> Check:
     if "\tdevice" in devices_output:
         return Check("OK", "ADB device state: device")
     if "\toffline" in devices_output:
-        return Check("WARN", "ADB device state: offline (a USB reset fixes this: `volatile --usb-reset`)")
+        return Check("WARN", "ADB device state: offline (`adb kill-server`, replug, start ADB once the module is up; if still offline: `usb-reset`, then replug before measuring)")
     return Check("INFO", "ADB device: not found (skipping ADB checks)")
 
 
@@ -966,7 +1052,7 @@ def _diagnose(snapshot: dict[str, str], samples: list[Sample], adb_checks: list[
     checks: list[Check] = []
     oem_check = check_oem_image(snapshot["gtpkgver"])
     checks.append(oem_check)
-    is_dell = "Dell DW5931e" in oem_check.message
+    is_dell = "_5025." in snapshot["gtpkgver"]
     checks.append(check_dipc(snapshot["gtdipcmode"]))
     checks.append(check_fcc_lock(snapshot["gtfcceffstatus"], is_dell))
     checks.append(check_cfun(snapshot["cfun"]))
@@ -977,7 +1063,7 @@ def _diagnose(snapshot: dict[str, str], samples: list[Sample], adb_checks: list[
     temp_check = check_temperature(temp_c)
     if temp_check is not None:
         checks.append(temp_check)
-    checks.append(check_cells(samples))
+    checks.append(check_cells(samples, sim_state=_sim_state(snapshot["cpin"])))
     checks.append(check_registration(samples, snapshot.get("ceer")))
     cgdcont_check = check_cgdcont(snapshot["cgdcont"])
     if cgdcont_check is not None:
@@ -1045,7 +1131,6 @@ def cmd_read(
 # --- volatile --------------------------------------------------------------------
 
 DEFAULT_VOLATILE_DURATION_S = 30.0
-_VOLATILE_SAMPLE_INTERVAL_S = 10.0
 _COPS_SCAN_TIMEOUT_S = 180.0
 
 
@@ -1100,6 +1185,54 @@ def _cereg_mode(response: str) -> int:
     return int(match.group(1)) if match else 0
 
 
+def _usb_reset(
+    session: Session,
+    transport_factory: Callable[[], Transport] | None,
+    sleep: Callable[[float], None],
+    monotonic: Callable[[], float],
+) -> Check | None:
+    """Reset the USB device and reopen the AT port; None if the transport can't reset."""
+    if not session.transport.usb_reset():
+        return None
+    session.transport.close()
+    if transport_factory is None:
+        return Check("OK", "issued a USB device reset")
+    # A device reset need not drop the modem off the bus (unlike AT+CFUN=15), so
+    # skip the disappear/reappear steps and just poll until the port opens again.
+    new_transport = _wait_for_reenumeration(transport_factory, 60.0, sleep=sleep, monotonic=monotonic, usb_present_fn=None)
+    if new_transport is None:
+        return Check("WARN", "modem did not come back within 60s after the USB reset")
+    session.rebind(new_transport)
+    return Check("OK", "issued a USB device reset")
+
+
+def cmd_usb_reset(
+    args: argparse.Namespace,
+    *,
+    session_factory: Callable[[], Session],
+    transport_factory: Callable[[], Transport] | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+    out_dir: Path,
+    up_running_fn: Callable[[], bool] = fm350mac_up_running,
+) -> int:
+    """Level 0: just the USB port reset (fixes ADB `offline`), nothing else on the modem."""
+    print(_UP_SESSION_WARNING)
+    if up_running_fn():
+        print("refusing: a `fm350mac up` process is running. Stop it first.", file=sys.stderr)
+        return 2
+    session = session_factory()
+    try:
+        check = _usb_reset(session, transport_factory, sleep, monotonic)
+        if check is None:
+            return 2  # the transport said why
+        _print_checks([check], session.redact)
+        write_report(out_dir, session, "fm350_diag usb-reset", [check])
+        return 0 if check.level == "OK" else 1
+    finally:
+        session.transport.close()
+
+
 def cmd_volatile(
     args: argparse.Namespace,
     *,
@@ -1121,6 +1254,7 @@ def cmd_volatile(
         print("aborted")
         return 1
     session = session_factory()
+    restore_signals = _signals_as_interrupt()
     orig_cmee: int | None = None
     try:
         snapshot = _collect_snapshot(session)
@@ -1137,11 +1271,14 @@ def cmd_volatile(
         orig_cereg_n = _cereg_mode(snapshot["cereg"])
         try:
             session.send("AT+CEREG=3")
-            reject_samples = _collect_samples(session, 60.0, _VOLATILE_SAMPLE_INTERVAL_S, sleep, monotonic)
+            reject_samples = _collect_samples(session, args.duration, args.interval, sleep, monotonic)
         finally:
             session.send(f"AT+CEREG={orig_cereg_n}")
 
-        checks = [check_cells(before_samples), check_registration(before_samples, snapshot.get("ceer"))]
+        checks = [
+            check_cells(before_samples, sim_state=_sim_state(snapshot["cpin"])),
+            check_registration(before_samples, snapshot.get("ceer")),
+        ]
         if cmee_note is not None:
             checks.append(cmee_note)
         checks.append(Check("INFO", f"CEREG=3 reject-cause sampling: {len(reject_samples)} sample(s) collected"))
@@ -1170,7 +1307,7 @@ def cmd_volatile(
                     session.send("AT+CFUN=4")
                     sleep(5.0)
                     session.send("AT+CFUN=1")
-                    cfun_samples = _collect_samples(session, 60.0, _VOLATILE_SAMPLE_INTERVAL_S, sleep, monotonic)
+                    cfun_samples = _collect_samples(session, args.duration, args.interval, sleep, monotonic)
                     checks.append(check_registration(cfun_samples))
                 finally:
                     session.send(f"AT+CFUN={orig_cfun_n}")
@@ -1195,22 +1332,9 @@ def cmd_volatile(
             # The transport was closed for the reset and never reopened.
             checks.append(Check("WARN", "USB reset skipped: the modem did not come back after AT+CFUN=15"))
         elif args.usb_reset:
-            if session.transport.usb_reset():
-                session.transport.close()
-                if transport_factory is None:
-                    checks.append(Check("OK", "issued a USB device reset"))
-                else:
-                    # A device reset need not drop the modem off the bus (unlike
-                    # AT+CFUN=15), so skip the disappear/reappear steps and just
-                    # poll until the port opens again.
-                    new_transport = _wait_for_reenumeration(
-                        transport_factory, 60.0, sleep=sleep, monotonic=monotonic, usb_present_fn=None
-                    )
-                    if new_transport is None:
-                        checks.append(Check("WARN", "modem did not come back within 60s after the USB reset"))
-                    else:
-                        session.rebind(new_transport)
-                        checks.append(Check("OK", "issued a USB device reset"))
+            reset_check = _usb_reset(session, transport_factory, sleep, monotonic)
+            if reset_check is not None:
+                checks.append(reset_check)
 
         _print_checks(checks, session.redact)
         write_report(out_dir, session, "fm350_diag volatile", checks)
@@ -1221,6 +1345,7 @@ def cmd_volatile(
                 session.send(f"AT+CMEE={orig_cmee}")
             except Exception as exc:  # transport may be gone after a reset; CMEE reverts on reset anyway
                 print(f"could not restore AT+CMEE={orig_cmee}: {exc}", file=sys.stderr)
+        restore_signals()
         session.transport.close()
 
 
@@ -1230,6 +1355,23 @@ _EXPERIMENT_NAMES = ("fmode", "anttuner", "rat-lte", "fcc-unlock-dell")
 DEFAULT_EXPERIMENT_MEASURE_S = 90.0
 _EXPERIMENT_SAMPLE_INTERVAL_S = 15.0
 _EXPERIMENT_REENUM_TIMEOUT_S = 120.0
+
+
+def _signals_as_interrupt() -> Callable[[], None]:
+    """Make SIGTERM/SIGHUP (kill, closing the Terminal) raise KeyboardInterrupt like Ctrl-C, so
+    the restore in `finally` runs. Returns the function that puts the old handlers back.
+    """
+
+    def raise_interrupt(signum, frame):
+        raise KeyboardInterrupt
+
+    old = [(sig, signal.signal(sig, raise_interrupt)) for sig in (signal.SIGTERM, signal.SIGHUP)]
+
+    def restore() -> None:
+        for sig, handler in old:
+            signal.signal(sig, handler)
+
+    return restore
 
 
 class RestoreFailed(Exception):
@@ -1271,6 +1413,10 @@ def run_experiment(
     if orig is None:
         # Nothing changed yet; restoring a guessed default could itself be the damage.
         raise DiagError(f"{name}: could not parse the original value from {orig_response.strip()!r}; nothing changed")
+
+    for cmd in restore_cmds(orig):
+        if command_level(cmd) is None:  # e.g. GTFMODE=2,0: applying the change would be one-way
+            raise DiagError(f"{name}: can't send {cmd!r} to restore the original value; nothing changed")
 
     restore_path = out_dir / "restore.txt"
     restore_path.write_text(
@@ -1486,6 +1632,7 @@ def cmd_experiment(
         return 1
 
     session = session_factory()
+    restore_signals = _signals_as_interrupt()
 
     def reenumerate() -> None:
         session.send("AT+CFUN=15")
@@ -1551,6 +1698,7 @@ def cmd_experiment(
         )
         return 1
     finally:
+        restore_signals()
         session.transport.close()
 
     if before or after:
@@ -1568,13 +1716,20 @@ def _parse_mtd_partitions(proc_mtd: str) -> list[int]:
     return [int(m.group(1)) for m in re.finditer(r"^mtd(\d+):", proc_mtd, re.MULTILINE)]
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _write_sha256sums(dest: Path) -> None:
     lines = []
     for path in sorted(dest.iterdir()):
         if path.name == "SHA256SUMS" or not path.is_file():
             continue
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        lines.append(f"{digest}  {path.name}")
+        lines.append(f"{_sha256_file(path)}  {path.name}")
     (dest / "SHA256SUMS").write_text("\n".join(lines) + "\n")
 
 
@@ -1592,11 +1747,8 @@ def cmd_backup(args: argparse.Namespace, *, adb_factory: Callable[[], Adb] | Non
     print("WARNING: this backup contains the IMEI and RF calibration of this exact unit.")
     print("Never share it, and never restore it onto another unit.")
     for name in _ADB_BACKUP_DIRS:
-        data = adb.run(
-            f"tar -C /mnt/vendor -cf - {name}", level=0, binary_output=True, timeout=_ADB_BACKUP_TIMEOUT_S
-        )
-        (dest / f"{name}.tar").write_bytes(data)
-        if not data:
+        adb.run(f"tar -C /mnt/vendor -cf - {name}", level=0, to_file=dest / f"{name}.tar", timeout=_ADB_BACKUP_TIMEOUT_S)
+        if not (dest / f"{name}.tar").stat().st_size:
             print(f"warning: {name}.tar is empty (directory missing on this firmware?)", file=sys.stderr)
     proc_mtd = adb.run("cat /proc/mtd", level=0)
     (dest / "proc_mtd.txt").write_text(proc_mtd)
@@ -1606,8 +1758,7 @@ def cmd_backup(args: argparse.Namespace, *, adb_factory: Callable[[], Adb] | Non
         return 1
     if args.raw:
         for n in _parse_mtd_partitions(proc_mtd):
-            data = adb.run(f"cat /dev/mtdblock{n}", level=0, binary_output=True, timeout=_ADB_BACKUP_TIMEOUT_S)
-            (dest / f"mtdblock{n}.img").write_bytes(data)
+            adb.run(f"cat /dev/mtdblock{n}", level=0, to_file=dest / f"mtdblock{n}.img", timeout=_ADB_BACKUP_TIMEOUT_S)
     _write_sha256sums(dest)
     print(f"backup written to {dest}")
     return 0
@@ -1683,6 +1834,21 @@ def _existing_orig(adb: Adb) -> tuple[str, str] | None:
     return None
 
 
+def _tar_problem(path: Path) -> str | None:
+    """Why ``path`` isn't a complete tar (a dropped ADB stream returns a prefix), else None."""
+    try:
+        with tarfile.open(path) as tar:
+            members = tar.getmembers()
+    except tarfile.TarError as exc:
+        return f"{path.name} is not a readable tar ({exc})"
+    # getmembers() stops quietly at a cut inside the last member's data
+    if members and members[-1].offset_data + members[-1].size > path.stat().st_size:
+        return f"{path.name} is truncated"
+    if path.name == "nvdata.tar" and "nvdata/md_cmn/dipc_config" not in {m.name for m in members}:
+        return "nvdata.tar has no nvdata/md_cmn/dipc_config"
+    return None
+
+
 def _verify_backup(backup_dir: Path) -> str | None:
     """None if the backup verifies, else a refusal message."""
     if not backup_dir.is_dir():
@@ -1693,6 +1859,7 @@ def _verify_backup(backup_dir: Path) -> str | None:
     sums_path = backup_dir / "SHA256SUMS"
     if not sums_path.is_file():
         return f"{sums_path} missing"
+    listed = set()
     for line in sums_path.read_text().splitlines():
         if not line.strip():
             continue
@@ -1700,8 +1867,14 @@ def _verify_backup(backup_dir: Path) -> str | None:
         path = backup_dir / name
         if not path.is_file():
             return f"SHA256SUMS lists {name!r} but it's missing"
-        if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+        if _sha256_file(path) != digest:
             return f"SHA256SUMS mismatch for {name!r}"
+        listed.add(name)
+    if "nvdata.tar" not in listed:
+        return f"{sums_path} does not list nvdata.tar"
+    for tar_path in sorted(backup_dir.glob("*.tar")):
+        if tar_path.stat().st_size and (problem := _tar_problem(tar_path)):  # an empty tar is a missing directory
+            return problem
     return None
 
 
@@ -1727,20 +1900,25 @@ def cmd_dipc_status(
     else:
         checks.append(Check("INFO", "adb not found; skipping file read"))
     if session_factory is not None:
-        session = session_factory()
         try:
-            checks.append(check_dipc(session.send("AT+GTDIPCMODE?")))
-        finally:
-            session.transport.close()
+            session = session_factory()
+            try:
+                checks.append(check_dipc(session.send("AT+GTDIPCMODE?")))
+            finally:
+                session.transport.close()
+        except (DiagError, UsbError, at_mod.UnknownAtInterface, at_mod.AtTimeoutError, OSError) as exc:
+            checks.append(Check("WARN", f"AT port unavailable (is `fm350mac up` running?): {exc}"))
     _print_checks(checks, getattr(args, "redact", True))
     return 1 if any(c.level in ("WARN", "FAIL") for c in checks) else 0
 
 
-def _dipc_try_restore(adb: Adb, orig_name: str, expected: str) -> bool:
-    """Put the pre-change dipc_config back; True only if the readback matches."""
+def _dipc_try_restore(adb: Adb, orig_name: str, expected: tuple[str, ...]) -> bool:
+    """Put the saved dipc_config back; True only if the readback matches one of ``expected``
+    (the pre-change file, or the .orig, which can differ from it).
+    """
     try:
         adb.run(_dipc_restore_cmd(orig_name), level=3)
-        return adb.run("cat " + _DIPC_PATH, level=0) == expected
+        return adb.run("cat " + _DIPC_PATH, level=0) in expected
     except AdbError:
         return False
 
@@ -1767,6 +1945,7 @@ def cmd_dipc_set_dual(
     if not adb.available():
         print("refusing: adb not found on PATH", file=sys.stderr)
         return 2
+    adb.journal = _JournalWriter(out_dir / "journal.jsonl")
 
     current_text = adb.run("cat " + _DIPC_PATH)
     current = parse_dipc_config(current_text)
@@ -1799,7 +1978,7 @@ def cmd_dipc_set_dual(
     existing = _existing_orig(adb)
     if existing is None:
         adb.run(_DIPC_CP_ORIG, level=3)
-        orig_name = "dipc_config.orig"
+        orig_name, orig_content = "dipc_config.orig", current_text
         if adb.run(f"cat {_DIPC_DIR}/{orig_name}") != current_text:
             print("refusing: couldn't save dipc_config.orig on the module; nothing changed", file=sys.stderr)
             return 3
@@ -1823,18 +2002,20 @@ def cmd_dipc_set_dual(
         print("refusing: pushed dipc_config.new doesn't match DUAL_CONTENT byte for byte; nothing changed", file=sys.stderr)
         return 3
 
+    # `cat > dipc_config` truncates the file first: if the link dies right there, this is the way back.
+    print(f"Writing dipc_config. If it is left empty or broken, restore it by hand: adb shell \"{_dipc_restore_cmd(orig_name)}\"")
     try:
         adb.run(_DIPC_INSTALL_NEW, level=3)
         adb.run(_DIPC_RM_NEW, level=3)
         readback = adb.run("cat " + _DIPC_PATH, level=0)
     except AdbError as exc:
-        if _dipc_try_restore(adb, orig_name, current_text):
+        if _dipc_try_restore(adb, orig_name, (current_text, orig_content)):
             print(f"adb failed during the write ({exc}); restored the pre-change content", file=sys.stderr)
         else:
             print("RESTORE FAILED -- inspect the module manually over adb", file=sys.stderr)
         return 3
     if readback != DUAL_CONTENT:
-        if not _dipc_try_restore(adb, orig_name, current_text):
+        if not _dipc_try_restore(adb, orig_name, (current_text, orig_content)):
             print("RESTORE FAILED -- inspect the module manually over adb", file=sys.stderr)
             return 3
         print("write to dipc_config didn't take effect; restored the pre-change content", file=sys.stderr)
@@ -1861,6 +2042,7 @@ def cmd_dipc_revert(
     if not adb.available():
         print("refusing: adb not found on PATH", file=sys.stderr)
         return 2
+    adb.journal = _JournalWriter(out_dir / "journal.jsonl")
 
     existing = _existing_orig(adb)
     if existing is None:
@@ -1887,6 +2069,7 @@ def cmd_dipc_revert(
         print("aborted")
         return 1
 
+    print(f"Writing dipc_config. If it is left empty or broken, restore it by hand: adb shell \"{_dipc_restore_cmd(orig_name)}\"")
     try:
         adb.run(_dipc_restore_cmd(orig_name), level=3)
         readback = adb.run("cat " + _DIPC_PATH)
@@ -1932,6 +2115,17 @@ def _default_out_dir() -> Path:
     return Path(f"fm350-diag-{datetime.now().strftime('%Y%m%d-%H%M%S')}")
 
 
+def _interval_arg(value: str) -> float:
+    """argparse ``type=``: seconds between samples, at least 1 (back-to-back AT queries have crashed the firmware)."""
+    try:
+        seconds = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid float value: {value!r}") from None
+    if not seconds >= 1:
+        raise argparse.ArgumentTypeError(f"{value} is too small: the interval must be at least 1 second")
+    return seconds
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="fm350_diag.py",
@@ -1948,13 +2142,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_read = sub.add_parser("read", help="level-0 read-only snapshot + sampling window + diagnosis")
     p_read.add_argument("--duration", type=float, default=DEFAULT_READ_DURATION_S)
-    p_read.add_argument("--interval", type=float, default=DEFAULT_READ_INTERVAL_S)
+    p_read.add_argument("--interval", type=_interval_arg, default=DEFAULT_READ_INTERVAL_S)
     p_read.add_argument("--adb", action="store_true", help="also run read-only ADB probes")
     p_read.set_defaults(func=_run_read)
 
     p_volatile = sub.add_parser("volatile", help="level<=1 transient probes (reject cause, operator scan, CFUN cycle)")
     p_volatile.add_argument("--duration", type=float, default=DEFAULT_VOLATILE_DURATION_S)
-    p_volatile.add_argument("--interval", type=float, default=DEFAULT_READ_INTERVAL_S)
+    p_volatile.add_argument("--interval", type=_interval_arg, default=DEFAULT_READ_INTERVAL_S)
     p_volatile.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
     p_volatile.add_argument("--reset", action="store_true", help="also cycle CFUN=15 and wait for re-enumeration")
     p_volatile.add_argument(
@@ -1963,6 +2157,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_volatile.add_argument("--skip-scan", action="store_true", help="skip the AT+COPS=? operator scan")
     p_volatile.add_argument("--skip-cfun", action="store_true", help="skip the CFUN=4/1 cycle")
     p_volatile.set_defaults(func=_run_volatile)
+
+    p_usb_reset = sub.add_parser("usb-reset", help="level 0: reset the USB device (fixes adb offline); libusb only")
+    p_usb_reset.set_defaults(func=_run_usb_reset)
 
     p_experiment = sub.add_parser("experiment", help="level<=2 temporary setting change, measured, then restored (not fcc-unlock-dell)")
     p_experiment.add_argument("name", choices=_EXPERIMENT_NAMES)
@@ -2008,6 +2205,10 @@ def _run_volatile(args, *, transport_factory, session_factory, out_dir):
     return cmd_volatile(
         args, session_factory=lambda: session_factory(1), transport_factory=transport_factory, out_dir=out_dir
     )
+
+
+def _run_usb_reset(args, *, transport_factory, session_factory, out_dir):
+    return cmd_usb_reset(args, session_factory=lambda: session_factory(0), transport_factory=transport_factory, out_dir=out_dir)
 
 
 def _run_experiment(args, *, transport_factory, session_factory, out_dir):

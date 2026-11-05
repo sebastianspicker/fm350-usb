@@ -4,9 +4,9 @@ Specs for the three parts of this setup, drawn from vendor datasheets and our ow
 
 ## In short
 
-- Three parts make up this setup: the router (GL.iNet Flint 2), the USB-to-M.2 adapter (Waveshare), and the modem (Fibocom FM350-GL, including the Dell DW5931e OEM variant).
+- Three parts make up this setup: the router (GL.iNet Flint 2), the USB-to-M.2 adapter (Waveshare; since 2026-11-05 the USB 3.2 Gen1 5G DONGLE, earlier the USB TO M.2 B KEY), and the modem (Fibocom FM350-GL, including the Dell DW5931e OEM variant).
 - The FM350-GL isn't on Waveshare's list of tested modules for this adapter, but it worked in our tests [Bench log].
-- Use the adapter's auxiliary power plug. 5G modules can draw short current spikes that a router's single USB port may not cover on its own.
+- Power the adapter well: the earlier adapter has an auxiliary power plug, the 5G DONGLE has an optional 5-12 V DC jack. 5G modules can draw short current spikes that a router's single USB port may not cover on its own.
 - Connect all 4 antennas: 5G NR uses 4×4 MIMO for download, and missing antennas lower both the reported signal quality and the throughput.
 - Buy decent antenna pigtails. A defective pair cost us most of a day chasing "no cells" as if it were a firmware or configuration problem [Bench log, Cable swap].
 
@@ -28,7 +28,20 @@ Source: GL.iNet datasheet `mt6000_datasheet_20251103.pdf`, product page, firmwar
 
 GL.iNet firmware supports multi-WAN failover and load balancing across Ethernet, repeater, tethering and cellular interfaces.
 
-## Waveshare USB TO M.2 B KEY (SKU 23252)
+## Waveshare USB 3.2 Gen1 5G DONGLE
+
+The adapter on the bench since 2026-11-05. It's a different product from the USB TO M.2 B KEY below. We took these facts from our own bench use; we haven't copied a datasheet.
+
+| Item | Value |
+|---|---|
+| Host interface | USB 3.2 Gen1 (USB-C). The FM350 enumerated at USB 3 (5 Gbps) |
+| Power | From USB-C, plus an optional 5-12 V DC jack. There is no dual-plug cable |
+| SIM | SIM1 is a nano-SIM slot. SIM2 is wired to an onboard eSIM chip |
+| Result | SIM1, all RF paths and registration worked; data ran at up to 132 Mbit/s down |
+
+Sustained uploads reset the whole module on this adapter (see [macos-driver.md](macos-driver.md)). We haven't yet decided whether the module or the supply is at fault.
+
+## Waveshare USB TO M.2 B KEY (SKU 23252), earlier adapter
 
 Source: product page and [wiki](https://www.waveshare.com/wiki/USB_TO_M.2_B_KEY).
 
@@ -66,7 +79,7 @@ Sources: Fibocom AT manual V2.10, Linux `option` driver patch (June 2024), 4glte
 | WCDMA | 1, 2, 4, 5, 8 |
 | GNSS | GPS, GLONASS, BeiDou, Galileo, QZSS |
 | Operating temp | −10 to 55 °C |
-| SIM | Dual SIM (one can be eSIM on some variants); the Waveshare board only wires one SIM slot |
+| SIM | Dual SIM (one can be eSIM on some variants); the earlier Waveshare adapter only wires one SIM slot, the 5G DONGLE wires SIM2 to an onboard eSIM |
 
 ### USB personality
 

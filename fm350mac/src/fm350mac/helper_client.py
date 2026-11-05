@@ -34,6 +34,7 @@ HELPER_SOCKET_PATH = "/var/run/fm350mac-helper.sock"
 HELPER_LOG_PATH = "/var/log/fm350mac-helper.log"
 PROTOCOL_VERSION = 1
 _MAX_MESSAGE_BYTES = 4096
+REQUEST_TIMEOUT_S = 60.0  # per request, after hello (see HelperClient.hello)
 _FD_CMSG_SPACE = socket.CMSG_LEN(struct.calcsize("i"))
 
 
@@ -152,6 +153,9 @@ class HelperClient:
         self.pid = resp.get("pid")
         version = resp.get("helper_version")
         self.helper_version = version if isinstance(version, str) else None
+        # The connect timeout is too short per request: one teardown alone
+        # can chain four 10 s helper commands.
+        self._sock.settimeout(REQUEST_TIMEOUT_S)
         return resp
 
     def open_utun(self) -> Utun:

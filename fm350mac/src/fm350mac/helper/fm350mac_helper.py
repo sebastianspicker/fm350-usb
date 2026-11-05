@@ -3,7 +3,7 @@ separation (see ../../../docs/macos-driver.md, "Privilege separation").
 
 STANDALONE FILE. This is copied verbatim to
 ``/usr/local/libexec/fm350mac-helper`` and run as root by the system
-``/usr/bin/python3 -I -S`` (Apple's Command Line Tools Python, 3.9.6),
+``/usr/bin/python3 -I -S`` (Apple's shim for the xcode-select-selected Python 3.9),
 launched by a LaunchDaemon. It must therefore:
 
   * use only the standard library (no third-party dependencies, no venv);
@@ -52,6 +52,8 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
+import traceback
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 PROTOCOL_VERSION = 1
@@ -88,18 +90,25 @@ MAX_HOST_ROUTES = 8
 # bring-up (AT+CGACT alone may take up to 60s on a slow attach), so this must
 # comfortably exceed a whole bring-up. Once the utun exists the connection is
 # a live session and may legitimately stay idle for hours, so the timeout is
-# lifted.
+# lifted. It is one absolute deadline, so a client trickling bytes can't
+# extend it.
 CONNECTION_IDLE_TIMEOUT_S = 300
+# Once the utun is open, a client that stops reading blocks a send this long.
+SEND_TIMEOUT_S = 30
+LOCAL_PEERPID = 0x0002  # <sys/un.h>
+
+# launchd's StandardErrorPath (see helper_admin.py); rotated at start-up.
+DEFAULT_LOG_PATH = "/var/log/fm350mac-helper.log"
+MAX_LOG_BYTES = 1024 * 1024
 
 _log = logging.getLogger("fm350mac-helper")
 
 # SIGTERM (e.g. `helper uninstall` -> launchctl bootout) during an active
-# `up` session: the handler only raises SystemExit (unwinding through
-# ConnectionHandler.handle()'s ``finally``, which runs teardown exactly
-# once) -- unless a teardown is already running, in which case it just
-# records the request so that teardown isn't interrupted half-way.
-_in_teardown = False
+# `up` session: the handler only records the request and shuts the active
+# connection's socket down, so its request loop sees EOF and
+# ConnectionHandler.handle()'s ``finally`` runs teardown exactly once.
 _shutdown_requested = False
+_active_conn: Optional[socket.socket] = None
 
 
 class HelperProtocolError(Exception):
@@ -181,6 +190,14 @@ def get_peer_uid(conn: socket.socket) -> int:
     raw = conn.getsockopt(SOL_LOCAL, LOCAL_PEERCRED, _XUCRED_SIZE)
     _version, uid, _ngroups = struct.unpack_from(_XUCRED_FMT, raw)[:3]
     return uid
+
+
+def get_peer_pid(conn: socket.socket) -> Optional[int]:
+    """The connecting process's pid (LOCAL_PEERPID), for the log only."""
+    try:
+        return conn.getsockopt(SOL_LOCAL, LOCAL_PEERPID)
+    except OSError:
+        return None
 
 
 # --- launchd socket activation (launch_activate_socket via ctypes) ---------
@@ -305,6 +322,9 @@ class NetState:
         return run_command([SCUTIL], runner=self._runner, input_text=script)
 
     def configure_interface(self, ip: str) -> None:
+        # A second address would stack another alias (macOS doesn't replace).
+        if self._configured_ip is not None:
+            raise HelperProtocolError("the address is already set; use reconfigure_address to change it")
         self._run([IFCONFIG, self.ifname, "inet", ip, ip, "mtu", str(UTUN_MTU), "up"])
         self._configured_ip = ip
 
@@ -312,6 +332,7 @@ class NetState:
         if old_ip != self._configured_ip:
             raise HelperProtocolError(f"reconfigure_address: old_ip {old_ip!r} isn't the configured address")
         self._run([IFCONFIG, self.ifname, "inet", old_ip, "delete"])
+        self._configured_ip = None
         self._run([IFCONFIG, self.ifname, "inet", new_ip, new_ip, "mtu", str(UTUN_MTU), "up"])
         self._configured_ip = new_ip
 
@@ -320,8 +341,14 @@ class NetState:
             return  # idempotent, like NetConfig.add_host_route
         if len(self._host_routes) >= MAX_HOST_ROUTES:
             raise HelperProtocolError(f"at most {MAX_HOST_ROUTES} host routes per connection")
-        self._run([ROUTE, "add", "-host", dest, "-interface", self.ifname])
+        # Tracked before the add, so a signal (KeyboardInterrupt) right after
+        # it can't leave an untracked route; a plain failure untracks it.
         self._host_routes.append(dest)
+        try:
+            self._run([ROUTE, "add", "-host", dest, "-interface", self.ifname])
+        except Exception:
+            self._host_routes.remove(dest)
+            raise
         _log.info("host route %s -> %s added", dest, self.ifname)
 
     def enable_default_route(self) -> None:
@@ -364,8 +391,13 @@ class NetState:
         else:
             self._prev_default_restore_cmd = None
         if self._prev_default_restore_cmd is not None:
-            self._run([ROUTE, "delete", "default"])
+            # Pending before the delete, so a signal right after it still restores.
             self._default_route_restore_pending = True
+            try:
+                self._run([ROUTE, "delete", "default"])
+            except Exception:
+                self._default_route_restore_pending = False
+                raise
         try:
             self._run([ROUTE, "add", "default", "-interface", self.ifname])
         except Exception:
@@ -375,14 +407,19 @@ class NetState:
         self._default_route_added = True
 
     def _current_default_iface(self) -> Tuple[bool, Optional[str]]:
-        """Return whether a default route exists and its interface, if known."""
+        """Return whether a default route exists and its interface, if known.
+        Raises if ``route`` fails or times out for any other reason than
+        "not in table": the caller must not guess.
+        """
         try:
             out = self._runner(
                 [ROUTE, "-n", "get", "default"],
                 capture_output=True, text=True, timeout=COMMAND_TIMEOUT_S, env=dict(_MINIMAL_ENV), check=True,
             ).stdout
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-            return False, None
+        except subprocess.CalledProcessError as exc:
+            if "not in table" in str(exc.stderr or ""):
+                return False, None
+            raise
         match = re.search(r"interface:\s*(\S+)", out)
         return True, match.group(1) if match else None
 
@@ -445,6 +482,15 @@ class NetState:
         # stays pending for a later teardown/clear_host_routes retry.
         for host_ip in list(reversed(self._host_routes)):
             try:
+                # `route delete` takes no interface qualifier: after the client
+                # died, the utun name and this host's route may belong to
+                # someone else (e.g. a VPN), so only delete it while it's ours.
+                out = self._run([ROUTE, "-n", "get", host_ip])
+                match = re.search(r"interface:\s*(\S+)", out)
+                if match and match.group(1) != self.ifname:
+                    _log.warning("host route to %s now goes via %s; leaving it", host_ip, match.group(1))
+                    self._host_routes.remove(host_ip)
+                    continue
                 self._run([ROUTE, "delete", "-host", host_ip])
             except Exception as exc:
                 if "not in table" in str(getattr(exc, "stderr", "") or ""):
@@ -457,7 +503,17 @@ class NetState:
     def bring_down(self) -> None:
         if self._configured_ip is None:
             return
-        self._configured_ip = None
+        ip, self._configured_ip = self._configured_ip, None
+        # After the client died the kernel may have handed this utun name to
+        # someone else (e.g. a VPN): only take it down if it still has our address.
+        try:
+            out = self._run([IFCONFIG, self.ifname])
+        except Exception:
+            _log.info("%s is already gone", self.ifname)
+            return
+        if out.strip() and f"inet {ip} " not in out:
+            _log.warning("%s no longer has our address %s; leaving it up", self.ifname, ip)
+            return
         try:
             self._run([IFCONFIG, self.ifname, "down"])
         except Exception:
@@ -469,15 +525,10 @@ class NetState:
         idempotent; failed route cleanup stays pending for a later retry.
         Never raises.
         """
-        global _in_teardown
-        _in_teardown = True
-        try:
-            self.clear_dns()
-            self.disable_default_route()
-            self.remove_host_routes()
-            self.bring_down()
-        finally:
-            _in_teardown = False
+        self.clear_dns()
+        self.disable_default_route()
+        self.remove_host_routes()
+        self.bring_down()
 
 
 # --- request schema ----------------------------------------------------
@@ -520,16 +571,27 @@ class _LineReader:
     anything that grows past ``max_bytes`` before a newline ever arrives.
     """
 
-    def __init__(self, sock: socket.socket, max_bytes: int = MAX_MESSAGE_BYTES) -> None:
+    def __init__(
+        self, sock: socket.socket, max_bytes: int = MAX_MESSAGE_BYTES, clock: Callable[[], float] = time.monotonic
+    ) -> None:
         self._sock = sock
         self._buf = b""
         self._max_bytes = max_bytes
+        self._clock = clock
+        self.deadline: Optional[float] = None  # absolute, on ``clock``; None: no deadline
 
     def read_line(self) -> Optional[bytes]:
-        """Return the next line (without its trailing ``\\n``), or None on EOF."""
+        """Return the next line (without its trailing ``\\n``), or None on EOF.
+        Raises socket.timeout once ``deadline`` has passed.
+        """
         while b"\n" not in self._buf:
             if len(self._buf) >= self._max_bytes:
                 raise HelperProtocolError(f"request exceeds {self._max_bytes} bytes")
+            if self.deadline is not None:
+                remaining = self.deadline - self._clock()
+                if remaining <= 0:
+                    raise socket.timeout("connection deadline passed")
+                self._sock.settimeout(remaining)
             chunk = self._sock.recv(4096)
             if not chunk:
                 return None
@@ -557,10 +619,13 @@ class ConnectionHandler:
         runner: Callable[..., Any] = subprocess.run,
         log: Optional[logging.Logger] = None,
         idle_timeout_s: Optional[float] = CONNECTION_IDLE_TIMEOUT_S,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._conn = conn
         self._conn.settimeout(idle_timeout_s)
-        self._reader = _LineReader(conn)
+        self._reader = _LineReader(conn, clock=clock)
+        if idle_timeout_s is not None:
+            self._reader.deadline = clock() + idle_timeout_s
         self._open_utun_fn = open_utun_fn
         self._runner = runner
         self._log = log or _log
@@ -676,8 +741,11 @@ class ConnectionHandler:
         self._utun_opened = True
         self.net = NetState(ifname, runner=self._runner)
         # From here on this is a live session, which is idle for long
-        # stretches by design -- see CONNECTION_IDLE_TIMEOUT_S.
+        # stretches by design -- see CONNECTION_IDLE_TIMEOUT_S. Sends still
+        # time out (SO_SNDTIMEO), so a client that stops reading can't hang us.
+        self._reader.deadline = None
         self._conn.settimeout(None)
+        self._conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, struct.pack("ll", SEND_TIMEOUT_S, 0))
         try:
             line = (json.dumps({"ok": True, "ifname": ifname}) + "\n").encode()
             self._conn.sendmsg([line], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, struct.pack("i", fd))])
@@ -754,7 +822,8 @@ def handle_one_connection(
         log.warning("rejecting connection from uid %d (allowed: %d)", peer_uid, allowed_uid)
         _send_reject(conn, "unauthorized")
         return
-    log.debug("connection accepted from uid %d", peer_uid)
+    # INFO: who holds the (single) slot is what you need when it's stuck.
+    log.info("connection accepted from uid %d, pid %s", peer_uid, get_peer_pid(conn))
     handler = ConnectionHandler(conn, open_utun_fn=open_utun_fn, runner=runner, log=log)
     handler.handle()
     log.debug("connection closed; teardown complete")
@@ -775,12 +844,14 @@ def serve_forever(
     concurrent client just waits in the kernel's listen backlog until the
     first disconnects (queued, not rejected) -- see the module docstring.
     """
+    global _active_conn
     log = log or _log
     while True:
         try:
             conn, _addr = listen_sock.accept()
         except OSError:
             return
+        _active_conn = conn  # what _on_term() shuts down
         try:
             handle_one_connection(
                 conn, allowed_uid, open_utun_fn=open_utun_fn, runner=runner, get_peer_uid_fn=get_peer_uid_fn, log=log
@@ -788,6 +859,7 @@ def serve_forever(
         except Exception:
             log.exception("connection handler crashed")
         finally:
+            _active_conn = None
             conn.close()
         if _shutdown_requested:
             return
@@ -808,28 +880,79 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+class _ShortTracebackFormatter(logging.Formatter):
+    """Full tracebacks only at DEBUG; otherwise just the exception line."""
+
+    def formatException(self, ei: Any) -> str:
+        if _log.isEnabledFor(logging.DEBUG):
+            return super().formatException(ei)
+        return "".join(traceback.format_exception_only(ei[0], ei[1])).rstrip()
+
+
+def _rotate_log(path: str = DEFAULT_LOG_PATH, max_bytes: int = MAX_LOG_BYTES, fds: Tuple[int, ...] = (1, 2)) -> None:
+    """If stderr (``fds[-1]``) is launchd's log file at ``path``: make it
+    mode 0600 and, past ``max_bytes``, rename it to ``path.1`` and point
+    ``fds`` (stdout, stderr) at a fresh 0600 file. Anything else (a
+    terminal, --standalone) is left alone.
+    """
+    try:
+        st = os.fstat(fds[-1])
+        on_disk = os.lstat(path)
+    except OSError:
+        return
+    if not stat.S_ISREG(on_disk.st_mode) or (st.st_dev, st.st_ino) != (on_disk.st_dev, on_disk.st_ino):
+        return
+    os.fchmod(fds[-1], 0o600)
+    if st.st_size <= max_bytes:
+        return
+    os.rename(path, path + ".1")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+    os.fchmod(fd, 0o600)  # in case it already existed
+    for target in fds:
+        os.dup2(fd, target)
+    os.close(fd)
+
+
 def _setup_logging() -> None:
     # No syslog socket dependency: launchd captures stderr on its own
     # (see the plist's StandardErrorPath, or the unified log by default).
-    logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="fm350mac-helper[%(process)d] %(levelname)s %(message)s")
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(_ShortTracebackFormatter("fm350mac-helper[%(process)d] %(levelname)s %(message)s"))
+    logging.basicConfig(level=logging.INFO, handlers=[handler])
+
+
+def _clear_stale_dns(runner: Callable[..., Any] = subprocess.run) -> None:
+    """Best-effort: drop a DNS key left behind by a helper that died
+    mid-session (a fresh helper has no connections, so it can't be ours-in-use).
+    """
+    try:
+        run_command([SCUTIL], runner=runner, input_text=f"remove {_DNS_KEY}\n")
+    except Exception as exc:
+        _log.debug("could not clear a stale DNS key: %s", exc)
 
 
 def _on_term(_signum: int, _frame: Any) -> None:
     """SIGTERM (e.g. an operator runs `helper uninstall` while `up` is
-    running): unwind through the active connection's ``finally`` -- which
-    tears down its routes/DNS exactly once -- rather than tearing down in
-    the handler itself, which could race a teardown already in progress.
+    running): only record the request and shut the active connection's
+    socket down. Its request loop then sees EOF and its ``finally`` tears
+    down routes/DNS exactly once; a teardown already running is never
+    interrupted. Idle (no connection): exit right away.
     """
     global _shutdown_requested
     _shutdown_requested = True
-    if _in_teardown:
-        return  # let the running teardown finish; serve_forever() exits afterwards
-    _log.warning("received SIGTERM; tearing down the active connection (if any) and exiting")
-    raise SystemExit(0)
+    conn = _active_conn
+    if conn is None:
+        raise SystemExit(0)
+    _log.warning("received SIGTERM; tearing down the active connection and exiting")
+    try:
+        conn.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_arg_parser().parse_args(argv)
+    _rotate_log()
     _setup_logging()
 
     if args.allowed_uid == 0:
@@ -855,6 +978,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
 
     _log.info("fm350mac-helper started: pid=%d allowed_uid=%d", os.getpid(), args.allowed_uid)
+    _clear_stale_dns()
 
     signal.signal(signal.SIGTERM, _on_term)
 

@@ -39,11 +39,15 @@ LUCI_PROTO_ATC_APK_SHA256="7a196e9a2565534d4657d81ce9c18794ad3687812fe941bf76aa2
 ATC_FIB_FM350_APK_URL="$MRHAAV_BASE/fib-fm350_gl/atc-fib-fm350_gl-2025.01.11-r2.apk"
 ATC_FIB_FM350_APK_SHA256="94e097b6a674f818921c648ed8c6ab80639e626c129f37d4224e64fe37c2eba0"
 
-MODEMFEED_URL="https://github.com/koshev-msk/modemfeed"
+# Kept across a sysupgrade through /etc/sysupgrade.conf (see keep_on_sysupgrade).
+SYSUPGRADE_CONF=/etc/sysupgrade.conf
+# /etc/glversion exists on GL.iNet stock firmware (overridable for tests).
+GLVERSION=${FM350_GLVERSION:-/etc/glversion}
 
 # --- defaults ---------------------------------------------------------------
 proto=atc
 apn=""
+force=0
 dry_run=0
 no_mwan3=0
 no_watchdog=0
@@ -55,14 +59,12 @@ usage() {
 Usage: install.sh [options]
 
 Options:
-  --proto atc|xmm   Protocol handler for the FM350 wwan interface (default: atc).
-                       atc: downloads and installs mrhaav's luci-proto-atc and
-                            atc-fib-fm350_gl packages.
-                       xmm: not in the official feeds; prints modemfeed
-                            xmm-modem install instructions instead of
-                            installing packages, but still applies the wwan
-                            network/firewall/mwan3 config for proto "xmm".
+  --proto atc       Protocol handler for the FM350 wwan interface: downloads
+                    and installs mrhaav's luci-proto-atc and atc-fib-fm350_gl
+                    packages (the only supported handler, and the default).
   --apn APN         Carrier APN for the wwan interface (e.g. internet.telekom).
+  --force           Install even on GL.iNet stock firmware with a network.wwan
+                    of its own (it would be replaced; uninstall.sh restores it).
   --dry-run         Print the uci commands that would run; change nothing.
   --no-mwan3        Skip installing/configuring mwan3 (network + firewall only).
   --no-watchdog     Don't install/enable fm350-watchdog (see README.md).
@@ -79,6 +81,10 @@ while [ $# -gt 0 ]; do
 		;;
 	--proto=*)
 		proto=${1#*=}
+		shift
+		;;
+	--force)
+		force=1
 		shift
 		;;
 	--apn)
@@ -122,9 +128,13 @@ while [ $# -gt 0 ]; do
 done
 
 case "$proto" in
-atc | xmm) ;;
+atc) ;;
+xmm)
+	echo "install.sh: --proto xmm is no longer supported (the watchdog and decoder are atc-specific)" >&2
+	exit 1
+	;;
 *)
-	echo "install.sh: --proto must be 'atc' or 'xmm', got '$proto'" >&2
+	echo "install.sh: --proto must be 'atc', got '$proto'" >&2
 	exit 1
 	;;
 esac
@@ -228,6 +238,20 @@ if [ -z "$wan_zone" ]; then
 	exit 1
 fi
 
+# GL.iNet stock firmware likely uses network.wwan for its own repeater and has
+# its own multi-WAN: don't replace that without --force.
+if [ -e "$GLVERSION" ] && uci -q get network.wwan >/dev/null 2>&1 &&
+	[ "$(uci -q get network.wwan.fm350_owned 2>/dev/null)" != 1 ]; then
+	if [ "$force" -eq 1 ]; then
+		log "WARNING: GL.iNet firmware with its own network.wwan: replacing it (--force)"
+	elif [ "$dry_run" -eq 1 ]; then
+		log "WARNING: GL.iNet firmware with its own network.wwan; a real run would refuse without --force"
+	else
+		echo "install.sh: this looks like GL.iNet stock firmware ($GLVERSION) and network.wwan is not ours; replacing it could break its repeater/multi-WAN. Use --force to continue. Nothing was changed." >&2
+		exit 1
+	fi
+fi
+
 # `uci commit <config>` saves every staged change, so pending edits of yours
 # (e.g. LuCI changes not yet applied) would be committed together with ours.
 for config in network firewall mwan3; do
@@ -253,45 +277,27 @@ log "installing: $base_pkgs"
 pkg_install repo $base_pkgs
 
 # --- protocol handler ---------------------------------------------------------
-if [ "$proto" = atc ]; then
-	tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/fm350-usb-install.XXXXXX") || {
-		echo "install.sh: mktemp failed" >&2
-		exit 1
-	}
-	trap 'rm -rf "$tmp_dir"' EXIT
-	trap 'rm -rf "$tmp_dir"; exit 130' INT
-	trap 'rm -rf "$tmp_dir"; exit 143' TERM
+tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/fm350-usb-install.XXXXXX") || {
+	echo "install.sh: mktemp failed" >&2
+	exit 1
+}
+trap 'rm -rf "$tmp_dir"' EXIT
+trap 'rm -rf "$tmp_dir"; exit 130' INT
+trap 'rm -rf "$tmp_dir"; exit 143' TERM
 
-	if [ "$pkg_mgr" = opkg ]; then
-		luci_pkg="$tmp_dir/luci-proto-atc.ipk"
-		fib_pkg="$tmp_dir/atc-fib-fm350_gl.ipk"
-		download "$LUCI_PROTO_ATC_IPK_URL" "$luci_pkg" "$LUCI_PROTO_ATC_IPK_SHA256" || exit 1
-		download "$ATC_FIB_FM350_IPK_URL" "$fib_pkg" "$ATC_FIB_FM350_IPK_SHA256" || exit 1
-	else
-		luci_pkg="$tmp_dir/luci-proto-atc.apk"
-		fib_pkg="$tmp_dir/atc-fib-fm350_gl.apk"
-		download "$LUCI_PROTO_ATC_APK_URL" "$luci_pkg" "$LUCI_PROTO_ATC_APK_SHA256" || exit 1
-		download "$ATC_FIB_FM350_APK_URL" "$fib_pkg" "$ATC_FIB_FM350_APK_SHA256" || exit 1
-	fi
-	log "installing luci-proto-atc and atc-fib-fm350_gl"
-	pkg_install local "$luci_pkg" "$fib_pkg"
+if [ "$pkg_mgr" = opkg ]; then
+	luci_pkg="$tmp_dir/luci-proto-atc.ipk"
+	fib_pkg="$tmp_dir/atc-fib-fm350_gl.ipk"
+	download "$LUCI_PROTO_ATC_IPK_URL" "$luci_pkg" "$LUCI_PROTO_ATC_IPK_SHA256" || exit 1
+	download "$ATC_FIB_FM350_IPK_URL" "$fib_pkg" "$ATC_FIB_FM350_IPK_SHA256" || exit 1
 else
-	cat <<EOF
-install.sh: --proto xmm selected. xmm-modem/luci-proto-xmm are not in the
-official OpenWrt feeds, so install.sh cannot install them automatically.
-To add them by hand:
-
-  1. Add the modemfeed repository for this OpenWrt release, see:
-       $MODEMFEED_URL
-  2. opkg update   (or: apk update)
-  3. opkg install xmm-modem luci-proto-xmm kmod-usb-acm kmod-usb-net-cdc-ncm
-     (or the apk equivalents)
-
-install.sh will still write the wwan network/firewall/mwan3 config below for
-proto "xmm" so the rest of the failover setup is ready once xmm-modem is
-installed.
-EOF
+	luci_pkg="$tmp_dir/luci-proto-atc.apk"
+	fib_pkg="$tmp_dir/atc-fib-fm350_gl.apk"
+	download "$LUCI_PROTO_ATC_APK_URL" "$luci_pkg" "$LUCI_PROTO_ATC_APK_SHA256" || exit 1
+	download "$ATC_FIB_FM350_APK_URL" "$fib_pkg" "$ATC_FIB_FM350_APK_SHA256" || exit 1
 fi
+log "installing luci-proto-atc and atc-fib-fm350_gl"
+pkg_install local "$luci_pkg" "$fib_pkg"
 
 # --- find the AT command tty -------------------------------------------------
 # fm350_find_at_device (files/usr/lib/fm350/at-port.sh): USB interface :1.6
@@ -605,22 +611,14 @@ if [ "$(uci -q get network.wwan.fm350_owned 2>/dev/null)" = 1 ] &&
 	if [ "$dry_run" -eq 1 ]; then
 		log "[dry-run] would preserve user-added options on the existing network.wwan"
 	else
-		if [ "$proto" = atc ]; then
-			template_opts="fm350_owned proto device apn auth delay defaultroute peerdns metric"
-		else
-			template_opts="fm350_owned proto device apn auth delay metric"
-		fi
+		template_opts="fm350_owned proto device apn auth delay defaultroute peerdns metric"
 		# Drop the section-type line: only real options count as "preserved".
 		wwan_preserved=$(uci_section_to_batch network wwan "$template_opts" | grep -v '^set network\.wwan=') || wwan_preserved=""
 	fi
 fi
 
 log "applying network config (proto=$proto, device=$device, apn=$apn)"
-if [ "$proto" = atc ]; then
-	apply_uci_template "$UCI_DIR/network-atc.uci" "DEVICE=$device" "APN=$apn"
-else
-	apply_uci_template "$UCI_DIR/network-xmm.uci" "DEVICE=$device" "APN=$apn"
-fi
+apply_uci_template "$UCI_DIR/network-atc.uci" "DEVICE=$device" "APN=$apn"
 if [ -n "$wwan_preserved" ]; then
 	log "preserving your extra options on network.wwan"
 	if ! batch_out=$(printf '%s\n' "$wwan_preserved" | uci batch 2>&1); then
@@ -691,6 +689,16 @@ else
 	[ "$dry_run" -eq 1 ] || uci commit mwan3
 fi
 
+# A sysupgrade drops everything outside /etc/config unless listed in
+# /etc/sysupgrade.conf (uninstall.sh removes these lines again).
+keep_on_sysupgrade() {
+	if [ "$dry_run" -eq 1 ]; then
+		log "[dry-run] would add $1 to $SYSUPGRADE_CONF"
+	elif ! grep -qxF "$1" "$SYSUPGRADE_CONF" 2>/dev/null; then
+		echo "$1" >>"$SYSUPGRADE_CONF"
+	fi
+}
+
 # --- kernel < 6.6: bind the option1 serial driver by hand -------------------
 kernel_lt_6_6() {
 	kv=$(uname -r)
@@ -712,6 +720,7 @@ if kernel_lt_6_6; then
 		mkdir -p /etc/hotplug.d/usb
 		cp "$FILES_DIR/etc/hotplug.d/usb/50-fm350_driver" /etc/hotplug.d/usb/50-fm350_driver
 		chmod 0755 /etc/hotplug.d/usb/50-fm350_driver
+		keep_on_sysupgrade /etc/hotplug.d/usb/50-fm350_driver
 	fi
 	# The hotplug file only runs on a USB plug event, so a modem that was
 	# already plugged in gets no ttyUSB (and the AT port guess above is
@@ -732,7 +741,10 @@ else
 	chmod 0644 /usr/lib/fm350/at-port.sh
 	cp "$SCRIPT_DIR/fm350-status.sh" /usr/bin/fm350-status
 	chmod 0755 /usr/bin/fm350-status
+	keep_on_sysupgrade /usr/lib/fm350/at-port.sh
+	keep_on_sysupgrade /usr/bin/fm350-status
 fi
+keep_on_sysupgrade "$STATE_DIR" # the saved sections uninstall.sh restores
 
 # --- fm350-watchdog -----------------------------------------------------------
 if [ "$no_watchdog" -eq 1 ]; then
@@ -752,6 +764,7 @@ else
 	if [ "$dry_run" -eq 1 ]; then
 		log "[dry-run] would copy $FILES_DIR/usr/sbin/fm350-watchdog to /usr/sbin/fm350-watchdog"
 		log "[dry-run] would copy $FILES_DIR/etc/init.d/fm350-watchdog to /etc/init.d/fm350-watchdog"
+		log "[dry-run] would copy $FILES_DIR/etc/hotplug.d/usb/60-fm350_reenum to /etc/hotplug.d/usb/60-fm350_reenum"
 		log "[dry-run] would run: /etc/init.d/fm350-watchdog enable"
 	else
 		cp "$FILES_DIR/usr/sbin/fm350-watchdog" /usr/sbin/fm350-watchdog
@@ -759,6 +772,11 @@ else
 		mkdir -p /etc/init.d
 		cp "$FILES_DIR/etc/init.d/fm350-watchdog" /etc/init.d/fm350-watchdog
 		chmod 0755 /etc/init.d/fm350-watchdog
+		# Restarts wwan right after the modem re-enumerates; it sources the
+		# watchdog, so it is installed only with it.
+		mkdir -p /etc/hotplug.d/usb
+		cp "$FILES_DIR/etc/hotplug.d/usb/60-fm350_reenum" /etc/hotplug.d/usb/60-fm350_reenum
+		chmod 0755 /etc/hotplug.d/usb/60-fm350_reenum
 		# Only enable (symlink for boot), never start here: install.sh may be
 		# running where procd isn't up yet (e.g. a plain Docker
 		# rootfs container), and mwan3/network/firewall aren't reloaded by
@@ -769,6 +787,10 @@ else
 		mkdir -p /var/lock
 		[ -x /etc/init.d/fm350-watchdog ] && /etc/init.d/fm350-watchdog enable
 	fi
+	for f in /usr/sbin/fm350-watchdog /etc/init.d/fm350-watchdog /etc/hotplug.d/usb/60-fm350_reenum \
+		/etc/rc.d/S95fm350-watchdog /etc/rc.d/K10fm350-watchdog; do
+		keep_on_sysupgrade "$f"
+	done
 fi
 
 if [ "$dry_run" -eq 1 ]; then
@@ -778,4 +800,5 @@ else
 	[ "$no_mwan3" -eq 1 ] || log "and: /etc/init.d/mwan3 restart"
 	[ "$no_watchdog" -eq 1 ] || log "and: /etc/init.d/fm350-watchdog restart"
 	log "check status with: fm350-status"
+	log "after a sysupgrade the config and the files above are kept, but the packages are not: run install.sh again"
 fi

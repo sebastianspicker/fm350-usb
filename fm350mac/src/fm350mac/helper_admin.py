@@ -90,19 +90,51 @@ def _sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _user_owned_path_component(executable: str) -> Optional[tuple[str, int]]:
-    """The first non-root-owned component of ``executable``'s real path (the
-    file itself, then each directory up to ``/``) as ``(path, owner uid)``,
-    or None if all of them are root-owned (or can't be inspected).
+def _user_owned_path_component(*paths: str) -> Optional[tuple[str, int]]:
+    """The first non-root-owned component of any of ``paths``' real paths
+    (the path itself, then each directory up to ``/``) as ``(path, owner
+    uid)``, or None if all of them are root-owned (or can't be inspected:
+    missing paths are skipped). Empty paths (``sys.path``'s cwd) are skipped.
     """
-    real = Path(os.path.realpath(executable))
-    for component in (real, *real.parents):
-        try:
-            owner = os.stat(component).st_uid
-        except OSError:
+    for path in paths:
+        if not path:
             continue
-        if owner != 0:
-            return str(component), owner
+        real = Path(os.path.realpath(path))
+        for component in (real, *real.parents):
+            try:
+                owner = os.stat(component).st_uid
+            except OSError:
+                continue
+            if owner != 0:
+                return str(component), owner
+    return None
+
+
+# What `/usr/bin/python3` (a shim) really runs, and where its stdlib is.
+_PYTHON_PATHS_SCRIPT = "import os,sys;print(os.path.realpath(sys.executable));print(os.path.realpath(os.path.dirname(os.__file__)))"
+
+
+def _system_python_problem(runner: Callable[..., subprocess.CompletedProcess], expected_uid: int = 0) -> Optional[str]:
+    """Why the interpreter behind ``PYTHON3`` (the xcode-select-selected
+    one) isn't safe to run as root, or None: its real executable and stdlib
+    directory, and every existing ancestor of both, must be root-owned and
+    not group/other-writable (``-I -S`` doesn't protect the stdlib).
+    """
+    probe = runner([PYTHON3, "-I", "-S", "-c", _PYTHON_PATHS_SCRIPT], capture_output=True, text=True)
+    lines = (probe.stdout or "").splitlines()
+    if probe.returncode != 0 or len(lines) != 2 or not all(os.path.isabs(line) for line in lines):
+        return f"could not determine which Python {PYTHON3} runs: {(probe.stderr or probe.stdout or '').strip()}"
+    executable, stdlib = lines
+    for directory in (Path(executable).parent, Path(stdlib)):
+        err = _check_dir_safe(directory, expected_uid=expected_uid)
+        if err:
+            return f"{PYTHON3} runs {executable}: {err}"
+    try:
+        st = os.lstat(executable)
+    except OSError as exc:
+        return f"{PYTHON3} runs {executable}, which can't be inspected: {exc}"
+    if st.st_uid != expected_uid or st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        return f"{PYTHON3} runs {executable}, which isn't root-owned and write-protected"
     return None
 
 
@@ -260,14 +292,28 @@ def _write_root_file(dest: Path, data: bytes, mode: int, uid: int = 0, gid: int 
     it's being written), ``fsync``ed, given its final owner/mode while it
     still has no name anyone else could race to open, then ``rename()``d
     into place -- ``rename()`` replaces whatever was at ``dest`` outright,
-    it never follows a symlink there.
+    it never follows a symlink there. The written bytes are read back and
+    compared before the rename.
     """
     tmp_path = dest.parent / f".{dest.name}.tmp{os.getpid()}"
-    fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    try:
+        fd = os.open(str(tmp_path), flags, 0o600)
+    except FileExistsError:
+        # A stale temp file from an earlier crashed run with our pid. Its
+        # directory passed _check_dir_safe, so only root could have made it.
+        os.unlink(str(tmp_path))
+        fd = os.open(str(tmp_path), flags, 0o600)
     try:
         try:
-            os.write(fd, data)
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view):]
             os.fsync(fd)
+            os.lseek(fd, 0, os.SEEK_SET)
+            with os.fdopen(os.dup(fd), "rb") as f:
+                if _sha256_hex(f.read()) != _sha256_hex(data):
+                    raise HelperInstallError(f"{tmp_path} doesn't read back what was written")
             os.fchown(fd, uid, gid)
             os.fchmod(fd, mode)
         finally:
@@ -331,6 +377,7 @@ def cmd_helper_install(
     owner_gid: int = 0,
     sleep: Callable[[float], None] = time.sleep,
     executable: Optional[str] = None,
+    import_paths: Optional[list[str]] = None,
 ) -> int:
     """Copy the helper file to ``install_path``, write the LaunchDaemon
     plist, and bootstrap it. Needs sudo; ``--dry-run`` prints the plan
@@ -341,7 +388,10 @@ def cmd_helper_install(
     Both print the sha256 of the exact bytes that get installed;
     ``--expect-sha256`` refuses (before anything is written) unless they
     match. Run as root from a user-owned Python (``executable``, default
-    ``sys.executable``), it warns: that user can change what runs as root.
+    ``sys.executable``) or with user-owned code on its import path
+    (``import_paths``, default this package, ``sys.prefix``,
+    ``sys.base_prefix`` and ``sys.path``), it warns: that user can change
+    what runs as root.
 
     ``install_dir``/``install_path``/``plist_path`` default to the real
     system paths; tests point them at a temporary root instead.
@@ -363,7 +413,9 @@ def cmd_helper_install(
         print("fm350mac helper install must be run with sudo.", file=sys.stderr)
         return 1
     if geteuid() == 0:
-        user_owned = _user_owned_path_component(executable if executable is not None else sys.executable)
+        if import_paths is None:
+            import_paths = [__file__, sys.prefix, sys.base_prefix, *sys.path]
+        user_owned = _user_owned_path_component(executable if executable is not None else sys.executable, *import_paths)
         if user_owned is not None:
             path, owner = user_owned
             print(
@@ -417,6 +469,9 @@ def cmd_helper_install(
                     f"{PYTHON3} is the Command Line Tools stub, not a real Python: run xcode-select --install first"
                 )
             raise HelperInstallError(f"helper failed to compile under {PYTHON3} -I -S:\n{check.stderr}")
+        problem = _system_python_problem(compile_runner)
+        if problem:
+            raise HelperInstallError(f"unsafe system Python: {problem}")
     except HelperInstallError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -493,7 +548,7 @@ def cmd_helper_uninstall(
     _print_step(f"{LAUNCHCTL} bootout system/{PLIST_LABEL}")
     _print_step(f"remove {plist_path}")
     _print_step(f"remove {install_path}")
-    _print_step(f"remove {log_path}")
+    _print_step(f"remove {log_path} and {log_path}.1")
 
     if dry_run:
         print("(dry run: nothing was changed)")
@@ -506,7 +561,7 @@ def cmd_helper_uninstall(
         detail = (result.stderr or result.stdout or "").strip() or f"exit status {result.returncode}"
         print(f"launchctl bootout failed: {detail} (removing the files anyway)", file=sys.stderr)
 
-    for path in (plist_path, install_path, log_path):
+    for path in (plist_path, install_path, log_path, Path(f"{log_path}.1")):
         try:
             path.unlink()
         except FileNotFoundError:
@@ -551,16 +606,23 @@ def cmd_helper_status(
     install_path: Optional[Path] = None,
     plist_path: Optional[Path] = None,
     helper_source: Path = _HELPER_SOURCE,
+    python_runner=subprocess.run,
 ) -> int:
     """Report file presence/ownership, socket presence, whether the installed
     helper matches the packaged source, and a hello round trip. Never needs
-    root.
+    root. Re-runs install's directory and system-Python safety checks, since
+    either can have changed since (e.g. a new ``xcode-select -s``).
     """
     install_path = Path(install_path) if install_path is not None else INSTALL_PATH
     plist_path = Path(plist_path) if plist_path is not None else PLIST_PATH
     print(f"helper binary : {install_path}: {_describe_path(install_path)}")
     print(f"LaunchDaemon  : {plist_path}: {_describe_path(plist_path)}")
     print(f"socket        : {SOCKET_PATH}: {_describe_path(Path(SOCKET_PATH))}")
+    for problem in (
+        _check_dir_safe(install_path.parent), _check_dir_safe(plist_path.parent), _system_python_problem(python_runner)
+    ):
+        if problem:
+            print(f"WARNING: {problem}")
     try:
         installed_bytes = install_path.read_bytes()
     except OSError:

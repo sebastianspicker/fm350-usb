@@ -46,3 +46,17 @@ fm350_is_at_port() {
 	done
 	return 1
 }
+
+# Prints the USB device number of the FM350 (vendor 0e8d); it changes every
+# time the modem re-enumerates. Fails (no output) if there is none.
+fm350_usb_devnum() {
+	for _fm350_dev in "$FM350_USB_SYSFS"/*; do
+		_fm350_vendor=""
+		read -r _fm350_vendor 2>/dev/null <"$_fm350_dev/idVendor" || true
+		[ "$_fm350_vendor" = "0e8d" ] || continue
+		read -r _fm350_num 2>/dev/null <"$_fm350_dev/devnum" || continue
+		echo "$_fm350_num"
+		return 0
+	done
+	return 1
+}

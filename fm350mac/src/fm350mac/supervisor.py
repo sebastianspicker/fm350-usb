@@ -37,6 +37,8 @@ AT_TIMEOUT_S = 10.0  # per-command AT timeout (AtPort's default is 240 s)
 # transfers (at least STALL_MIN_TX_TIMEOUTS new tx_timeouts) while rx stays
 # flat for this long. Sent-but-unanswered traffic alone (a host that drops
 # ICMP, SYN retries, one-way UDP) is not a stall: the modem took it.
+# An OUT-dead modem (tx_timeouts grow, tx_packets flat for the same window)
+# fails the bridge even while rx still flows.
 STALL_WINDOW_S = 60.0
 STALL_MIN_TX_TIMEOUTS = 20
 
@@ -129,6 +131,8 @@ class Supervisor:
         # was already cycled once for the current stall.
         self._stall_baseline: tuple[float, int, int] | None = None
         self._stall_cycled = False
+        # OUT-dead baseline: (since, tx_packets, tx_timeouts), see _check_out_dead.
+        self._out_baseline: tuple[float, int, int] | None = None
 
     def stop(self) -> None:
         """Ask ``run()`` to exit at the next opportunity."""
@@ -194,6 +198,7 @@ class Supervisor:
             self._step_disconnected(registered)
         if self.state != State.CONNECTED:
             self._stall_baseline = None  # an outage is not a stall; start afresh once connected
+            self._out_baseline = None
 
     def _step_connected(self, registered: bool) -> None:
         if not registered:
@@ -235,6 +240,7 @@ class Supervisor:
         if rx != rx0:
             self._stall_baseline = (now, rx, tx_timeouts)
             self._stall_cycled = False  # traffic flows again
+            self._check_out_dead(now)
             return
         if now - since < self.stall_window:
             return
@@ -269,6 +275,31 @@ class Supervisor:
         # The next window starts after the cycle (up to 2 x ACTIVATE_TIMEOUT_S):
         # packets refused while the context was down are not a new stall.
         self._stall_baseline = (self._time(), stats.rx_packets, stats.tx_timeouts)
+        self._out_baseline = None
+
+    def _check_out_dead(self, now: float) -> None:
+        """The rx rule above never fires while rx flows (a download, inbound
+        UDP), so an uplink the modem refuses outright would go unnoticed:
+        if ``tx_timeouts`` grew by ``stall_min_tx_timeouts`` and ``tx_packets``
+        didn't move for ``stall_window``, fail the bridge so ``up`` rebuilds.
+        """
+        stats = self.bridge.stats
+        tx, tx_timeouts = stats.tx_packets, stats.tx_timeouts
+        if self._out_baseline is None or tx != self._out_baseline[1]:
+            self._out_baseline = (now, tx, tx_timeouts)
+            return
+        since, _tx0, tx_timeouts0 = self._out_baseline
+        if now - since < self.stall_window:
+            return
+        self._out_baseline = (now, tx, tx_timeouts)
+        refused = tx_timeouts - tx_timeouts0
+        if refused < self.stall_min_tx_timeouts:
+            return
+        self.stats.stalls += 1
+        reason = f"uplink dead ({refused} tx timeouts, no OUT transfer completed for {now - since:.0f}s, rx still flowing)"
+        _log.error("%s; failing the bridge to force a rebuild", reason)
+        self.stall_failure = True
+        self._fail_bridge(reason)
 
     def _fail_bridge(self, reason: str) -> None:
         # AsyncBridge.fail() is public; the frozen sync Bridge only has
@@ -332,8 +363,8 @@ class Supervisor:
         doesn't support it and when it's in unsolicited-report-only mode
         (``+C5GREG: <n>`` with no ``<stat>`` field at all, see
         ``at.parse_registration``); either way that's not an error as long
-        as CEREG parsed. Only counts as an ``at_errors`` if *neither*
-        response parses.
+        as CEREG parsed. Unless one says registered, an unparseable CEREG
+        counts as an ``at_errors`` and the result is unknown (None).
         """
         try:
             cereg_stat = at_mod.parse_registration(self._command("AT+CEREG?", self.at_timeout))
@@ -346,10 +377,14 @@ class Supervisor:
             self.stats.at_errors += 1
             _log.exception("registration poll failed")
             return None
-        if cereg_stat is None and c5greg_stat is None:
+        if at_mod.is_registered(cereg_stat) or at_mod.is_registered(c5greg_stat):
+            return True
+        # C5GREG without <stat> is normal, but an unparseable CEREG says
+        # nothing: don't call the link lost on C5GREG's "not registered" alone.
+        if cereg_stat is None:
             self.stats.at_errors += 1
             return None
-        return at_mod.is_registered(cereg_stat) or at_mod.is_registered(c5greg_stat)
+        return False
 
     def _poll_ip(self) -> tuple[bool, str | None]:
         """Return ``(answered, ip)``. ``answered`` is False if CGPADDR timed

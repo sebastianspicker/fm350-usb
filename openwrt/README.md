@@ -15,8 +15,7 @@
 scp -O -r openwrt root@192.168.1.1:/root/   # -O: see below
 ssh root@192.168.1.1
 cd /root/openwrt
-./install.sh --apn internet.telekom          # mrhaav atc handler (default)
-./install.sh --apn internet.telekom --proto xmm   # modemfeed xmm-modem instead
+./install.sh --apn internet.telekom          # mrhaav atc handler
 ./install.sh --apn internet.telekom --dry-run     # print the uci commands, change nothing
 ./install.sh --apn internet.telekom --no-mwan3    # network + firewall only, no mwan3
 ```
@@ -53,7 +52,8 @@ ifup wwan; rm /tmp/fm350-watchdog.pause
 
 | Flag | Default | Effect |
 |---|---|---|
-| `--proto atc\|xmm` | `atc` | `atc`: downloads and installs `luci-proto-atc` + `atc-fib-fm350_gl` (mrhaav). `xmm`: prints instructions for the modemfeed `xmm-modem` package instead (not in official feeds) and applies the `network.wwan` config for proto `xmm` without installing anything. |
+| `--proto atc` | `atc` | Downloads and installs `luci-proto-atc` + `atc-fib-fm350_gl` (mrhaav). The only supported handler: `--proto xmm` exits 1. |
+| `--force` | off | Installs even on GL.iNet stock firmware (`/etc/glversion` exists) that has a `network.wwan` of its own, which is replaced (`uninstall.sh` restores it). Without it `install.sh` refuses there. |
 | `--apn APN` | (required) | Carrier APN, e.g. `internet.telekom`, `web.vodafone.de`, `internet`. Letters, digits, dots, underscores, and hyphens are accepted. |
 | `--dry-run` | off | Prints the uci commands and package actions that would run; installs nothing and changes no config. |
 | `--no-mwan3` | off | Skips installing `mwan3`/`luci-app-mwan3` and skips `uci/mwan3.uci`. |
@@ -128,10 +128,10 @@ of the setup guide.
 | `files/usr/lib/fm350/at-port.sh` | Shared AT tty lookup (vendor `0e8d` only, `:1.6` before `:1.4`), sourced by `install.sh`, `fm350-status` and the watchdog. Installed to `/usr/lib/fm350/at-port.sh`. |
 | `uci/fm350-watchdog.uci` | Default settings for the watchdog (`/etc/config/fm350_watchdog`). |
 | `uci/network-atc.uci` | `network.wwan` for the mrhaav `atc` protocol handler, plus `network.wan.metric`. |
-| `uci/network-xmm.uci` | `network.wwan` for the modemfeed `xmm` protocol handler, plus `network.wan.metric`. |
-| `uci/firewall.uci` | Adds `wwan` to the `wan` firewall zone and the "Allow modem RA" ICMPv6 rule. |
+| `uci/firewall.uci` | Adds `wwan` to the `wan` firewall zone. |
 | `uci/mwan3.uci` | wan/wwan mwan3 tracking, members, `failover` policy and `default` rule. |
 | `files/etc/hotplug.d/usb/50-fm350_driver` | Binds the `option` serial driver via `new_id` on kernel < 6.6 only. Copied by `install.sh` when needed. |
+| `files/etc/hotplug.d/usb/60-fm350_reenum` | After the modem re-enumerates (e.g. a crash): waits for the AT port, re-resolves `network.wwan.device`, restarts `wwan` once. Honours the watchdog's pause file, `disabled`/`auto` and a PIN block. Installed with the watchdog, on every kernel. |
 
 All `uci/*.uci` files are `uci batch` snippets: they `delete` a section (or
 `del_list`/`add_list` a single value) before (re-)creating it, so running
@@ -220,15 +220,15 @@ again at each start and three failures PUK-lock the SIM (a carrier-issued PUK
 is then needed, and ten wrong PUKs destroy the SIM). The watchdog restarts
 `wwan`, so it must never do that blindly: it reads `ifstatus wwan`'s
 `errors[].code` and does **not** restart (it logs once per episode) when a code
-contains `pin`, `puk`, `password`, `denied` or `not inserted`,
-case-insensitively. This covers the codes `atc.sh` passes to
-`proto_notify_error` right before `proto_block_restart` in the pinned
-revision: `PINmissing`, `PINerror` (also used for `SIM PUK` and other CPIN
-states), `REG_DENIED`, the raw `+CME ERROR` text `SIM not inserted`, and any
-other raw text that mentions a PIN or password (fail closed).
-`SIMreadfailure` and other raw texts such as `SIM busy` do restart: `atc.sh`
-raises them before any PIN is sent, a restart only re-queries `AT+CPIN?`, and
-the backoff bounds the rate. Assumption: these codes show up in `ifstatus` as
+contains `pin`, `puk` or `password`, case-insensitively. This covers the codes
+`atc.sh` passes to `proto_notify_error` right before `proto_block_restart` in
+the pinned revision: `PINmissing`, `PINerror` (also used for `SIM PUK` and
+other CPIN states), and any other raw text that mentions a PIN or password
+(fail closed). `REG_DENIED`, the raw text `SIM not inserted`, `SIMreadfailure`
+and other raw texts such as `SIM busy` do restart: `atc.sh` raises them before
+any PIN is sent, a restart only re-queries `AT+CPIN?`, and the backoff bounds
+the rate. `REG_DENIED` and `SIM not inserted` (which can be transient after a
+modem crash) are retried at most once per `backoff_max`. Assumption: these codes show up in `ifstatus` as
 `errors[].code`; this is unverified on hardware, and `SESSION_FAILED` (bad
 APN) is still retried with backoff. Prefer a SIM with the PIN disabled, and do
 not set `pincode` until you have checked the PIN by hand.
@@ -241,8 +241,12 @@ mrhaav's `atc.sh` treats only `+CME ERROR ... (#33)` from `AT+CGACT` as fatal. A
 
 - you disabled it (`network.wwan.disabled=1` or `network.wwan.auto=0`),
 - you paused the watchdog (`touch /tmp/fm350-watchdog.pause`),
-- the modem is absent (no FM350 AT port in sysfs; its clocks are reset, so a replug doesn't trigger an immediate restart), or
-- `ifstatus` shows a SIM/PIN/registration-denied error (see [the PIN/PUK risk](#pinpuk-risk)).
+- the modem is absent (no FM350 AT port in sysfs; its clocks are reset, so the unplug doesn't burn down the backoff), or
+- `ifstatus` shows a PIN/PUK/password error (see [the PIN/PUK risk](#pinpuk-risk)).
+
+After the modem was absent (it crashed and re-enumerated), the first pending period is 90 s instead of `pending_threshold`. The USB hotplug helper `60-fm350_reenum` restarts `wwan` sooner still, once the AT port is back. If netifd keeps `wwan` "up" through a re-enumeration, the modem's changing USB device number triggers one restart.
+
+A sysupgrade keeps `/etc/config` and, through `/etc/sysupgrade.conf`, the files `install.sh` installed, but not the packages: run `install.sh` again afterwards (`fm350-status` warns when `atc.sh` or mwan3 is missing).
 
 The watchdog runs without `set -e`, so a failing `ifstatus`, `jsonfilter` or `uci` call is treated as "unknown" instead of killing it, and procd respawns it indefinitely (`respawn 3600 5 0`). `check_interval`, `pending_threshold` and `backoff_max` must be greater than 0; a `0` falls back to the default.
 

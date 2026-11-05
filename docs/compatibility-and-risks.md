@@ -16,6 +16,8 @@ confirmed = primary source or reproduced report; reported = single community rep
 
 ## 1. FM350-GL in the Waveshare USB TO M.2 B KEY
 
+This section covers the earlier adapter. Since 2026-11-05 the bench uses the Waveshare USB 3.2 Gen1 5G DONGLE (USB-C power, optional 5-12 V DC jack, SIM2 wired to an onboard eSIM; see [hardware.md](hardware.md)). The FM350 works in it, but sustained uploads reset the module there.
+
 | Claim | Status | Evidence |
 |---|---|---|
 | Waveshare says FM350 is unsupported | confirmed | RM520N-GL wiki: *"The FM350 series is a custom module for a certain brand's computer and does not support it either."* Not in the adapter's tested list. |
@@ -52,7 +54,7 @@ GL.iNet staff: *"we can't guarantee compatibility with every third-party model"*
   2. `AT+CGPADDR=1` returns the IP, which is set as a static `/24` on the RNDIS interface
   3. `ip link set <if> arp off`; default route through the device
   4. `AT+GTDNS=1` returns the DNS servers
-- After a network drop the FM350 gives few signals the host can react to. mrhaav's script uses the NITZ indication `+CTZV` to trigger a reconnect. A hotplug helper (`60-fm350_crash`) re-runs `ifup` when the modem re-enumerates after a crash.
+- After a network drop the FM350 gives few signals the host can react to. mrhaav's script uses the NITZ indication `+CTZV` to trigger a reconnect. Our hotplug helper (`60-fm350_reenum`, installed by `install.sh`) restarts `wwan` when the modem re-enumerates after a crash.
 - Band and RAT (radio access technology) control use Fibocom `GT` commands (`AT+GTACT`), not Quectel `QCFG` or `QNWPREFCFG`, so any Quectel-oriented UI will not work for these settings.
 
 ## 5. Power and thermal
@@ -68,7 +70,7 @@ The module firmware can be updated with SP Flash Tool (MediaTek's Windows progra
 
 Found against a fake modem (atc-fib-fm350_gl 2025.08.24-r3):
 
-- No SIM: fails fast and cleanly (`SIM not inserted`, restart blocked). It does not loop.
+- No SIM: fails fast and cleanly (`SIM not inserted`, restart blocked). It does not loop. The fm350-watchdog retries this error at most once per `backoff_max`, since it can be transient after a modem crash.
 - `AT+CGACT` errors: only `+CME ERROR: Requested service option not subscribed (#33)` is treated as fatal. Any other `+CME ERROR` during activation is ignored, and the `atc` protocol handler (the OpenWrt add-on that dials the modem) then waits forever for URCs (unsolicited status messages from the modem) that never arrive. `wwan` stays "connecting" and never goes online in mwan3 (OpenWrt's multi-WAN package that does the switching), so failover would silently be unavailable. If this happens on the bench, `ifup wwan` restarts it. The repo now includes a watchdog service, `fm350-watchdog`, that does exactly this automatically after a 180 s threshold — see [openwrt/README.md, fm350-watchdog: recovering a stuck `wwan`](../openwrt/README.md#fm350-watchdog-recovering-a-stuck-wwan) [openwrt README, fm350-watchdog].
 - Its own AT-readiness retry loop (`while [ $atOut != 'OK' ]`, unquoted) gives up after one attempt. This is harmless because `gcom` already waits up to 25 s per command.
 - `atc_debug` unset prints `sh: out of range` to stderr. This is cosmetic.

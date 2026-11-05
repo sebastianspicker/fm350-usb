@@ -102,13 +102,16 @@ class RndisUsb:
 
     def __init__(self, usb_device: UsbDevice) -> None:
         self.usb_device = usb_device
-        usb_device.claim_interface(CONTROL_IFACE)
-        usb_device.claim_interface(DATA_IFACE)
         self._claimed = True
-
-        self.ep_interrupt, _ = usb_device.find_endpoint(CONTROL_IFACE, "in", "interrupt")
-        self.ep_bulk_in, _ = usb_device.find_endpoint(DATA_IFACE, "in", "bulk")
-        self.ep_bulk_out, self.bulk_out_max_packet = usb_device.find_endpoint(DATA_IFACE, "out", "bulk")
+        try:
+            usb_device.claim_interface(CONTROL_IFACE)
+            usb_device.claim_interface(DATA_IFACE)
+            self.ep_interrupt, _ = usb_device.find_endpoint(CONTROL_IFACE, "in", "interrupt")
+            self.ep_bulk_in, _ = usb_device.find_endpoint(DATA_IFACE, "in", "bulk")
+            self.ep_bulk_out, self.bulk_out_max_packet = usb_device.find_endpoint(DATA_IFACE, "out", "bulk")
+        except BaseException:
+            self.close()  # release_interface skips an interface that was never claimed
+            raise
         _log.debug(
             "RNDIS endpoints: interrupt=%#04x bulk_in=%#04x bulk_out=%#04x",
             self.ep_interrupt, self.ep_bulk_in, self.ep_bulk_out,

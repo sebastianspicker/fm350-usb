@@ -26,7 +26,7 @@ task-focused door in.
   throughput before the dongle goes on the Flint 2, and as an ad-hoc Mac
   uplink. The production failover path is still the router (see
   [setup-guide.md](setup-guide.md)).
-- Status (release 0.1.0a1, alpha): verified on hardware on 2026-10-05 (FM350-GL / Dell DW5931e, Telekom DE SIM, LTE B3/B7, macOS 27, Apple Silicon): USB enumeration, AT, `status`/`doctor`/`probe`, `up --route-host` (ping, HTTPS, capped `iperf3`), `helper install`/`helper status`, clean teardown, a 10-minute idle soak, automatic recovery after unplug/replug (57 s) and 50 MB transfers (42.1 Mbit/s down, 34.7 Mbit/s up). Not verified on hardware: `--default-route`, `--dns`, sessions longer than 10 minutes, the keepalive watchdog and stall detection actually firing, rebuild retry after a failed bring-up, the RNDIS-level rebuild, and Intel Macs. Not supported: IPv6 (IPv4 only) and more than one modem. See "What's not proven yet".
+- Status (release 0.1.0a1, alpha): verified on hardware on 2026-10-05 (FM350-GL / Dell DW5931e, Telekom DE SIM, LTE B3/B7, macOS 27, Apple Silicon): USB enumeration, AT, `status`/`doctor`/`probe`, `up --route-host` (ping, HTTPS, capped `iperf3`), `helper install`/`helper status`, clean teardown, a 10-minute idle soak, automatic recovery after unplug/replug (57 s) and 50 MB transfers (42.1 Mbit/s down, 34.7 Mbit/s up). On 2026-11-05 (Waveshare USB 3.2 Gen1 5G DONGLE): firmware-crash recovery ran on hardware (`up` rebuilt the session in about 41 s) and a 500 MB download reached 132 Mbit/s; sustained uploads (28-195 MB) reset the module in 3 of 3 runs (cause unresolved: module fault or supply transient). Not verified on hardware: `--default-route`, `--dns`, sessions longer than 10 minutes, whether the PacketAlignmentFactor raw value is 8 or 3, the keepalive watchdog and stall detection actually firing, rebuild retry after a failed bring-up, the RNDIS-level rebuild, and Intel Macs. Not supported: IPv6 (IPv4 only) and more than one modem. See "What's not proven yet".
 - Biggest caveat: live throughput has only been measured in short, capped runs on a weak cell (roughly 10-20 Mbit/s down, 7-15 Mbit/s up, driver CPU 3-8%). That is a radio-limited figure, not a capacity figure.
 
 ## Facts measured on this Mac
@@ -123,13 +123,13 @@ The pieces, in the order a packet or a failure meets them:
 8. **Keepalive and supervision:** answer device `KEEPALIVE_MSG` with `KEEPALIVE_CMPLT`, send our own every 5 s; the supervisor polls and watches for stalls.
 9. **Teardown (SIGINT/SIGTERM/SIGHUP):** remove DNS key and restore routes, stop the bridge, log `stats:` and `perf:`, `AT+CGACT=0,1`, RNDIS HALT, release interfaces, then close the utun (with the helper, closing the connection also undoes anything left).
 
-`up --dry-run` has no side effects: it sends only read-only AT queries (`CPIN?`, `CGSN`, `CGACT?`, `CGPADDR`, `GTDNS`; no `CGDCONT`/`CGACT` writes), does no RNDIS init/halt and runs no system command. It prints the AT commands and system commands it would run (using a placeholder address if the PDP context isn't already active). It needs neither root nor the helper.
+`up --dry-run` has no side effects: it sends only read-only AT queries (`CPIN?`, `CGSN`, `CGACT?`, `CGPADDR`, `GTDNS`; no `CGDCONT`/`CGACT` writes), does no RNDIS init/halt and changes nothing on the system (with `--default-route` it runs only the read-only `route -n get default`). It prints the AT commands and system commands it would run (using a placeholder address if the PDP context isn't already active). It needs neither root nor the helper.
 
 Shutdown order (SIGINT/SIGTERM/SIGHUP handlers are installed before the first network change): routes/DNS, then the bridge, then AT deactivate, then RNDIS halt.
 
 ### Failure handling and rebuilds
 
-All of this is covered by unit and end-to-end tests with fake USB and AT layers (`up --loopback` uses the plain bridge, without the supervisor or rebuilds). On hardware, unplug/replug recovery was verified on 2026-10-05 (see the plan below); the keepalive watchdog, stall detection and rebuild retry have not fired on hardware yet.
+All of this is covered by unit and end-to-end tests with fake USB and AT layers (`up --loopback` uses the plain bridge, without the supervisor or rebuilds). On hardware, unplug/replug recovery was verified on 2026-10-05 (see the plan below); firmware-crash recovery ran on hardware on 2026-11-05; the keepalive watchdog, stall detection and rebuild retry have not fired on hardware yet.
 
 - **Device loss** (the FM350's firmware is known to crash and re-enumerate under real network conditions). The utun stays, routes and DNS are removed, `up` waits up to `--reenum-timeout` (default 180 s) for the modem, waits 15 s for its firmware to settle, then rebuilds AT, RNDIS and the bridge. The modem's IMEI is pinned at first bring-up: if a different IMEI comes back, `up` refuses to rebuild (exit 4). A different USB port only logs a warning. If the modem does not return in time: exit 3.
 - **Bridge failure with the modem still on the bus** (watchdog, stall detection, an endpoint error). A bounded RNDIS-level rebuild without waiting for re-enumeration: at most 3 in a row (the counter resets after a session was stable for 10 minutes), then exit 2. Rebuilds forced by the supervisor's stall detection are not counted toward that cap, by design: a backup link that is down keeps being retried. The rebuild pauses 3 s between the RNDIS HALT and the re-INIT so the modem settles.
@@ -174,7 +174,7 @@ fm350mac/                 Python >=3.11 project, uv-managed (pyproject.toml, hat
 3. Done: `up` with `--route-host`: utun + pump, verified live 2026-10-05 (ping, HTTPS, capped iperf3, clean teardown).
 4. Done: the root helper, installed and checked on hardware (`helper install`, `helper status`).
 5. Open: `--default-route` + `--dns` on hardware.
-6. Done 2026-10-05: 10-minute soak and unplug/replug recovery on hardware. Open: longer sessions; the keepalive watchdog, stall detection and rebuild retry actually firing on hardware (so far only the healthy path was observed there).
+6. Done 2026-10-05: 10-minute soak and unplug/replug recovery on hardware. Done 2026-11-05: firmware-crash recovery (about 41 s). Open: longer sessions; the keepalive watchdog, stall detection and rebuild retry actually firing on hardware (so far only the healthy path was observed there).
 7. Open: Intel Macs.
 8. Later, not planned for 0.1.0a1: IPv6 (`IPV4V6` PDP, RA via the modem), more than one modem.
 
@@ -203,7 +203,7 @@ running sync pyusb (packets can be reordered on RX).
   - **Lifetime rules (a mistake here crashes a root process):** transfers, buffers and the single `CFUNCTYPE` callback object are allocated once and kept referenced in the pool until *every* transfer has reported a final status after cancel. Never free or resize a buffer while its transfer is in flight. `free_transfer` only after its callback ran with a non-resubmitted status. No `LIBUSB_TRANSFER_FREE_*` flags (Python owns the memory).
   - The callback must never raise into C: wrap its body in try/except, log, and mark the pool failed.
   - Status handling: `COMPLETED` → deliver (IN) / release slot (OUT). `TIMED_OUT` → IN: resubmit; OUT: count stall, release slot. `CANCELLED` → retire. `NO_DEVICE` → mark failed (device gone), retire. `STALL` → schedule `clear_halt` from a non-event thread, then resubmit. `ERROR`/`OVERFLOW` → count, resubmit with backoff; fatal after K consecutive.
-- `EventLoop`: one thread runs `libusb_handle_events_timeout_completed(ctx, 100 ms)` until stopped. All callbacks run on it, so **RX order is preserved**. `stop()` = cancel all pools, then keep handling events until every pool reports all transfers retired (bounded wait, e.g. 2 s; if exceeded, log loudly, skip freeing and leak rather than free memory that's still in flight).
+- `EventLoop`: one thread runs `libusb_handle_events_timeout_completed(ctx, 100 ms)` until stopped. Most callbacks run on it, but libusb lets a thread blocked in a sync transfer (the control or AT thread) handle events too, so a callback can also run there. libusb's event lock lets only one thread handle events at a time, so callbacks never overlap and **RX order is preserved**. The `perf:` line reports the time spent in callbacks (`cb_busy`, `cb_max`). `stop()` = cancel all pools, then keep handling events until every pool reports all transfers retired (bounded wait, e.g. 2 s; if exceeded, log loudly, skip freeing and leak rather than free memory that's still in flight).
 
 ### New data path `AsyncBridge` (same public API as `Bridge`: start/stop/failed/stats)
 
@@ -249,7 +249,7 @@ To test the pool size on hardware, run the same iperf3 upload with `--tx-urbs 4`
 | | Main process `fm350mac` | Helper `fm350mac-helper` |
 |---|---|---|
 | Runs as | you | root, via a LaunchDaemon |
-| Interpreter | Homebrew/.venv Python (any) | **`/usr/bin/python3`** (Apple CLT 3.9.6, root-owned; no user-writable code on its path, `-I -S` isolated mode) |
+| Interpreter | Homebrew/.venv Python (any) | **`/usr/bin/python3`** (Apple's shim for the xcode-select-selected Python 3.9; `helper install` and `helper status` check that the interpreter it really runs and its stdlib are root-owned and not group/other-writable; `-I -S` isolated mode) |
 | Code | everything: USB, RNDIS, AT, bridge, supervisor | one file, stdlib only, Python 3.9 compatible, installed root:wheel 0755 at `/usr/local/libexec/fm350mac-helper` |
 | Does | data path | creates utun, passes its fd over the socket, sets address/routes/DNS, restores everything on disconnect |
 
@@ -274,7 +274,7 @@ To test the pool size on hardware, run the same iperf3 upload with `--tx-urbs 4`
 
 - Installing runs the package as root once: `sudo "$(command -v fm350mac)" helper install` executes the installed `fm350mac` and its Python environment as root, to read one file, check that it compiles under `/usr/bin/python3 -I -S`, and write the helper and its plist. That interpreter and those packages are owned by the user, so anything that can write to them decides what runs as root for that step. Inspecting the helper file or running `helper install --dry-run --allowed-uid <uid>` does not limit this: both use the same user-owned code. The mitigation is to compare the printed `helper sha256:` with the value published in the release notes and the CHANGELOG and install with `--expect-sha256 <sha256>`, which pins the one file that stays on the system as root. `helper install` also warns (`WARNING: running user-owned code as root`) when run as root from a user-owned Python, and root-owned `__pycache__` files may be written into the user's venv. `sudo uv run` must not be used: it runs uv as root and leaves root-owned files in the project's `.venv`.
 - After that, only the copied helper file runs as root, with nothing user-writable on its interpreter or import path. The install step writes it atomically and refuses symlinks and directories that are not root-owned or are group/other-writable.
-- The helper is not harmless: any process running as the allowed uid can ask it, as root, to create a utun, set an address, add up to 8 host routes, replace the default route and set DNS. It runs fixed argv lists without a shell and validates every argument, so it cannot be made to run arbitrary commands, but a hostile process running as that user could redirect the Mac's traffic. The socket (mode 0600, owned by the installing uid, plus the `LOCAL_PEERCRED` check) keeps other users out.
+- The helper is not harmless: any process running as the allowed uid can ask it, as root, to create a utun, set one address (changed only by replacing it), add up to 8 host routes, replace the default route and set DNS. It runs fixed argv lists without a shell and validates every argument, so it cannot be made to run arbitrary commands, but a hostile process running as that user could redirect the Mac's traffic. The socket (mode 0600, owned by the installing uid, plus the `LOCAL_PEERCRED` check) keeps other users out.
 - Nothing is code-signed or notarized.
 
 This design has since run live end to end — see the [bench log's privilege
@@ -290,10 +290,11 @@ Everything verified so far was verified on one unit on 2026-10-05 (Telekom DE SI
 
 - `--default-route` and `--dns`.
 - Sessions longer than 10 minutes (a 10-minute idle soak passed).
-- Recovery when the modem re-enumerates on its own (firmware crash). Unplug/replug recovery is verified: session rebuilt automatically 57 s after the unplug.
+- Firmware-crash recovery is verified (2026-11-05): `up` rebuilt the session in about 41 s after the module reset on its own. Unplug/replug recovery is also verified (57 s).
 - The resilience features actually firing: keepalive watchdog, supervisor stall detection, rebuild retry after a failed bring-up, RNDIS-level rebuild. On hardware only the healthy path (watchdog not firing) has been observed.
 - Intel Macs. The libusb loader also looks in `/usr/local`, but that is untested.
-- Throughput above about 40 Mbit/s. 50 MB transfers reached 42.1 Mbit/s down and 34.7 Mbit/s up on LTE B8, radio-limited; the measured USB OUT latency (mean 184 µs) puts the 8-URB TX ceiling near 43k packets/s, far above that.
+- Sustained uploads. On 2026-11-05 uploads of 28-195 MB reset the whole module in 3 of 3 runs (50 MB or less passed; downloads never crashed). We don't know yet whether it's a module fault or a supply transient. Throughput above 40 Mbit/s was reached on downloads: 132 Mbit/s (500 MB). On 2026-10-05, 50 MB transfers reached 42.1 Mbit/s down and 34.7 Mbit/s up on LTE B8, radio-limited; the measured USB OUT latency (mean 184 µs) puts the 8-URB TX ceiling near 43k packets/s.
+- The PacketAlignmentFactor raw value (8 or 3) is still unchecked.
 
 Not supported:
 

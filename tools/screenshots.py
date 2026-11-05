@@ -484,6 +484,9 @@ def main() -> int:
 
     os.makedirs(args.out, exist_ok=True)
     selected = set(args.only) if args.only else {name for name, _ in SHOTS}
+    unknown = selected - {name for name, _ in SHOTS}
+    if unknown:
+        sys.exit("error: unknown shot name(s): %s" % ", ".join(sorted(unknown)))
 
     for name, builder in SHOTS:
         if name not in selected:

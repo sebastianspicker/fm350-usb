@@ -59,6 +59,13 @@ PING_COUNT=500
 PING_INTERVAL=0.01
 PING_SIZE=1400
 UP_WAIT_TIMEOUT=60  # bring-up includes AT+CGACT, which may take up to 60 s
+MAX_SECONDS=""      # wall-clock limit per iperf3 run; empty = 2x the expected time + 60 s
+LEDGER="$SCRIPT_DIR/bench-results/.sim-ledger"
+BUDGET_MB=""
+SESSION_LOST_IN=""  # "mode direction/proto" of runs that lost the session, for SUMMARY.md
+# Log lines of `fm350mac up` that mean the session is gone; tools/tests/test_bench_log_strings.py
+# checks that fm350mac still logs each of them.
+LOST_SESSION_RE='bridge failed|modem disconnected|supervisor stopping|IP changed'
 
 usage() {
     cat <<'EOF'
@@ -75,6 +82,13 @@ Options:
                        (default: 5M). TCP runs use `iperf3 -n N`. 0 = no volume
                        cap: --duration is used instead (can burn a lot of data)
   --duration SECONDS   seconds per run, only when --max-bytes 0 (default: 20)
+  --max-seconds N      stop an iperf3 run that takes longer than N seconds and count it as
+                       failed (default: 2x the expected time + 60; a -n run assumes at
+                       least 10 Mbit/s)
+  --ledger FILE        append every run's measured SIM usage (driver count) to FILE
+                       (default: tools/bench-results/.sim-ledger)
+  --budget MB          refuse (exit 2) when the ledger total plus this run's worst-case
+                       estimate would exceed MB megabytes
   --tests LIST         comma-separated: down, up, udp (default: down,up)
                        udp runs both directions
   --udp-bitrate RATE   UDP target rate, e.g. 5M (default: 5M). Must be > 0; the UDP
@@ -101,7 +115,8 @@ Options:
 Real mode runs, for each bridge mode: fm350mac status (before), then
 fm350mac up --apn APN --io MODE --route-host SERVER_IP, the selected iperf3
 tests, then stops the session, verifies teardown and takes fm350mac status
-again. Before every iperf3 run the harness checks that the route to the
+again. A run that loses the session (modem crash) stops that mode's remaining tests and
+is named in SUMMARY.md. Before every iperf3 run the harness checks that the route to the
 server really points at the tunnel's utun and that `up` is still alive,
 and it records the bytes that went over the utun during each test.
 
@@ -137,6 +152,9 @@ while [[ $# -gt 0 ]]; do
         --port) PORT="$2"; shift 2 ;;
         --max-bytes) MAX_BYTES_ARG="$2"; shift 2 ;;
         --duration) DURATION="$2"; shift 2 ;;
+        --max-seconds) MAX_SECONDS="$2"; shift 2 ;;
+        --ledger) LEDGER="$2"; shift 2 ;;
+        --budget) BUDGET_MB="$2"; shift 2 ;;
         --udp-bitrate) UDP_BITRATE_ARG="$2"; shift 2 ;;
         --tests)
             IFS=',' read -r -a TESTS <<< "$2"
@@ -172,6 +190,18 @@ fi
 for mode in "${MODES[@]}"; do
     if [[ "$mode" != "sync" && "$mode" != "async" ]]; then
         echo "unknown --io mode: $mode (expected sync or async)" >&2
+        exit 2
+    fi
+done
+
+if [[ -n "$(printf '%s\n' "${MODES[@]}" | sort | uniq -d)" ]]; then
+    echo "--modes lists a mode twice: the second run would overwrite the first one's logs and SIM usage" >&2
+    exit 2
+fi
+
+for spec in "--max-seconds:$MAX_SECONDS" "--budget:$BUDGET_MB"; do
+    if [[ -n "${spec#*:}" ]] && { [[ ! "${spec#*:}" =~ ^[0-9]+$ ]] || (( 10#${spec#*:} < 1 )); }; then
+        echo "invalid ${spec%%:*}: ${spec#*:} (expected an integer >= 1)" >&2
         exit 2
     fi
 done
@@ -327,6 +357,7 @@ wait_for_up_iface() {
 # Globals used to hand the running `up` process and its utun name from
 # start_up()/run_loopback_mode() to the cleanup trap and to verify_teardown().
 UP_PID=""
+IPERF_PID=""
 UP_IFACE=""
 CURRENT_MODE=""
 BENCH_FAILED=0
@@ -451,7 +482,13 @@ verify_path() {
 # shellcheck disable=SC2329 # invoked by the EXIT trap below
 cleanup() {
     local rc=$?
-    trap - EXIT INT TERM HUP
+    # Ignore (not reset) signals: a second one must not skip the teardown check or SIM accounting.
+    trap - EXIT
+    trap '' INT TERM HUP
+    if [[ -n "$IPERF_PID" ]]; then
+        kill "$IPERF_PID" 2>/dev/null || true
+        wait "$IPERF_PID" 2>/dev/null || true
+    fi
     if [[ -n "$UP_PID" ]] && kill -0 "$UP_PID" 2>/dev/null; then
         log "cleanup: fm350mac up is still running, stopping it"
         if [[ -n "$UP_IFACE" ]]; then
@@ -460,10 +497,10 @@ cleanup() {
             stop_up "$UP_PID" TERM
         fi
         UP_PID=""
-        # The interrupted session's data use still counts against the SIM.
-        if [[ "$LOOPBACK" -ne 1 && -n "$CURRENT_MODE" ]]; then
-            record_sim_usage "$RESULTS_DIR/up-$CURRENT_MODE.log" "$RESULTS_DIR/sim-$CURRENT_MODE.txt"
-        fi
+    fi
+    # An interrupted session's data use still counts against the SIM.
+    if [[ "$LOOPBACK" -ne 1 && -n "$CURRENT_MODE" && -f "$RESULTS_DIR/up-$CURRENT_MODE.log" ]]; then
+        record_sim_usage "$RESULTS_DIR/up-$CURRENT_MODE.log" "$RESULTS_DIR/sim-$CURRENT_MODE.txt"
     fi
     if [[ -n "$UP_IFACE" || "$BENCH_STARTED" -eq 1 ]]; then
         if ! verify_teardown "$UP_IFACE" "$DEFAULT_ROUTE_BEFORE" "$UTUNS_BEFORE"; then
@@ -493,11 +530,23 @@ cputime_seconds() {
         }' || true
 }
 
-# Append one "<epoch> <cpu-seconds>" sample for $1 to $2.
+# Epoch seconds with fractions (a `date` that doesn't expand %N prints it literally).
+now_ts() {
+    local t
+    t="$(date +%s.%N)"
+    if [[ "$t" == *N* ]]; then
+        t="$(perl -MTime::HiRes=time -e 'printf "%.3f\n", time')"
+    fi
+    echo "$t"
+}
+
+# Append one "<epoch> <cpu-seconds>" sample for $1 to $2. The summary divides by the
+# wall-clock delta, so the epoch needs sub-second resolution: a whole-second stamp
+# plus the poll loop's tail made short runs read 2-4x too idle.
 cpu_sample_once() {
     local pid="$1" outfile="$2" cpu
     cpu="$(cputime_seconds "$pid")"
-    [[ -z "$cpu" ]] || printf '%s %s\n' "$(date +%s)" "$cpu" >> "$outfile"
+    [[ -z "$cpu" ]] || printf '%s %s\n' "$(now_ts)" "$cpu" >> "$outfile"
 }
 
 # Sample the cputime of $pid once a second (max $3 seconds) into $2. Run in
@@ -520,13 +569,24 @@ sample_cpu() {
 # and anything else routed via the tunnel); see the utun caveat below.
 record_sim_usage() {
     local stats
-    stats="$(sed -n 's/.*stats: rx=[0-9]*\/\([0-9]*\)B tx=[0-9]*\/\([0-9]*\)B.*/\1 \2/p' "$1" 2>/dev/null | tail -n1)" || true
+    # `up` logs one stats line per bridge, i.e. per session attempt: a session
+    # rebuilt mid-run (modem crash, stall) has several, and the usage is their sum.
+    stats="$(sed -n 's/.*stats: rx=[0-9]*\/\([0-9]*\)B tx=[0-9]*\/\([0-9]*\)B.*/\1 \2/p' "$1" 2>/dev/null \
+        | awk '{rx += $1; tx += $2} END {if (NR) printf "%.0f %.0f\n", rx, tx}')" || true
     if [[ -z "$stats" ]]; then
         log "WARNING: no driver stats line in $(basename "$1"); SIM usage for this mode unknown"
         return 0
     fi
     echo "$stats" > "$2"
-    log "SIM usage (driver count): rx $(( ${stats% *} / 1000 )) kB, tx $(( ${stats#* } / 1000 )) kB"
+    local rx="${stats% *}" tx="${stats#* }" est
+    log "SIM usage (driver count): rx $(( rx / 1000 )) kB, tx $(( tx / 1000 )) kB"
+    # The ledger is what --budget adds up across runs: "<epoch> <rx> <tx>".
+    { mkdir -p "$(dirname "$LEDGER")" && printf '%s %s %s\n' "$(date +%s)" "$rx" "$tx" >> "$LEDGER"; } \
+        || log "WARNING: could not append to the SIM ledger $LEDGER; --budget will undercount"
+    est="$(estimate_bytes)"
+    if [[ "$est" != "unbounded" ]] && (( rx + tx > est / ${#MODES[@]} )); then
+        log "WARNING: measured SIM usage ($(( (rx + tx) / 1000000 )) MB) is above the estimate for this mode ($(( est / ${#MODES[@]} / 1000000 )) MB)"
+    fi
 }
 
 # Write the rx/tx byte delta between two utun_bytes outputs to $3.
@@ -548,9 +608,22 @@ record_utun_usage() {
     log "utun usage: rx $((rx / 1000)) kB, tx $((tx / 1000)) kB"
 }
 
+# Rough duration of one run, for the --max-seconds default (a -n run assumes at least 10 Mbit/s).
+expected_seconds() {
+    if [[ "$1" == "udp" ]]; then
+        echo "$UDP_TIME"
+    elif (( MAX_BYTES > 0 )); then
+        echo $((MAX_BYTES / 1250000 + 1))
+    else
+        echo "$DURATION"
+    fi
+}
+
 # run_iperf MODE DIRECTION PROTO OUT_JSON CPU_FILE UP_PID
-# Returns 0 on success, 1 if iperf3 failed, 3 if the path check failed (the
-# caller must then stop the whole run: nothing was sent).
+# Returns 0 on success, 1 if iperf3 failed (or ran past --max-seconds), 3 if the
+# path check failed (the caller must then stop the whole run: nothing was sent),
+# 4 if the session was lost during the run (the caller must stop that mode: the
+# module has probably just crashed).
 run_iperf() {
     local mode="$1" direction="$2" proto="$3" out_json="$4" cpu_file="$5" up_pid="$6"
     if ! verify_path; then
@@ -574,11 +647,43 @@ run_iperf() {
     usage_before="$(utun_bytes "$UP_IFACE")"
     sample_cpu "$up_pid" "$cpu_file" 3600 &
     local sampler_pid=$!
-    local failed=0
-    if ! iperf3 "${args[@]}" > "$out_json" 2> "${out_json}.stderr" < /dev/null; then
+    local failed=0 lost="" timed_out=0 tick=0 up_log="$RESULTS_DIR/up-$mode.log" log_mark=0
+    local limit="${MAX_SECONDS:-$((2 * $(expected_seconds "$proto") + 60))}"
+    local deadline=$((SECONDS + limit))
+    [[ -f "$up_log" ]] && log_mark="$(wc -l < "$up_log")"
+    # In the background so a lost session can be noticed: a capped (-n) run has
+    # no time limit, and its TCP connection does not survive a rebuild of the
+    # session (seen 2026-11-05: modem crash, session rebuilt, iperf3 hung 12 min).
+    iperf3 "${args[@]}" > "$out_json" 2> "${out_json}.stderr" < /dev/null &
+    IPERF_PID=$!
+    # Polls every 0.2 s so the CPU samples end close to iperf3's end; the log is read every 5th poll.
+    while kill -0 "$IPERF_PID" 2>/dev/null; do
+        if ! kill -0 "$up_pid" 2>/dev/null; then
+            lost="fm350mac up exited"
+        elif (( tick % 5 == 0 )) && [[ -f "$up_log" ]] && tail -n +"$((log_mark + 1))" "$up_log" \
+                | grep -E "$LOST_SESSION_RE" >/dev/null; then
+            lost="the session was lost (see $(basename "$up_log"))"
+        fi
+        if [[ -n "$lost" ]]; then
+            log "ERROR: $lost during iperf3 $direction/$proto; stopping iperf3"
+            kill "$IPERF_PID" 2>/dev/null || true  # TERM: background jobs start with INT ignored
+            break
+        fi
+        if (( SECONDS >= deadline )); then
+            log "ERROR: iperf3 $direction/$proto ran past --max-seconds (${limit}s); stopping iperf3"
+            kill "$IPERF_PID" 2>/dev/null || true
+            timed_out=1
+            break
+        fi
+        tick=$((tick + 1))
+        sleep 0.2
+    done
+    if ! wait "$IPERF_PID" || [[ -n "$lost" ]] || (( timed_out )); then
         log "ERROR: iperf3 $direction/$proto failed for mode=$mode; see ${out_json}.stderr"
         failed=1
+        [[ -z "$lost" ]] || failed=4
     fi
+    IPERF_PID=""
     kill "$sampler_pid" 2>/dev/null || true
     wait "$sampler_pid" 2>/dev/null || true
     cpu_sample_once "$up_pid" "$cpu_file"
@@ -648,6 +753,24 @@ confirm_budget() {
     fi
     log "ERROR: estimated data use is above 50 MB (or unbounded); pass --yes to proceed"
     return 1
+}
+
+# With --budget: refuse when what the ledger already holds plus this run's
+# worst case would exceed it. Returns 1 if the run must not proceed.
+check_budget() {
+    [[ -n "$BUDGET_MB" ]] || return 0
+    local est used=0
+    est="$(estimate_bytes)"
+    [[ ! -f "$LEDGER" ]] || used="$(awk '{ s += $2 + $3 } END { printf "%.0f", s }' "$LEDGER")"
+    log "SIM ledger $LEDGER: $((used / 1000000)) MB used so far, budget $BUDGET_MB MB"
+    if [[ "$est" == "unbounded" ]]; then
+        log "ERROR: --budget needs a bounded run (--max-bytes above 0)"
+        return 1
+    fi
+    if (( used + est > BUDGET_MB * 1000000 )); then
+        log "ERROR: $((used / 1000000)) MB used + $(( (est + 999999) / 1000000 )) MB estimated is over the $BUDGET_MB MB budget"
+        return 1
+    fi
 }
 
 # --full-tunnel moves the Mac's default route onto the SIM: ask for explicit
@@ -737,6 +860,11 @@ run_real_mode() {
                 BENCH_FAILED=1
                 path_abort=1
                 break
+            elif [[ "$rc" -eq 4 ]]; then
+                BENCH_FAILED=1
+                SESSION_LOST_IN="${SESSION_LOST_IN:+$SESSION_LOST_IN, }$mode $direction/$proto"
+                log "ERROR: session lost in mode=$mode; skipping its remaining tests (the module may have just crashed)"
+                break
             elif [[ "$rc" -ne 0 ]]; then
                 BENCH_FAILED=1
             fi
@@ -767,6 +895,10 @@ run_real_mode() {
     local python_bin="python3"
     command -v python3 >/dev/null 2>&1 || python_bin="$VENV_PYTHON"
     "$python_bin" "$SUMMARIZE" "$RESULTS_DIR" | tee "$RESULTS_DIR/SUMMARY.md"
+    if [[ -n "$SESSION_LOST_IN" ]]; then
+        printf '\nSession lost during: %s. The remaining tests of that mode were skipped.\n' "$SESSION_LOST_IN" \
+            | tee -a "$RESULTS_DIR/SUMMARY.md"
+    fi
     log "results in $RESULTS_DIR"
 }
 
@@ -961,6 +1093,7 @@ if [[ "$LOOPBACK" -ne 1 ]]; then
     fi
     confirm_full_tunnel || exit 2
     confirm_budget || exit 2
+    check_budget || exit 2
 fi
 
 # Never reuse a results dir: stale *.json/sim-*.txt would end up in SUMMARY.md.

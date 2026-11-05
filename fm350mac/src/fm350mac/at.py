@@ -7,12 +7,13 @@ CLI, now a thin wrapper around ``AtPort``.
 
 from __future__ import annotations
 
-import ipaddress
 import logging
 import re
 import threading
 import time
 
+# One copy of the IPv4 rule; supervisor/cli reach it as at.valid_assigned_ipv4.
+from .helper.fm350mac_helper import valid_assigned_ipv4
 from .redact import redact_pin
 from .usb_async import UsbDevice, UsbTimeout, open_device
 
@@ -67,6 +68,8 @@ class AtPort:
     passed in explicitly, ``close()`` only releases this port's interface,
     leaving the device open for whoever else is using it.
     """
+
+    _needs_resync = False  # set while a command's reply is outstanding
 
     def __init__(self, usb_device: UsbDevice | None = None, iface_override: int | None = None) -> None:
         self._owns_device = usb_device is None
@@ -129,10 +132,19 @@ class AtPort:
         """
         if stop_event is not None and stop_event.is_set():
             raise AtTimeoutError(f"{cmd!r} not sent: stop requested")
+        if self._needs_resync:
+            # A late reply to the abandoned command would pass for this one's: sync on a no-op first.
+            self._needs_resync = False
+            self.command("AT", timeout=2.0, stop_event=stop_event)
+            self._drain(100, deadline=time.monotonic() + 0.2)
         stale = self._drain(_STALE_DRAIN_TIMEOUT_MS, deadline=time.monotonic() + 0.05)
         if stale.strip():
             _log.debug("discarded stale AT output before %r: %r", redact_pin(cmd), redact_pin(stale))
-        self.usb_device.bulk_out(self.ep_out, (cmd + "\r").encode())
+        self._needs_resync = True  # cleared below once a final result code arrives
+        try:
+            self.usb_device.bulk_out(self.ep_out, (cmd + "\r").encode())
+        except UsbTimeout as exc:
+            raise AtTimeoutError(f"write of {cmd!r} timed out") from exc
         buf = ""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -142,6 +154,7 @@ class AtPort:
                 trailing = buf[final.end():]
                 if trailing.strip():
                     _log.debug("discarded AT output after %r's final result code: %r", redact_pin(cmd), redact_pin(trailing))
+                self._needs_resync = False
                 return buf[: final.end()].strip()
             if stop_event is not None and stop_event.is_set():
                 raise AtTimeoutError(f"{cmd!r} abandoned: stop requested", buf.strip())
@@ -240,7 +253,8 @@ def parse_cpin_state(response: str) -> str | None:
 
     ``"READY"``, ``"SIM PIN"``, ``"SIM PUK"`` etc. from ``+CPIN: <state>``;
     ``"NOT INSERTED"`` for ``+CME ERROR: SIM not inserted``/``10``; other
-    CME errors are returned as their error text. None if unrecognisable.
+    CME errors are returned as their error text, a bare ``ERROR`` as
+    ``"ERROR"``. None if unrecognisable.
     """
     match = re.search(r"\+CPIN:\s*([^\r\n]*)", response)
     if match:
@@ -251,6 +265,8 @@ def parse_cpin_state(response: str) -> str | None:
         if error.lower() == "sim not inserted" or error == "10":
             return "NOT INSERTED"
         return error or None
+    if re.search(r"(?m)^ERROR\s*$", response):
+        return "ERROR"  # CMEE=0 hides the reason; this modem answers a missing SIM this way
     return None
 
 
@@ -359,29 +375,6 @@ def setup_pdp(port: AtPort, cid: int, pdp_type: str, apn: str) -> tuple[str, str
     defined = check_ok(define_pdp(port, cid, pdp_type, apn), "AT+CGDCONT")
     activated = check_ok(activate(port, cid), f"AT+CGACT=1,{cid}")
     return defined, activated
-
-
-def valid_assigned_ipv4(value: str | None) -> str | None:
-    """Return ``value`` if it's a plausible IPv4 address assigned to us by
-    the network, else None.
-
-    ``parse_cgpaddr``'s regex only checks the shape of the field (1-3
-    digits per octet), so e.g. a malformed/malicious ``+CGPADDR:
-    1,"999.1.1.1"`` would otherwise pass through as a string. This is the
-    single place that turns modem-controlled text into something safe to
-    hand to ``ifconfig``/``route``/the RNDIS bridge's ARP responder:
-    rejects anything that isn't a real unicast address (not unspecified,
-    multicast, loopback or link-local).
-    """
-    if value is None:
-        return None
-    try:
-        addr = ipaddress.IPv4Address(value)
-    except ValueError:
-        return None
-    if addr.is_unspecified or addr.is_multicast or addr.is_loopback or addr.is_link_local:
-        return None
-    return value
 
 
 def ip_address(port: AtPort, cid: int) -> str | None:

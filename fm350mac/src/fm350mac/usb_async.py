@@ -14,8 +14,10 @@ errors to typed exceptions. ``AsyncEndpoint`` is a pool of pre-allocated
 transfers/buffers for one endpoint, with the lifetime rules described in
 the doc: never free a buffer or the shared callback while a transfer might
 still complete into it. ``EventLoop`` runs
-``libusb_handle_events_timeout_completed`` on one thread, so every
-callback (and hence every IN completion) is delivered in order.
+``libusb_handle_events_timeout_completed`` on one thread, which delivers
+most callbacks. libusb also lets a thread blocked in a sync transfer (the
+control or AT thread) handle events, so a callback can run there too; the
+event lock still serialises them, so IN completions stay in order.
 """
 
 from __future__ import annotations
@@ -59,6 +61,8 @@ LIBUSB_TRANSFER_CANCELLED = 3
 LIBUSB_TRANSFER_STALL = 4
 LIBUSB_TRANSFER_NO_DEVICE = 5
 LIBUSB_TRANSFER_OVERFLOW = 6
+
+TRANSFER_STATUS_NAMES = ("completed", "error", "timed_out", "cancelled", "stall", "no_device", "overflow")
 
 # --- enum libusb_transfer_type (only the two kinds we use) -----------------
 
@@ -278,6 +282,21 @@ class _Timeval(ctypes.Structure):
     _fields_ = [("tv_sec", ctypes.c_long), ("tv_usec", ctypes.c_int32)]
 
 
+class _LibusbVersion(ctypes.Structure):
+    _fields_ = [
+        ("major", ctypes.c_uint16),
+        ("minor", ctypes.c_uint16),
+        ("micro", ctypes.c_uint16),
+        ("nano", ctypes.c_uint16),
+        ("rc", ctypes.c_char_p),
+        ("describe", ctypes.c_char_p),
+    ]
+
+
+# enum libusb_speed, indexed by value
+_SPEED_NAMES = ("unknown", "low 1.5M", "full 12M", "high 480M", "super 5G", "super+ 10G", "super+ x2 20G")
+
+
 # --- library loading ---------------------------------------------------
 
 
@@ -384,7 +403,9 @@ class Libusb:
         lib.libusb_error_name.argtypes = [ctypes.c_int]
         lib.libusb_error_name.restype = ctypes.c_char_p
         lib.libusb_get_version.argtypes = []
-        lib.libusb_get_version.restype = ctypes.c_void_p  # struct libusb_version*; only used for logging
+        lib.libusb_get_version.restype = ctypes.POINTER(_LibusbVersion)
+        lib.libusb_get_device_speed.argtypes = [libusb_device_p]
+        lib.libusb_get_device_speed.restype = ctypes.c_int
 
         lib.libusb_get_bus_number.argtypes = [libusb_device_p]
         lib.libusb_get_bus_number.restype = ctypes.c_uint8
@@ -490,6 +511,13 @@ class Libusb:
         raw = self.lib.libusb_error_name(code)
         return raw.decode() if raw else f"LIBUSB_ERROR({code})"
 
+    def version(self) -> str:
+        v = self.lib.libusb_get_version().contents
+        return f"{v.major}.{v.minor}.{v.micro}.{v.nano}"
+
+    def get_device_speed(self, dev) -> int:
+        return self.lib.libusb_get_device_speed(dev)
+
     def get_bus_number(self, dev) -> int:
         return self.lib.libusb_get_bus_number(dev)
 
@@ -542,13 +570,16 @@ def open_device(vid: int = VID, pids: tuple[int, ...] = PIDS, *, libusb: "Libusb
         cached = _shared_device
     # Probe outside the lock: close() takes it too, and the probe is a real
     # USB round trip.
-    if cached is not None and not cached.closed and not cached.is_alive():
+    stale = cached is not None and not cached.closed and not cached.is_alive()
+    if stale:
         # Stale: the device went away (or re-enumerated) while the cached
         # handle was still "open". Drop it and open a fresh one.
         _log.info("cached UsbDevice handle is stale; reopening")
         _discard_stale(cached)
     with _shared_lock:
-        if _shared_device is cached and cached is not None and cached.closed:
+        # A stale handle marked unsafe to close stays "open" after close():
+        # evict it anyway, or a re-enumeration wait would take it for the device.
+        if _shared_device is cached and cached is not None and (cached.closed or stale):
             _shared_device = None
         if _shared_device is not None and not _shared_device.closed:
             return _shared_device
@@ -592,15 +623,6 @@ class UsbDevice:
         self.closed = False
         self._claimed: set[int] = set()
         self._unsafe_reason: str | None = None
-
-    @property
-    def unsafe_to_close(self) -> bool:
-        """True once ``mark_unsafe_to_close()`` has been called: some
-        in-flight USB transfer using this device's context was leaked
-        (never freed) rather than risk a use-after-free, so ``close()`` is
-        now permanently a no-op for this instance.
-        """
-        return self._unsafe_reason is not None
 
     def mark_unsafe_to_close(self, reason: str) -> None:
         """Record that this device's context may still be referenced by
@@ -680,6 +702,11 @@ class UsbDevice:
         code = self._libusb.release_interface(self.handle, iface)
         if code != 0:
             _log.debug("release_interface(%d) failed: %s", iface, self._libusb.error_name(code))
+
+    def speed(self) -> str:
+        """The negotiated link speed, for the bring-up log."""
+        code = self._libusb.get_device_speed(self._libusb.get_device(self.handle))
+        return _SPEED_NAMES[code] if 0 <= code < len(_SPEED_NAMES) else f"unknown({code})"
 
     def port_path(self) -> tuple[int, tuple[int, ...]]:
         """Return ``(bus_number, port_numbers)`` identifying the physical
@@ -862,11 +889,16 @@ class AsyncEndpoint:
         # -1 per completion, both under self._lock. Latency histogram: only
         # ever written by the completion callback (one event thread), read as
         # a snapshot by anyone.
-        self._out_inflight = 0
+        self.out_inflight = 0
         self.out_inflight_max = 0
         self._out_latency_buckets = [0] * (len(_OUT_LATENCY_BOUNDS_NS) + 1)
         self._out_latency_total_ns = 0
         self._out_latency_max_ns = 0
+        # Time spent inside completion callbacks (event-thread saturation),
+        # written only by whichever thread runs the callback.
+        self.cb_busy_ns = 0
+        self.cb_max_ns = 0
+        self._last_submit_error_log = float("-inf")
         # Guards _stopping plus every slot's in_flight/retired flags and the
         # actual libusb_submit_transfer/cancel_transfer calls, so a submit
         # (from the tx thread or the event thread -- ARP replies come from
@@ -880,13 +912,17 @@ class AsyncEndpoint:
         self._callback = LibusbTransferCbFn(self._on_transfer_done)
         self._slots: list[_Slot] = []
         self._slots_by_addr: dict[int, _Slot] = {}
-        for _ in range(count):
-            buf = (ctypes.c_uint8 * buffer_size)()
-            transfer = libusb.alloc_transfer(0)
-            slot = _Slot(buffer=buf, transfer=transfer)
-            self._fill_static(slot)
-            self._slots.append(slot)
-            self._slots_by_addr[ctypes.addressof(transfer.contents)] = slot
+        try:
+            for _ in range(count):
+                buf = (ctypes.c_uint8 * buffer_size)()
+                transfer = libusb.alloc_transfer(0)
+                slot = _Slot(buffer=buf, transfer=transfer)
+                self._fill_static(slot)
+                self._slots.append(slot)
+                self._slots_by_addr[ctypes.addressof(transfer.contents)] = slot
+        except BaseException:
+            self.free_all()  # nothing was submitted yet
+            raise
 
     @property
     def failed(self) -> bool:
@@ -911,13 +947,15 @@ class AsyncEndpoint:
 
     def submit_out(self, data: bytes, metadata=None) -> bool:
         """Submit ``data`` on a free OUT slot. Returns False if none is free
-        (all in flight -- the caller should count a drop/stall) or the pool
-        is stopping.
+        (all in flight -- the caller should count a drop/stall), the pool
+        is stopping, or libusb_submit_transfer failed (logged, and counted
+        toward the error streak, so a persistent failure goes fatal).
 
         ``metadata`` (e.g. the caller's own idea of this write's length) is
-        round-tripped back to ``on_out_result(ok, actual_length, metadata)``
-        when this specific transfer retires -- slots are reused for later,
-        unrelated submissions, so this can't be tracked on the pool itself.
+        round-tripped back to ``on_out_result(ok, status, actual_length,
+        length, metadata)`` when this specific transfer retires -- slots are
+        reused for later, unrelated submissions, so this can't be tracked on
+        the pool itself. ``ok`` is False for a short COMPLETED, too.
 
         Called from more than one thread (the tx thread for ordinary
         traffic, the event thread for ARP replies): the free-slot scan, the
@@ -1027,9 +1065,9 @@ class AsyncEndpoint:
             slot.in_flight = False
             slot.retired = True
         elif self.direction == "out":
-            self._out_inflight += 1
-            if self._out_inflight > self.out_inflight_max:
-                self.out_inflight_max = self._out_inflight
+            self.out_inflight += 1
+            if self.out_inflight > self.out_inflight_max:
+                self.out_inflight_max = self.out_inflight
         return code
 
     def _submit(self, slot: _Slot, length: int, *, retry: bool = True) -> int:
@@ -1045,7 +1083,10 @@ class AsyncEndpoint:
         if code == LIBUSB_ERROR_NO_DEVICE:
             self._mark_fatal(f"submit_transfer: {name}", device_lost=True)
             return
-        _log.error("submit_transfer on endpoint %#04x failed: %s", self.endpoint, name)
+        now = time.monotonic()
+        if now - self._last_submit_error_log >= _EVENT_ERROR_LOG_INTERVAL_S:
+            self._last_submit_error_log = now
+            _log.error("submit_transfer on endpoint %#04x failed: %s", self.endpoint, name)
         self._error_streak += 1
         if self._error_streak >= self._max_errors:
             self._mark_fatal(f"{self._error_streak} consecutive transfer errors (submit_transfer: {name})")
@@ -1086,13 +1127,18 @@ class AsyncEndpoint:
         # Never let an exception propagate into C: it would corrupt libusb's
         # internal state (or the interpreter, depending on the ctypes
         # callback path) instead of just failing this pool.
+        start_ns = time.perf_counter_ns()
         try:
-            self._handle_completion(transfer_ptr)
+            self._handle_completion(transfer_ptr, start_ns)
         except Exception:
             _log.exception("callback crashed on endpoint %#04x", self.endpoint)
             self._mark_fatal("callback exception")
+        busy_ns = time.perf_counter_ns() - start_ns
+        self.cb_busy_ns += busy_ns
+        if busy_ns > self.cb_max_ns:
+            self.cb_max_ns = busy_ns
 
-    def _handle_completion(self, transfer_ptr) -> None:
+    def _handle_completion(self, transfer_ptr, now_ns: int) -> None:
         slot = self._slots_by_addr.get(ctypes.addressof(transfer_ptr.contents))
         if slot is None:
             _log.error("completion for unknown transfer on endpoint %#04x", self.endpoint)
@@ -1103,7 +1149,7 @@ class AsyncEndpoint:
         slot.in_flight = False
         if self.direction == "out":
             with self._lock:
-                self._out_inflight -= 1
+                self.out_inflight -= 1
 
         if self._stopping:
             slot.retired = True
@@ -1116,23 +1162,27 @@ class AsyncEndpoint:
                 self._submit(slot, self._buffer_size)
                 if self._on_complete:
                     self._on_complete(data)
+            elif actual_length != slot.length:
+                # A short COMPLETED OUT put a truncated message on the wire: not a success.
+                self._retire_out_failed(slot, status, actual_length)
             else:
                 metadata = slot.metadata  # before retiring: the slot may be reused at once
-                elapsed_ns = time.perf_counter_ns() - slot.submit_ns  # before the slot is reused
+                length = slot.length
+                elapsed_ns = now_ns - slot.submit_ns  # before the slot is reused
                 slot.retired = True
                 self._out_latency_buckets[bisect.bisect_right(_OUT_LATENCY_BOUNDS_NS, elapsed_ns)] += 1
                 self._out_latency_total_ns += elapsed_ns
                 if elapsed_ns > self._out_latency_max_ns:
                     self._out_latency_max_ns = elapsed_ns
                 if self._on_out_result:
-                    self._on_out_result(True, actual_length, metadata)
+                    self._on_out_result(True, status, actual_length, length, metadata)
             return
 
         if status == LIBUSB_TRANSFER_TIMED_OUT:
             if self.direction == "in":
                 self._submit(slot, self._buffer_size)
             else:
-                self._retire_out_failed(slot, actual_length)
+                self._retire_out_failed(slot, status, actual_length)
             return
 
         if status == LIBUSB_TRANSFER_CANCELLED:
@@ -1140,7 +1190,7 @@ class AsyncEndpoint:
             if self.direction == "out":
                 # Report it like any other failed OUT transfer, so the owner
                 # sees the slot free up and counts the lost packet.
-                self._retire_out_failed(slot, actual_length)
+                self._retire_out_failed(slot, status, actual_length)
                 return
             # IN: keep the pool full, but count it toward the error streak --
             # a transfer that is cancelled again on every resubmit must not
@@ -1195,16 +1245,16 @@ class AsyncEndpoint:
             self._mark_fatal(f"{self._error_streak} consecutive transfer errors (status={status})")
             return
         if self.direction == "out":
-            self._retire_out_failed(slot, actual_length)
+            self._retire_out_failed(slot, status, actual_length)
             return
         delay = min(0.01 * self._error_streak, 0.5)
         self._schedule_resubmit(slot, delay)
 
-    def _retire_out_failed(self, slot: _Slot, actual_length: int) -> None:
-        metadata = slot.metadata  # before retiring: the slot may be reused at once
+    def _retire_out_failed(self, slot: _Slot, status: int, actual_length: int) -> None:
+        metadata, length = slot.metadata, slot.length  # before retiring: the slot may be reused at once
         slot.retired = True
         if self._on_out_result:
-            self._on_out_result(False, actual_length, metadata)
+            self._on_out_result(False, status, actual_length, length, metadata)
 
     def _clear_halt(self) -> None:
         try:
@@ -1222,7 +1272,7 @@ class AsyncEndpoint:
 
     def _handle_out_stall(self, slot: _Slot, actual_length: int) -> None:
         self._clear_halt()
-        self._retire_out_failed(slot, actual_length)
+        self._retire_out_failed(slot, LIBUSB_TRANSFER_STALL, actual_length)
 
     def _resubmit_after(self, slot: _Slot, delay: float) -> None:
         time.sleep(delay)
@@ -1230,9 +1280,9 @@ class AsyncEndpoint:
 
 
 class EventLoop:
-    """Runs ``libusb_handle_events_timeout_completed`` on one thread, so
-    every ``AsyncEndpoint`` callback (and hence RX order) is delivered in
-    order, on that thread.
+    """Runs ``libusb_handle_events_timeout_completed`` on one thread, which
+    delivers ``AsyncEndpoint`` callbacks in order (a sync transfer on another
+    thread can deliver some too; libusb's event lock keeps them serialised).
     """
 
     def __init__(

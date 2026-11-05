@@ -57,7 +57,7 @@ AT port: USB interface 6 (mode 41) or 4 (mode 40), usually `/dev/ttyUSB4`. Only 
 | `AT+GTUSBMODE?` | USB composition: 40 = `0e8d:7126`, 41 = `0e8d:7127` (default) | **Persistent**; takes effect after reset |
 | `AT+GTFMODE?` | Hardware W_DISABLE# / GNSS pin control (check if the radio won't turn on in the adapter) | |
 | `AT+GTSENRDTEMP=<id>` | Thermal sensor reading | |
-| `AT+GTDUALSIM?` / `AT+GTDUALSIM=0` | Active SIM slot (0 = SIM1; the Waveshare board only wires one slot) | |
+| `AT+GTDUALSIM?` / `AT+GTDUALSIM=0` | Active SIM slot (0 = SIM1; the earlier Waveshare USB TO M.2 B KEY only wires one slot; the 5G DONGLE wires SIM2 to an onboard eSIM) | |
 
 ## FCC lock
 

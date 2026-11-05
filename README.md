@@ -49,7 +49,7 @@ How the pieces work together, with diagrams and a code map: [docs/ARCHITECTURE.m
 
 ## What has been checked
 
-- A DW5931e / FM350-GL enumerates over USB in the Waveshare adapter with no flashing or unlock needed — that's what we found on the one unit tested, 2026-09-25 [Dell guide, TL;DR].
+- A DW5931e / FM350-GL enumerates over USB in the earlier Waveshare adapter with no flashing or unlock needed — that's what we found on the one unit tested, 2026-09-25 [Dell guide, TL;DR].
 - If the modem hears no cells at all, check the antenna pigtails before anything else. We lost a day chasing firmware causes; the pigtails were the actual problem [Bench log].
 - What's proven vs not: USB enumeration, AT access, ADB, SIM detection and LTE registration are verified on real hardware; a real cellular data session works on macOS (`fm350mac up`, Telekom DE, 2026-10-05: ping, HTTPS and capped `iperf3` runs, routed per host with `--route-host`); router failover is verified only in emulation (Docker, a modem emulator, QEMU); throughput has only been measured in short, capped runs on a weak cell (see the status table).
 - Not sure where to start? See "Start here" below.
@@ -98,7 +98,7 @@ default to SFTP, which OpenWrt's dropbear does not serve, so a plain `scp -r` fa
 says `unknown option -- O`, it is older and works without it. `192.168.1.1` is vanilla OpenWrt's
 default address; use your router's (GL.iNet firmware: `192.168.8.1`).
 
-This installs the FM350 protocol handler (mrhaav's `atc`, or modemfeed's `xmm` with `--proto xmm`), adds a `wwan` interface, and sets up an `mwan3` failover policy. It keeps your existing mwan3 settings: the stock catch-all rules get pointed at the failover policy, and `uninstall.sh` puts them back. It also installs a small watchdog that restarts `wwan` if the protocol handler gets stuck (a known `atc.sh` bug); `--no-watchdog` skips it. `fm350-status` shows decoded signal and cell info on the router.
+This installs the FM350 protocol handler (mrhaav's `atc`), adds a `wwan` interface, and sets up an `mwan3` failover policy. It keeps your existing mwan3 settings: the stock catch-all rules get pointed at the failover policy, and `uninstall.sh` puts them back. It also installs a small watchdog that restarts `wwan` if the protocol handler gets stuck (a known `atc.sh` bug); `--no-watchdog` skips it. `fm350-status` shows decoded signal and cell info on the router.
 
 In the QEMU test (with the earlier, more aggressive mwan3 settings: `wan` down/up 3/3), traffic moved to the modem 5 s after the wired link dropped and came back 4 s after it returned. When the link stayed up but the upstream died, it took 13 s and 16 s — the [openwrt README](openwrt/README.md#failover-measured-under-qemu) gives a tighter bound of 12–13 s for the same test; the difference is rounding, not a second measurement. The current defaults (`wan` down 5 / up 10) trade speed for fewer false failovers onto a metered SIM: expect roughly 25 s to fail over and 50 s to fail back on a dead upstream (calculated, not yet re-measured).
 
@@ -176,7 +176,8 @@ Every image is real output from our bench, rendered to SVG by [`tools/screenshot
 | Part | Notes |
 |---|---|
 | Fibocom FM350-GL (Dell DW5931e) | MediaTek T700, M.2 3052, firmware 29.20.22. USB ID `0e8d:7127` |
-| Waveshare USB TO M.2 B KEY (SKU 23252) | USB 3 to M.2 B-key adapter with a nano-SIM slot and 4 SMA connectors. Waveshare doesn't list the FM350 as supported, but it worked |
+| Waveshare USB 3.2 Gen1 5G DONGLE | Current bench adapter (since 2026-11-05): USB-C power, optional 5-12 V DC jack, SIM1 slot plus SIM2 wired to an onboard eSIM |
+| Waveshare USB TO M.2 B KEY (SKU 23252) | Earlier adapter: USB 3 to M.2 B-key with a nano-SIM slot and 4 SMA connectors. Waveshare doesn't list the FM350 as supported, but it worked |
 | 4 antennas + MHF4-to-SMA pigtails | Buy decent pigtails. Ours were the problem |
 | GL.iNet Flint 2 (GL-MT6000) | Router; USB 3 port, 5 V / 2 A |
 

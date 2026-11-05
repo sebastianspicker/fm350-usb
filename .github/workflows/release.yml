@@ -51,10 +51,18 @@ jobs:
         with:
           version: "0.12.17"
 
-      - name: Check the tag matches the package version
+      - name: Check the tag and helper match the package version
         run: |
           version="$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' src/fm350mac/__init__.py)"
           test "v${version}" = "${TAG}" || { echo "tag ${TAG} does not match version ${version}" >&2; exit 1; }
+          helper_version="$(sed -n 's/^HELPER_VERSION = "\(.*\)"$/\1/p' src/fm350mac/helper/fm350mac_helper.py)"
+          test "${helper_version}" = "${version}" || { echo "HELPER_VERSION ${helper_version} does not match version ${version}" >&2; exit 1; }
+
+      - name: ruff
+        run: uvx ruff@0.16.10 check . ../tools
+
+      - name: helper compiles under Python 3.9 -I -S
+        run: uv run --no-project --python 3.9 python -I -S -c 'import sys; compile(open(sys.argv[1]).read(), sys.argv[1], "exec")' src/fm350mac/helper/fm350mac_helper.py
 
       - name: Build wheel and sdist
         run: uv build -o dist
@@ -69,8 +77,11 @@ jobs:
       - name: Write SHA256SUMS and the release notes
         run: |
           (cd dist && sha256sum -- *.whl *.tar.gz | tee SHA256SUMS)
-          helper_sha="$(sha256sum src/fm350mac/helper/fm350mac_helper.py | cut -d' ' -f1)"
-          grep -q "${helper_sha}" ../CHANGELOG.md || { echo "helper sha256 ${helper_sha} is not in CHANGELOG.md: fill it in before tagging" >&2; exit 1; }
+          # Hash the helper as shipped (inside the wheel and the sdist), not the source tree.
+          helper_sha="$(unzip -p dist/*.whl fm350mac/helper/fm350mac_helper.py | sha256sum | cut -d' ' -f1)"
+          sdist_sha="$(tar -xzOf dist/*.tar.gz --wildcards '*/src/fm350mac/helper/fm350mac_helper.py' | sha256sum | cut -d' ' -f1)"
+          test "${sdist_sha}" = "${helper_sha}" || { echo "the helper differs between the wheel (${helper_sha}) and the sdist (${sdist_sha})" >&2; exit 1; }
+          grep -qxF "Helper sha256: \`${helper_sha}\`" ../CHANGELOG.md || { echo "CHANGELOG.md has no line 'Helper sha256: \`${helper_sha}\`': fill it in before tagging" >&2; exit 1; }
           {
             echo "Alpha release. See CHANGELOG.md for what is in it and what is not verified, and the fm350mac README for the trust model before installing the root helper."
             echo

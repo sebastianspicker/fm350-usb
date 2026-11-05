@@ -94,6 +94,17 @@ load_at_port_lib() {
 	return 1
 }
 
+# A sysupgrade keeps /etc/config but drops the packages: the config then looks
+# healthy while the proto handler or mwan3 is gone (only when install.sh ran).
+check_installed() {
+	[ "$(uci -q get network.wwan.fm350_owned 2>/dev/null)" = 1 ] || return 0
+	[ -e /lib/netifd/proto/atc.sh ] ||
+		echo "fm350-status.sh: WARNING: /lib/netifd/proto/atc.sh is missing (atc-fib-fm350_gl not installed? run install.sh again, e.g. after a sysupgrade)." >&2
+	[ "$(uci -q get mwan3.fm350_install_state 2>/dev/null)" = fm350_install_state ] || return 0
+	[ -e /etc/init.d/mwan3 ] ||
+		echo "fm350-status.sh: WARNING: mwan3 is configured but not installed (run install.sh again, e.g. after a sysupgrade)." >&2
+}
+
 # Warn only: a running, unpaused watchdog may restart the interface while we
 # query (uses $wd_iface/$wd_enabled set by check_wwan_idle).
 warn_watchdog() {
@@ -434,6 +445,7 @@ main() {
 		exit 1
 	fi
 
+	check_installed
 	check_wwan_idle
 	echo "AT device: $device"
 	echo

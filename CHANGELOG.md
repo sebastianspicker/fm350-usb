@@ -80,7 +80,7 @@ First alpha release of `fm350mac`. See the
 for installation, limitations and the trust model. The `v0.1.0a1` tag is
 created at release; until then install from the branch with `@alpha-0.1`.
 
-Helper sha256: `b22923481d9b1e469019307231735c1fdc8a8c31c322947bb07e8789233c8b09`
+Helper sha256: `24b414271fbb7031c4b59c066303392d2e5e9b0c3e919ac7debf3ddbc0ce621a`
 
 This is the sha256 of `fm350mac/src/fm350mac/helper/fm350mac_helper.py` in
 this release (the release workflow refuses to publish if the file differs).

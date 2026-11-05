@@ -41,6 +41,8 @@ __pycache__/
 
 # Benchmark run output (tools/bench-throughput.sh)
 /tools/bench-results/
+# tools/module-telemetry.sh output (module syslog and sensors: operator, cell and IP data)
+/tools/telemetry-results/
 
 # fm350_diag.py run output (reports/transcripts/journals may hold operator or cell data)
 fm350-diag-*/
@@ -60,6 +62,7 @@ journal.jsonl
 /THINGS_TO_DO_LEDGER.md
 /REPO_AUDIT_LEDGER.md
 /REPO_AUDIT_LEDGER_2026-11-05.md
+/CODE_REVIEW_LEDGER_2026-11-05.md
 
 # Nested assistant workspaces are local state too.
 .agents/

@@ -14,11 +14,20 @@ import queue
 import socket
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 
 from . import ethernet, rndis
 from .bridge_common import BridgeCommon, _is_device_gone
-from .usb_async import AsyncEndpoint, EventLoop, UsbError
+from .usb_async import (
+    LIBUSB_TRANSFER_CANCELLED,
+    LIBUSB_TRANSFER_COMPLETED,
+    LIBUSB_TRANSFER_TIMED_OUT,
+    TRANSFER_STATUS_NAMES,
+    AsyncEndpoint,
+    EventLoop,
+    UsbError,
+)
 from .usb_transport import RateLimiter, RndisUsb, is_response_available, mark_usb_unsafe
 from .utun import Utun
 
@@ -56,6 +65,7 @@ _KEEPALIVE_MISSED_LIMIT = 3
 # ARP replies that found every OUT slot busy, waiting for the tx thread (see
 # _handle_arp). A handful is plenty: the modem asks for one MAC.
 _CONTROL_TX_QUEUE_MAX = 4
+_OUT_EVENTS = 64  # OUT completions kept for the failure dump (DP-2)
 
 # Sane range for the device-reported max_transfer_size (INIT_CMPLT): the FM350
 # reports 2048. Out-of-range values are clamped (with a warning); one too
@@ -109,6 +119,8 @@ class AsyncBridgeStats:
     rx_urbs: int = 0  # completed RX bulk transfers (event thread)
     rx_urb_frames: int = 0  # Ethernet frames across them, so frames/URB = rx_urb_frames / rx_urbs (event thread)
     rx_urb_frames_max: int = 0  # most frames seen in one RX URB (event thread)
+    out_partial: int = 0  # failed OUT transfers that had already moved bytes, or short COMPLETED ones
+    tx_ipv6_drops: int = 0  # IPv6 packets from the utun, dropped: the PDP context is IPv4-only (tx thread)
 
 
 class AsyncBridge(BridgeCommon):
@@ -178,6 +190,17 @@ class AsyncBridge(BridgeCommon):
         # atomic (LOAD/ADD/STORE), so concurrent increments from two threads
         # can lose an update without this lock.
         self._stats_lock = threading.Lock()
+        # OUT diagnostics for the failure dump and the perf: line, written
+        # by whichever thread runs _on_tx_result.
+        self._out_status = [0] * len(TRANSFER_STATUS_NAMES)
+        self._last_out_ok_ns = 0
+        self._out_events: deque[tuple[int, int, int, int]] = deque(maxlen=_OUT_EVENTS)
+        # Drain barrier (DP-1): set after an OUT timeout/cancel or a partial
+        # OUT; no new OUT is submitted until every in-flight one has retired.
+        # _tx_drain_fail: a partial OUT left the device mid-message, so the
+        # bridge fails once drained and the caller's HALT/INIT resyncs it.
+        self._tx_drain = False
+        self._tx_drain_fail: str | None = None
 
         device = rndis_usb.usb_device
         self._event_loop = EventLoop(device.libusb, device.ctx, usb_device=device, on_fatal=self._on_pool_fatal)
@@ -215,6 +238,13 @@ class AsyncBridge(BridgeCommon):
         while not self._control_tx.empty():
             self._control_tx.get_nowait()
         self._last_keepalive_ack = time.monotonic()
+        self._tx_drain = False
+        self._tx_drain_fail = None
+        device = self.usb.usb_device
+        _log.info(
+            "USB: libusb %s, link speed %s, bulk OUT wMaxPacketSize %d",
+            device.libusb.version(), device.speed(), self.usb.bulk_out_max_packet,
+        )
         self._event_loop.start()
         # A failed initial submit marks the pool fatal, which fails the bridge
         # (via _on_pool_fatal) so the caller sees it instead of a dead pump.
@@ -274,6 +304,12 @@ class AsyncBridge(BridgeCommon):
         if not self.failed.is_set():
             self.failure_reason = reason
             _log.error("bridge failed: %s", reason)
+            now = time.monotonic_ns()
+            events = " ".join(
+                f"-{(now - t) / 1e6:.0f}ms:{TRANSFER_STATUS_NAMES[st]}:{actual}/{length}"
+                for t, st, actual, length in list(self._out_events)
+            )
+            _log.error("OUT at failure: %s; last OUT events (age:status:actual/length): %s", self._out_summary(), events)
         if device_lost:
             self.device_lost = True
         self.failed.set()
@@ -356,7 +392,7 @@ class AsyncBridge(BridgeCommon):
         if frame is None:
             return
         msg = self._out_msg(frame)
-        if msg is None or self._tx_pool.submit_out(msg):
+        if msg is None or self._submit_out(msg):
             return
         # Every OUT slot is busy (e.g. under upload load): this runs on the
         # EventLoop thread, which must never wait for a slot, so hand the
@@ -384,6 +420,10 @@ class AsyncBridge(BridgeCommon):
             if not self._submit_waiting(msg, None) and not self._stop.is_set():
                 self._incr_stat("drops")  # an ARP reply, not a data packet: no tx_stall
 
+    def _submit_out(self, msg: bytes, ip_len: int | None = None) -> bool:
+        """``submit_out`` unless the drain barrier is up (then: no slot)."""
+        return not self._tx_drain and self._tx_pool.submit_out(msg, metadata=ip_len)
+
     def _tx_loop(self) -> None:
         read_errors = 0
         while not self._stop.is_set():
@@ -410,12 +450,18 @@ class AsyncBridge(BridgeCommon):
             if not payload:
                 continue
             version = payload[0] >> 4
-            if version not in (4, 6):
+            if version != 4:
+                # macOS sends link-local IPv6 on any utun; the PDP context is IPv4-only.
                 self._incr_stat("drops")
+                if version == 6:
+                    self._incr_stat("tx_ipv6_drops")
                 _log.debug("dropping utun packet with IP version nibble %d", version)
                 continue
-            ethertype = ethernet.ETH_P_IP if version == 4 else ethernet.ETH_P_IPV6
-            frame = ethernet.wrap(payload, ethertype, dst=self.learner.current(), src=self.our_mac)
+            if len(payload) > _MTU:
+                self._incr_stat("drops")  # the module reports a 1500-byte max frame
+                _log.debug("dropping %d-byte IP packet > MTU %d", len(payload), _MTU)
+                continue
+            frame = ethernet.wrap(payload, ethernet.ETH_P_IP, dst=self.learner.current(), src=self.our_mac)
             self._send_frame(frame, ip_len=len(payload), wait_for_slot=True)
 
     def _send_frame(self, frame: bytes, ip_len: int | None = None, wait_for_slot: bool = False) -> None:
@@ -435,7 +481,7 @@ class AsyncBridge(BridgeCommon):
         if wait_for_slot:
             if self._submit_waiting(msg, ip_len):
                 return
-        elif self._tx_pool.submit_out(msg, metadata=ip_len):
+        elif self._submit_out(msg, ip_len):
             return
         if self._stop.is_set():
             return  # shutting down: not a stall, nothing to count
@@ -454,6 +500,7 @@ class AsyncBridge(BridgeCommon):
         packet behind each other, which is fine for a log line.
         """
         stats = self.stats
+        pools = (self._rx_pool, self._tx_pool, self._control_pool)
         return {
             "out_latency": self._tx_pool.out_latency(),
             "tx_inflight_max": self._tx_pool.out_inflight_max,
@@ -463,6 +510,9 @@ class AsyncBridge(BridgeCommon):
             "rx_urbs": stats.rx_urbs,
             "rx_frames_per_urb_mean": (stats.rx_urb_frames / stats.rx_urbs) if stats.rx_urbs else 0.0,
             "rx_frames_per_urb_max": stats.rx_urb_frames_max,
+            "cb_busy_ms": sum(p.cb_busy_ns for p in pools) / 1e6,
+            "cb_max_us": max(p.cb_max_ns for p in pools) / 1e3,
+            "tx_ipv6_drops": stats.tx_ipv6_drops,
         }
 
     def perf_summary(self) -> str:
@@ -476,24 +526,35 @@ class AsyncBridge(BridgeCommon):
             f"tx_inflight_max={snap['tx_inflight_max']}/{snap['tx_urbs']} "
             f"tx_slot_waits={snap['tx_slot_waits']} tx_slot_wait={snap['tx_slot_wait_ms']:.1f}ms "
             f"rx_urbs={snap['rx_urbs']} rx_frames_per_urb mean={snap['rx_frames_per_urb_mean']:.2f} "
-            f"max={snap['rx_frames_per_urb_max']}"
+            f"max={snap['rx_frames_per_urb_max']} "
+            f"cb_busy={snap['cb_busy_ms']:.1f}ms cb_max={snap['cb_max_us']:.0f}us "
+            f"tx_ipv6_drops={snap['tx_ipv6_drops']} {self._out_summary()}"
+        )
+
+    def _out_summary(self) -> str:
+        """OUT completions per libusb status, partial ones, in flight, and the last success."""
+        counts = " ".join(f"{name}={n}" for name, n in zip(TRANSFER_STATUS_NAMES, self._out_status) if n)
+        last_ok = self._last_out_ok_ns
+        age = f"{(time.monotonic_ns() - last_ok) / 1e6:.0f}ms_ago" if last_ok else "never"
+        return (
+            f"out[{counts or 'none'} partial={self.stats.out_partial} "
+            f"inflight={self._tx_pool.out_inflight}/{self.tx_urbs} last_ok={age}]"
         )
 
     def _out_msg(self, frame: bytes) -> bytes | None:
         """Wrap ``frame`` in a PACKET_MSG ready for the OUT pool, or count a
-        drop and return None if it exceeds max_transfer_size.
+        drop and return None if it (with its pad byte) exceeds max_transfer_size.
         """
         msg = rndis.pack_packet(frame)
-        if len(msg) > self.max_transfer_size:
+        pad = len(msg) % self.usb.bulk_out_max_packet == 0  # see usb_transport.RndisUsb.bulk_write for why
+        if len(msg) + pad > self.max_transfer_size:
             self._incr_stat("drops")
             _log.debug(
-                "dropping oversized frame: PACKET_MSG %d bytes > max_transfer_size %d",
-                len(msg), self.max_transfer_size,
+                "dropping oversized frame: PACKET_MSG %d bytes (+%d pad) > max_transfer_size %d",
+                len(msg), pad, self.max_transfer_size,
             )
             return None
-        if len(msg) % self.usb.bulk_out_max_packet == 0:
-            msg = msg + b"\x00"  # see usb_transport.RndisUsb.bulk_write for why
-        return msg
+        return msg + b"\x00" if pad else msg
 
     def _submit_waiting(self, msg: bytes, ip_len: int | None) -> bool:
         """Submit ``msg``, waiting up to _TX_SLOT_WAIT_S for a free OUT slot
@@ -502,7 +563,7 @@ class AsyncBridge(BridgeCommon):
         """
         with self._tx_slot_freed:
             seen = self._tx_slots_freed
-        if self._tx_pool.submit_out(msg, metadata=ip_len):
+        if self._submit_out(msg, ip_len):
             return True
         wait_start_ns = time.perf_counter_ns()
         self.stats.tx_slot_waits += 1
@@ -515,24 +576,25 @@ class AsyncBridge(BridgeCommon):
                     if self._tx_slots_freed == seen:
                         self._tx_slot_freed.wait(_TX_SLOT_POLL_S)
                     seen = self._tx_slots_freed
-                if self._tx_pool.submit_out(msg, metadata=ip_len):
+                if self._submit_out(msg, ip_len):
                     return True
             return False
         finally:
             self.stats.tx_slot_wait_ns += time.perf_counter_ns() - wait_start_ns
 
-    def _on_tx_result(self, ok: bool, _actual_length: int, ip_len: int | None) -> None:
-        """Called on the EventLoop thread when a submitted OUT transfer
-        retires (COMPLETED, or failed: TIMED_OUT/STALL/ERROR -- see
-        AsyncEndpoint). ``ip_len``
+    def _on_tx_result(self, ok: bool, status: int, actual_length: int, length: int, ip_len: int | None) -> None:
+        """Called (normally on the EventLoop thread) when a submitted OUT
+        transfer retires (COMPLETED, or failed: TIMED_OUT/STALL/ERROR, or a
+        short COMPLETED -- see AsyncEndpoint). ``ip_len``
         is the IP packet length passed as ``submit_out()``'s metadata (None
         for an ARP reply, which isn't counted), since several transfers are
         in flight at once and can retire out of submission order.
         """
-        with self._tx_slot_freed:
-            self._tx_slots_freed += 1
-            self._tx_slot_freed.notify()
+        now_ns = time.monotonic_ns()
+        self._out_events.append((now_ns, status, actual_length, length))
+        self._out_status[status] += 1
         if ok:
+            self._last_out_ok_ns = now_ns
             if ip_len is not None:
                 self._incr_stat("tx_packets")
                 self._incr_stat("tx_bytes", ip_len)
@@ -544,6 +606,27 @@ class AsyncBridge(BridgeCommon):
             self._incr_stat("tx_timeouts")
             self._incr_stat("drops")
             self._warn_tx_stall_rate_limited()
+            # On macOS a timeout aborts the whole pipe: the transfers behind
+            # this one fail too, and one that had moved bytes left the
+            # device holding half an RNDIS message.
+            partial = actual_length > 0 or status == LIBUSB_TRANSFER_COMPLETED
+            if partial:
+                self._incr_stat("out_partial")
+                if self._tx_drain_fail is None:
+                    self._tx_drain_fail = (
+                        f"tx: OUT transfer {TRANSFER_STATUS_NAMES[status]} after {actual_length}/{length} bytes: "
+                        "device may hold a partial RNDIS message"
+                    )
+            if partial or status in (LIBUSB_TRANSFER_TIMED_OUT, LIBUSB_TRANSFER_CANCELLED):
+                self._tx_drain = True
+        if self._tx_drain and self._tx_pool.out_inflight == 0:
+            if self._tx_drain_fail is not None:
+                self._mark_failed(self._tx_drain_fail)
+            else:
+                self._tx_drain = False
+        with self._tx_slot_freed:
+            self._tx_slots_freed += 1
+            self._tx_slot_freed.notify()
 
     # --- control: a 1-deep async interrupt-IN transfer signals this thread,
     # which does a single GET_ENCAPSULATED_RESPONSE (never polls without a

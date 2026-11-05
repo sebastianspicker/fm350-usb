@@ -167,7 +167,17 @@ tunnel").
 
 ### Measuring real data usage
 
-The real usage of the SIM is the `stats:` line `up` logs on shutdown:
+The real usage of the SIM is the `usage:` line `up` logs after every session
+rebuild, every 5 minutes and on shutdown. It sums all sessions of one `up`
+run:
+
+```
+usage: total rx=<bytes>B tx=<bytes>B
+```
+
+The last `usage:` line is the total, and a crash or `kill -9` loses at most the
+last 5 minutes. Each session also logs its own `stats:` line on teardown; after
+a rebuild it covers only that session, so do not read it as the total:
 
 ```
 stats: rx=<packets>/<bytes>B tx=<packets>/<bytes>B drops=<n> tx_stalls=<n>
@@ -259,9 +269,10 @@ decide when `up` gives up or keeps going:
 |---|---|
 | 0 | ok (also: a running session stopped cleanly with Ctrl-C/SIGTERM; for `doctor`, no warnings) |
 | 1 | error (printed as `fm350mac: <cause>. <next step>` or a command-specific message; for `doctor`, at least one warning) |
-| 2 | bridge failure or usage error |
+| 2 | bridge failure or usage error (also: `--route-host` over the limit, `--dns` without `--default-route`) |
 | 3 | the modem did not come back after a disconnect, or the rebuild budget (600 s, measured from the loss of the session) was exhausted |
 | 4 | the modem's identity changed (a different IMEI came back; the session is not rebuilt) |
+| 5 | the modem was lost 3 times within 10 minutes (a crash loop, probably under load); `up` stops rebuilding and removes its routes |
 | 130 | interrupted while bringing the session up or waiting for the modem |
 
 ## Privilege separation and the trust model
@@ -272,7 +283,7 @@ USB access (libusb claim, RNDIS, AT) never needs root; only creating the
 | | Main process (`fm350mac up`) | Helper (`fm350mac-helper`) |
 |---|---|---|
 | Runs as | you (no root) | root, via a LaunchDaemon |
-| Interpreter | the tool's own Python | `/usr/bin/python3 -I -S` (Apple's, root-owned, isolated mode) |
+| Interpreter | the tool's own Python | `/usr/bin/python3 -I -S`: the xcode-select-selected Python 3.9, isolated mode; `helper install` and `helper status` check it and its stdlib are root-owned |
 | Code | everything: USB, RNDIS, AT, bridge, supervisor | one stdlib-only file, `fm350mac/helper/fm350mac_helper.py`, copied to `/usr/local/libexec/fm350mac-helper` (root, 0755) |
 | Does | data path | creates the `utun`, passes its file descriptor over a Unix socket, sets address/routes/DNS, undoes all of it when the connection closes, including after `kill -9` of the main process |
 
@@ -284,7 +295,7 @@ The honest version of the trust model:
   - Python run as root can write root-owned `__pycache__` files into your venv or tool environment. They are harmless but can get in the way of a later `uv tool uninstall` or `rm`; remove them with `sudo` if needed.
   - Install only from the release tag, into an environment only you can write to.
 - **Afterwards only the copied helper file runs as root**, under `/usr/bin/python3 -I -S`, so nothing user-writable (your Homebrew prefix, the tool's environment, any dependency) is on its import path. `install` also refuses unsafe directories (symlinks, non-root owners, group/other-writable) under the install path.
-- **The helper does what `up` needs, as root, for one user.** The socket `/var/run/fm350mac-helper.sock` is mode 0600 and owned by the installing uid, and the helper additionally checks the peer's credentials against that uid. Any process running as that user can therefore ask the helper to create a utun, set an address, add up to 8 host routes, swap the default route and set DNS. It runs fixed commands (`/sbin/ifconfig`, `/sbin/route`, `/usr/sbin/scutil`) with validated arguments and no shell, and it cannot run arbitrary code or commands. Treat the account that may use the helper accordingly: a hostile process running as you could redirect your traffic.
+- **The helper does what `up` needs, as root, for one user.** The socket `/var/run/fm350mac-helper.sock` is mode 0600 and owned by the installing uid, and the helper additionally checks the peer's credentials against that uid. Any process running as that user can therefore ask the helper to create a utun, set one address (changed only by replacing it), add up to 8 host routes, swap the default route and set DNS. It runs fixed commands (`/sbin/ifconfig`, `/sbin/route`, `/usr/sbin/scutil`) with validated arguments and no shell, and it cannot run arbitrary code or commands. Treat the account that may use the helper accordingly: a hostile process running as you could redirect your traffic.
 - **Nothing is signed or notarized.** The installed helper is a plain file. `helper status` prints its sha256 and compares it byte for byte with the packaged one; that is a consistency check, not an integrity proof, because both come from the same user-owned environment.
 - The helper reports its version; `up` warns when it differs from the driver's.
 - `--no-helper` runs everything, including your whole Python environment, as root. Prefer the helper.
@@ -373,6 +384,7 @@ subcommand) for details and tracebacks.
 | `RNDIS control channel did not respond; unplug/replug the modem` | RNDIS control exchange timed out | unplug and replug |
 | `RNDIS error: <detail>; unplug/replug the modem` | the RNDIS control exchange failed in another way (for example a malformed or rejected reply) | unplug and replug |
 | `no SIM detected: check the SIM tray` | `AT+CPIN?` reports NOT INSERTED | reseat the SIM |
+| `no SIM detected, or it is still initialising (CMEE=0 hides the reason; ...)` | `AT+CPIN?` answers a bare `ERROR` | reseat the SIM or wait; `fm350mac at 'AT+CMEE=2' 'AT+CPIN?'` shows the reason |
 | `SIM is PIN-locked: unlock it in a phone first (or disable the PIN there), or with fm350mac at 'AT+CPIN="<pin>"' -- note that the PIN then ends up in your shell history; 3 wrong PINs lock the SIM` | SIM PIN is set | preferably unlock or disable the PIN in a phone. Typing it into `fm350mac at` works, but the shell keeps it in its history (the tool masks it in its own output) |
 | `SIM is PUK-locked: unlock with the PUK in a phone` | too many wrong PINs | unlock in a phone |
 | `SIM not ready (...)` | any other SIM state | `fm350mac status`, `fm350mac doctor` |

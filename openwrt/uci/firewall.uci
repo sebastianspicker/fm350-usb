@@ -1,7 +1,6 @@
 # Idempotent uci batch snippet: put "wwan" in the wan firewall zone's network
-# list, and add the "Allow modem RA" rule from the mrhaav atc-fib-fm350_gl
-# README (lets the FM350 hand out IPv6 DNS servers via Router Advertisement).
-# Applied by install.sh with `uci -q batch`.
+# list. Applied by install.sh with `uci -q batch`. No IPv6 RA rule: the PDP is
+# IPv4-only. The delete below clears the rule older installers added.
 #
 # Placeholder substituted by install.sh before piping to `uci -q batch`:
 #   @WAN_ZONE@ - uci reference of the existing zone with option name='wan'
@@ -16,12 +15,5 @@ del_list @WAN_ZONE@.network='wwan'
 add_list @WAN_ZONE@.network='wwan'
 
 delete firewall.wwan_allow_ra
-set firewall.wwan_allow_ra=rule
-set firewall.wwan_allow_ra.name='Allow modem RA'
-set firewall.wwan_allow_ra.family='ipv6'
-set firewall.wwan_allow_ra.proto='icmp'
-set firewall.wwan_allow_ra.src='wan'
-set firewall.wwan_allow_ra.src_ip='fe80::1'
-set firewall.wwan_allow_ra.target='ACCEPT'
 
 commit firewall

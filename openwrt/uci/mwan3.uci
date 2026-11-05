@@ -35,7 +35,9 @@
 # Metered-link defaults: wan is probed every 5 s and marked down after 5
 # misses (25 s) / up after 10 successes (50 s), so a short blip doesn't move
 # traffic onto the metered SIM; wwan is probed every 30 s with at most two
-# track IPs (reliability 1) to keep tracking traffic small (see README.md).
+# track IPs (reliability 1) to keep tracking traffic small, and is up after
+# one success (up 1), so a recovered wwan carries traffic after 30 s, not 90 s
+# (see README.md).
 #
 # Every section created here carries option fm350_owned='1' so install.sh can
 # tell its own sections from a user's own sections with the same names (those
@@ -59,7 +61,7 @@ add_list mwan3.wwan.track_ip='9.9.9.9'
 set mwan3.wwan.reliability='1'
 set mwan3.wwan.interval='30'
 set mwan3.wwan.down='3'
-set mwan3.wwan.up='3'
+set mwan3.wwan.up='1'
 
 delete mwan3.wan_m1
 set mwan3.wan_m1=member

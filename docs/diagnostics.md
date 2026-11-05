@@ -6,7 +6,7 @@ A diagnostics tool for a Fibocom FM350-GL (including the Dell DW5931e) in a Wave
 
 - **Start with `python3 tools/fm350_diag.py read`** (stage 0). It only sends read commands to the modem (AT commands, short text commands) and can't change anything, and it's enough for most problems.
 - The tool works in stages: stage 0 reads only; stages 1 and 2 change settings and restore them automatically; stage 3 edits a file on the module that can turn USB off if it goes wrong. The higher stages repeat changes we made while debugging our own module (none damaged it), and each one tells you what it's about to do and asks you to confirm first.
-- If no cell is measured at all, the tool reports a FAIL and tells you to check the antenna cables (pigtails) first — that was the cause on our own module. See [Stage 0](#stage-0-read).
+- If no cell is measured at all, the tool reports a FAIL and tells you to check the antenna cables (pigtails) first — that was the cause on our own module. Without a ready SIM the modem doesn't search, so the tool reports INFO instead and the antennas aren't the suspect. See [Stage 0](#stage-0-read).
 - **Stage 3 (`dipc`) carries real risk**: a wrong value locks you out of USB until you reach the module over PCIe or reflash it. You don't need it just to use the module over USB.
 - Tested on one module (a Dell DW5931e) on 2026-09-25. Your module may behave differently.
 
@@ -67,7 +67,7 @@ The exit code is 0 when everything is OK, 1 when there's at least one WARN or FA
 
 ## Stage 0: `read`
 
-The tool first checks whether the modem is on the USB bus at all (`0e8d:7127`, or `0e8d:7126` in mode 40). If it is, it takes a snapshot of the module's state and then samples the cells and registration every 10 s for 60 s (`--duration`, `--interval`). It needs several samples because one sample can show "searching" on a module that's working fine.
+The tool first checks whether the modem is on the USB bus at all (`0e8d:7127`, or `0e8d:7126` in mode 40). If it is, it takes a snapshot of the module's state and then samples the cells and registration every 10 s for 60 s (`--duration`, `--interval`; the interval can't be shorter than 1 s). It needs several samples because one sample can show "searching" on a module that's working fine.
 
 What it checks, and what the result means:
 
@@ -78,16 +78,16 @@ What it checks, and what the result means:
 | DIPC mode | `AT+GTDIPCMODE?` | `1,…` means PCIe Advance Mode (the Dell default). USB still works in an adapter because there's no PCIe link. `3,…` is the stock dual mode. |
 | FCC lock | `AT+GTFCCEFFSTATUS?`, `AT+GTFCCLOCKMODE?` | If the second value isn't `1`, the module is locked and the radio stays off. See [stage 2](#stage-2-experiment-name) for the fix. |
 | Radio | `AT+CFUN?`, `AT+GTFMODE?`, `AT+GTRXPATHEN?`, `AT+GTANTTUNINGEN?`, `AT+BODYSAREN?`, `AT+ECAL?` | `CFUN` should be `1`. The antenna tuner should be `1`; a `0` is usually left over from an experiment. `ECAL` `1` means the RF calibration is there. |
-| SIM | `AT+CPIN?`, `AT+SIMTYPE?`, `AT+GTDUALSIM?`, `AT+MSMPD?`, `AT+CIMI`, `AT+ICCID` | `READY` in slot 0. The Waveshare board only wires SIM slot 1, which the modem reports as slot 0. |
+| SIM | `AT+CPIN?`, `AT+SIMTYPE?`, `AT+GTDUALSIM?`, `AT+MSMPD?`, `AT+CIMI`, `AT+ICCID` | `READY` in slot 0. The earlier Waveshare adapter (USB TO M.2 B KEY) only wires SIM slot 1, which the modem reports as slot 0. The Waveshare USB 3.2 Gen1 5G DONGLE wires SIM1 to the slot and SIM2 to an onboard eSIM chip. |
 | Access technology and bands | `AT+GTACT?`, `AT+ERAT?`, `AT+E5GOPT?` | A RAT mode other than 21 is unusual. It's usually left over from an earlier experiment, because `ERAT` survives a module reset. |
 | Cells and registration (sampled) | `AT+CEREG?`, `AT+C5GREG?`, `AT+COPS?`, `AT+CESQ`, `AT+GTCCINFO?`, `AT+CEER` | See the next section. |
 | Temperature | `AT+GTSENRDTEMP=0` | Above 70 °C gets a WARN. |
 | APN | `AT+CGDCONT?` | Empty just means no APN has been set yet. |
-| ADB (`--adb`) | `adb devices`, `id`, `/etc/vendor_info`, `dipc_config`, and the radio lines from `logread` | `MIPC_NW_RADIO_STATE hw=1, sw=1` means the radio is on at both levels. `offline` in `adb devices` after a module reset is fixed with `volatile --usb-reset`. |
+| ADB (`--adb`) | `adb devices`, `id`, `/etc/vendor_info`, `dipc_config`, and the radio lines from `logread` | `MIPC_NW_RADIO_STATE hw=1, sw=1` means the radio is on at both levels. `offline` in `adb devices` happens when the module boots while the Mac's ADB server is running. Run `adb kill-server` before a module restart and start ADB only once the module is up. If it's already `offline`, `volatile --usb-reset` clears it, but it may leave the module's log daemon (`logread_agent`) spinning, so replug before measurements. |
 
 ### If no cell is measured at all
 
-If **none** of the samples shows a cell (`AT+CESQ` returns only 99/255 and `AT+GTCCINFO?` is empty), the tool reports a FAIL and tells you to **check the antenna pigtails and connectors first.**
+If **none** of the samples shows a cell (`AT+CESQ` returns only 99/255 and `AT+GTCCINFO?` is empty), the tool reports a FAIL and tells you to **check the antenna pigtails and connectors first.** Without a ready SIM the modem doesn't search, so the tool reports INFO instead and the antennas aren't the suspect.
 
 This exact symptom cost us a full day of ruling out software causes before we found a pair of defective pigtails [Bench log, Cable swap]. The full story is in the [Dell guide's troubleshooting section](dell-dw5931e-usb.md#no-cells-at-all-cesq-all-99255-gtccinfo-empty).
 
@@ -124,13 +124,15 @@ Stage 1 runs a short stage 0 first, then:
 | Step | Commands | Effect | How it's undone |
 |---|---|---|---|
 | Readable errors | `AT+CMEE?` first, then `AT+CMEE=2` | Errors come back as text instead of numbers | Set back to the value it read first, and resets on restart anyway |
-| Reject cause | `AT+CEREG=3`, then samples for 60 s | Registration reports include the network's reject cause | Set back to the previous value, and resets on restart anyway |
+| Reject cause | `AT+CEREG=3`, then samples for `--duration` (30 s by default) | Registration reports include the network's reject cause | Set back to the previous value, and resets on restart anyway |
 | Network scan | `AT+COPS=?` (up to 180 s) | Lists every network the module can hear. Registration pauses during the scan | Registration resumes by itself |
-| Radio off and on | `AT+CFUN=4`, 5 s wait, `AT+CFUN=1`, then samples for 60 s | Starts the network search again from scratch | Always ends with the original `CFUN` value |
+| Radio off and on | `AT+CFUN=4`, 5 s wait, `AT+CFUN=1`, then samples for `--duration` | Starts the network search again from scratch | Always ends with the original `CFUN` value |
 | `--reset` | `AT+CFUN=15` | Restarts the module. It drops off USB and comes back within about 60 s. The tool waits for it to disappear, waits for it to reappear, then waits another 15 s before the first command | – |
-| `--usb-reset` | libusb port reset (macOS/libusb only) | Fixes ADB showing `offline` after a module restart | – |
+| `--usb-reset` | libusb port reset (macOS/libusb only) | Clears ADB showing `offline` after a module restart (stop the ADB server before the restart instead; this reset may leave `logread_agent` spinning, so replug before measurements) | – |
 
 What we saw on our module: an instant, empty `AT+COPS=?` meant the module wasn't really scanning. A real scan takes more than 30 s. Reject cause `114` isn't a standard 3GPP cause (it's MediaTek-internal), and `AT+CEER: 0,NONE` meant the network hadn't rejected anything. An unexpected crash is also possible: when we sent about 2000 USB control requests back to back, the module's firmware crashed. It came back by itself 60 to 90 s later, with all settings intact. Stage 1 doesn't do that, but if the module drops off USB during stage 1, wait 90 s before you unplug it.
+
+To do only the USB port reset, without the stage 1 probes, run `python3 tools/fm350_diag.py usb-reset`. It is level 0, asks nothing, and refuses to run while `fm350mac up` is running.
 
 ## Stage 2: `experiment NAME`
 
@@ -169,7 +171,7 @@ What the tool does to reduce that risk:
 1. It refuses to run without `--backup DIR`, where DIR contains a non-empty `nvdata.tar` and a `SHA256SUMS` file that checks out. It also refuses if the current file can't be parsed or its mode isn't 1 or 3.
 2. It asks you to type `CHANGE DIPC`, and refuses if it isn't running in an interactive terminal.
 3. It copies the current file to your computer, and to `dipc_config.orig` on the module. It never overwrites an existing `.orig` file, and it also recognises the `.orig-dell` name from our manual run. (The Dell guide's manual [Step 4](dell-dw5931e-usb.md#step-4-optional-switch-from-pcie-advance-mode-to-dual-mode) saves its copy as `dipc_config.orig-dell`; the tool's own copy is `dipc_config.orig`. Both hold the original file.)
-4. It uploads the new content to a temporary file on the module, reads it back, and compares it byte for byte. Only then does it copy the content into place, keeping the file's owner and permissions. Every write on the module first checks that its source file exists and isn't empty. A failed copy therefore never leaves `dipc_config` empty.
+4. It uploads the new content to a temporary file on the module, reads it back, and compares it byte for byte. Only then does it copy the content into place, keeping the file's owner and permissions. Every write on the module first checks that its source file exists and isn't empty, so a missing source can't blank `dipc_config`. The copy itself (`cat new > dipc_config`) truncates the file before it writes, and it isn't atomic: if the connection drops at that moment, the file can be left empty or half written. The tool prints the manual recovery command before the write, and journals every write on the module to `journal.jsonl` in the output directory.
 5. It reads the file back again. If the content doesn't match, it restores the original immediately and stops.
 6. It doesn't restart the module itself. The new mode takes effect at the next restart: run `volatile --reset --skip-scan --skip-cfun`, or unplug the adapter and plug it back in. Then run `dipc status`, which should show `3,1,1,1,3,15`.
 
@@ -182,6 +184,26 @@ adb exec-out 'cd /mnt/vendor/nvdata/md_cmn && cp -p dipc_config.orig dipc_config
 
 On our module, mode 3 has survived every restart since, and USB, AT, ADB and the SIM all kept working.
 
+## Recording the module during a test: `tools/module-telemetry.sh`
+
+When the module crashes and reboots, its own logs are gone: the kernel's crash-log area (ramoops) comes up invalid at the next boot, and the syslog only lives in RAM. To keep what the module logged and measured just before a reset, stream it off the module while the test runs:
+
+```sh
+tools/module-telemetry.sh -- tools/bench-throughput.sh --apn <apn> --server <iperf3-host> \
+    --tests up --max-bytes 500M --yes
+```
+
+It runs any command you give it after `--`. Meanwhile it records over ADB, with the Mac's clock on every line, into `tools/telemetry-results/<date>-<time>-<pid>/` (or `--out DIR`):
+
+| File | Contents |
+|---|---|
+| `module-log.txt` | The module's syslog, kernel lines included (`logread -f`) |
+| `module-sensors.txt` | About 10 samples a second (one a second if the module's shell can't sleep for fractions of a second; the file's first line says which): the supply voltage the module's PMIC measures (`BATADC`, mV) and the LTE PA, NR PA, RF, modem-RF and PMIC temperatures (milli-degrees C) |
+
+At the end it prints the last samples, the lowest voltage and the highest temperatures. It only reads from the module. It needs ADB in the `device` state; ADB shows `offline` if the module boots while the Mac's ADB server runs, so run `adb kill-server` first and start ADB once the module is up. If it's already `offline`, `volatile --usb-reset` clears it (see [Stage 1](#stage-1-volatile)), but replug before measurements. The files can contain your operator, cell and IP details, so don't publish them unredacted.
+
+Limits: 10 samples a second can miss a voltage dip shorter than about 100 ms, and the last log lines before a crash can be lost when USB drops.
+
 ## Troubleshooting the tool
 
 | Symptom | Fix |
@@ -190,7 +212,7 @@ On our module, mode 3 has survived every restart since, and USB, AT, ADB and the
 | `LIBUSB_ERROR_ACCESS` / `BUSY` on Linux | The `option` driver has claimed the interface. Use `--tty` (the tool normally finds it on its own). |
 | `LIBUSB_ERROR_ACCESS` on macOS | Another program has the port open, for example `fm350mac up`. Close it. |
 | AT commands time out | Another program is using the port, or the module is still booting. Wait 60 s. |
-| ADB shows `offline` | `volatile --usb-reset`, or unplug and replug the adapter. `adb kill-server` alone doesn't fix it. |
+| ADB shows `offline` | Run `adb kill-server` before the module restarts and start ADB once it's up. If already offline, use `volatile --usb-reset` (a replug alone doesn't help while the server runs); it may leave `logread_agent` spinning, so replug before measurements. |
 | `RESTORE FAILED` | Run the commands in `restore.txt` with `uv run tools/fm350_at.py '<command>'`. Every change is listed in `journal.jsonl`. |
 | A Linux `ttyUSB` number changed after a restart | Use the stable name under `/dev/serial/by-id/` for `--tty`. |
 
