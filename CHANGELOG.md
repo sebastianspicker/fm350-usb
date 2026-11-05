@@ -30,7 +30,30 @@ versioned separately.
   names the flags it ignores. RNDIS packets whose data overlaps their header
   are rejected; empty ones are skipped without dropping the rest of the
   transfer.
+- A USB error while polling the modem's IP address no longer marks a healthy
+  session as lost, and a busy modem right after a stall-triggered PDP cycle no
+  longer does either. A bulk-OUT endpoint that stalls on every transfer now
+  fails the bridge (so a supervised session rebuilds) instead of silently
+  dropping all uploads.
+- `up --no-helper` and `--dry-run` use the root helper's own route/DNS code
+  instead of a copy, so both paths restore the previous default route the same
+  way; a timed-out `route -n get default` no longer fails the helper's
+  `set_default_route`. The helper sha256 below changed accordingly.
+- `tools/fm350_at.py` no longer needs `pyusb` (run it with `uv run
+  tools/fm350_at.py ...`); its unused pyusb fallback was removed.
 - Router scripts:
+  - **mwan3:** the catch-all `default` rule is placed right before the first
+    stock rule instead of at the top, so rules of your own above the stock
+    ones keep matching first.
+  - **Install and uninstall:** refuse to run while `network`, `firewall` or
+    `mwan3` has uncommitted uci changes (e.g. unapplied LuCI edits), which
+    would otherwise be committed with ours. On kernels before 6.6 with the
+    AT port not found, the installer says to replug the modem. The final
+    hint says `fm350-watchdog restart`, so an upgrade replaces a running
+    watchdog.
+  - **`fm350-status`:** drops control characters from modem output (the
+    operator name comes from the cell network) and removes its temp file on
+    Ctrl-C.
   - **Watchdog:** restarts `wwan` after a transient SIM error such as
     `SIM busy` or `SIMreadfailure`. It still never restarts after an error
     that mentions a PIN, PUK, password, denial or a missing SIM. It no
@@ -57,7 +80,7 @@ First alpha release of `fm350mac`. See the
 for installation, limitations and the trust model. The `v0.1.0a1` tag is
 created at release; until then install from the branch with `@alpha-0.1`.
 
-Helper sha256: `4973bc87fc9cbb5df508321e538884984ad38c6ee88e8ceaf8206eafde3bb5be`
+Helper sha256: `b22923481d9b1e469019307231735c1fdc8a8c31c322947bb07e8789233c8b09`
 
 This is the sha256 of `fm350mac/src/fm350mac/helper/fm350mac_helper.py` in
 this release (the release workflow refuses to publish if the file differs).

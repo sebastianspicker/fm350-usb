@@ -10,11 +10,13 @@ launched by a LaunchDaemon. It must therefore:
   * run correctly on Python 3.9 (no ``match``, no ``X | Y`` unions evaluated
     at runtime -- only inside ``from __future__ import annotations``, which
     just stringifies them);
-  * never import anything from the ``fm350mac`` package. A few small pieces
-    (utun creation, IPv4 validation, the NetConfig capture/restore logic)
-    are therefore deliberately duplicated here rather than shared -- see
-    ``fm350mac.utun``, ``fm350mac.at.valid_assigned_ipv4`` and
-    ``fm350mac.netconfig.NetConfig`` for the originals.
+  * never import anything from the ``fm350mac`` package. Two small pieces
+    (utun creation, IPv4 validation) are therefore deliberately duplicated
+    here rather than shared -- see ``fm350mac.utun`` and
+    ``fm350mac.at.valid_assigned_ipv4`` for the originals. The other
+    direction is fine: ``fm350mac.netconfig.NetConfig`` (``up --no-helper``)
+    imports ``NetState`` from this file, so the route/DNS capture/restore
+    logic exists only here.
 
 Protocol: one JSON object per line over a Unix socket, request -> response,
 at most ``MAX_MESSAGE_BYTES`` per message. See ``_OP_SCHEMAS`` for the exact
@@ -70,6 +72,7 @@ IFCONFIG = "/sbin/ifconfig"
 ROUTE = "/sbin/route"
 SCUTIL = "/usr/sbin/scutil"
 COMMAND_TIMEOUT_S = 10
+UTUN_MTU = 1500
 _MINIMAL_ENV = {"PATH": "/usr/bin:/usr/sbin:/bin:/sbin"}
 
 _DNS_KEY = "State:/Network/Service/fm350mac/DNS"
@@ -271,7 +274,7 @@ def run_command(
     return result.stdout
 
 
-# --- per-connection network state (copy of fm350mac.netconfig.NetConfig) ---
+# --- per-connection network state (also behind fm350mac.netconfig.NetConfig) ---
 
 
 class NetState:
@@ -301,15 +304,15 @@ class NetState:
         self.commands.append([SCUTIL] + script.strip().splitlines())
         return run_command([SCUTIL], runner=self._runner, input_text=script)
 
-    def configure_interface(self, ip: str, mtu: int = 1500) -> None:
-        self._run([IFCONFIG, self.ifname, "inet", ip, ip, "mtu", str(mtu), "up"])
+    def configure_interface(self, ip: str) -> None:
+        self._run([IFCONFIG, self.ifname, "inet", ip, ip, "mtu", str(UTUN_MTU), "up"])
         self._configured_ip = ip
 
     def reconfigure_address(self, old_ip: str, new_ip: str) -> None:
         if old_ip != self._configured_ip:
             raise HelperProtocolError(f"reconfigure_address: old_ip {old_ip!r} isn't the configured address")
         self._run([IFCONFIG, self.ifname, "inet", old_ip, "delete"])
-        self._run([IFCONFIG, self.ifname, "inet", new_ip, new_ip, "mtu", "1500", "up"])
+        self._run([IFCONFIG, self.ifname, "inet", new_ip, new_ip, "mtu", str(UTUN_MTU), "up"])
         self._configured_ip = new_ip
 
     def add_host_route(self, dest: str) -> None:
@@ -350,7 +353,7 @@ class NetState:
             if_match = re.search(r"interface:\s*(\S+)", out)
             prev_gateway = gw_match.group(1) if gw_match else None
             prev_iface = if_match.group(1) if if_match else None
-        except subprocess.CalledProcessError:
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
             _log.warning("could not read the previous default route")
         if prev_iface == self.ifname:
             prev_gateway = prev_iface = None
@@ -378,7 +381,7 @@ class NetState:
                 [ROUTE, "-n", "get", "default"],
                 capture_output=True, text=True, timeout=COMMAND_TIMEOUT_S, env=dict(_MINIMAL_ENV), check=True,
             ).stdout
-        except subprocess.CalledProcessError:
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
             return False, None
         match = re.search(r"interface:\s*(\S+)", out)
         return True, match.group(1) if match else None

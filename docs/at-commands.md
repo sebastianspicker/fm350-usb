@@ -13,7 +13,7 @@ A quick reference for the AT commands used elsewhere in this repo to identify th
 AT port: USB interface 6 (mode 41) or 4 (mode 40), usually `/dev/ttyUSB4`. Only one program may hold the port at a time.
 
 - **Linux / OpenWrt:** `picocom -b 115200 --echo /dev/ttyUSB4` — see [setup guide, step 2](setup-guide.md#2-check-that-the-modem-enumerates-any-firmware).
-- **macOS** (no serial driver for these interfaces): `uv run --with pyusb tools/fm350_at.py 'ATI' 'AT+CPIN?'` — see [dell-dw5931e-usb.md, step 2](dell-dw5931e-usb.md#step-2-get-an-at-shell).
+- **macOS** (no serial driver for these interfaces): `uv run tools/fm350_at.py 'ATI' 'AT+CPIN?'` — see [dell-dw5931e-usb.md, step 2](dell-dw5931e-usb.md#step-2-get-an-at-shell).
 
 ## Identity and status
 

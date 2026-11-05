@@ -257,12 +257,15 @@ class Supervisor:
             self.state = State.LOST
             self._connected_since = None
             return
-        _answered, ip = self._poll_ip()
-        if ip is None:
+        answered, ip = self._poll_ip()
+        if answered and ip is None:
             self.state = State.LOST
             self._connected_since = None
             return
-        self._note_ip(ip)
+        # Not answered: the modem is busy right after the cycle, which says
+        # nothing about the context; the next tick polls again.
+        if ip is not None:
+            self._note_ip(ip)
         # The next window starts after the cycle (up to 2 x ACTIVATE_TIMEOUT_S):
         # packets refused while the context was down are not a new stall.
         self._stall_baseline = (self._time(), stats.rx_packets, stats.tx_timeouts)
@@ -363,9 +366,11 @@ class Supervisor:
             _log.warning("CGPADDR poll timed out")
             return False, None
         except Exception:
+            # e.g. UsbTimeout/UsbPipeError on the AT write: no answer, so
+            # nothing is known about the PDP context either.
             self.stats.at_errors += 1
             _log.exception("CGPADDR poll failed")
-            return True, None
+            return False, None
 
     def _deactivate_activate(self) -> bool:
         try:

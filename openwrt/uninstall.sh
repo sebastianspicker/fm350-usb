@@ -106,6 +106,15 @@ restore_saved_section() {
 	fi
 }
 
+# `uci commit <config>` saves every staged change, so pending edits of yours
+# (e.g. LuCI changes not yet applied) would be committed together with ours.
+for config in network firewall mwan3; do
+	if [ -n "$(uci -q changes "$config" 2>/dev/null || true)" ]; then
+		echo "uninstall.sh: /etc/config/$config has uncommitted changes (e.g. unapplied LuCI edits). Apply or revert them first (uci changes $config; uci revert $config). Nothing was changed." >&2
+		exit 1
+	fi
+done
+
 # A network.wwan that exists, isn't ours (no fm350_owned marker) and with no
 # install state section is the user's own: install.sh never ran (or never got
 # that far), so leave it and its firewall zone membership alone.

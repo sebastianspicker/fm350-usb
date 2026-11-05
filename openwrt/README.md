@@ -157,8 +157,10 @@ destroying a user's existing mwan3 tuning, `install.sh`:
   tracked; `globals`: `mmx_mask` only if it was unset);
 - fully owns and recreates `wwan`, `wan_m1`, `wwan_m2`, `failover` and
   `default` on every run;
-- runs `uci reorder mwan3.default=1` so `default` is evaluated right after
-  `globals`, ahead of every stock rule;
+- moves `default` right before the first stock rule (`https`,
+  `default_rule_v4` or `default_rule_v6`), so it is evaluated ahead of every
+  stock rule but after any rule of your own that sits above them (with no
+  stock rule left, it stays appended after your rules);
 - if `mwan3.default_rule_v4` and/or `mwan3.https` exist, points their
   `use_policy` at `failover` too, saving the original value in a
   `fm350_orig_policy` option (only on the first run, so a second run doesn't

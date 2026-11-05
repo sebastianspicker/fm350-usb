@@ -59,6 +59,7 @@ journal.jsonl
 /ALPHA_PR_DESCRIPTION.md
 /THINGS_TO_DO_LEDGER.md
 /REPO_AUDIT_LEDGER.md
+/REPO_AUDIT_LEDGER_2026-11-05.md
 
 # Nested assistant workspaces are local state too.
 .agents/

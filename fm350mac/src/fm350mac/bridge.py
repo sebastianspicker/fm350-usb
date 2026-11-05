@@ -29,7 +29,8 @@ import time
 from dataclasses import dataclass
 
 from . import ethernet, rndis
-from .usb_async import UsbError, UsbNoDevice, UsbTimeout
+from .bridge_common import BridgeCommon, _is_device_gone
+from .usb_async import UsbError, UsbTimeout
 from .usb_transport import RateLimiter, RndisUsb, mark_usb_unsafe
 from .utun import Utun
 
@@ -44,7 +45,6 @@ _JOIN_TIMEOUT_S = 2.0
 _ERROR_RETRY_DELAY_S = 0.1
 _MAX_CONSECUTIVE_ERRORS = 50
 _TX_STALL_TIMEOUT_MS = 50  # short write timeout while tx is stalled, so utun doesn't back up
-_TX_STALL_WARN_INTERVAL_S = 10.0
 # If a "wait for a notification" call returns in much less than the timeout
 # it was given, several times in a row, treat it as not really blocking
 # (e.g. a fake transport in tests/loopback mode) and sleep out the rest of
@@ -57,11 +57,6 @@ _LOG_INTERVAL_S = 10.0  # rate limit for per-packet error logs
 _UTUN_ERROR_BACKOFF_S = 0.05  # first backoff after a utun.read() OSError; grows linearly
 _UTUN_ERROR_BACKOFF_MAX_S = 1.0
 _UTUN_ERROR_FAIL_STREAK = 30  # consecutive utun.read() errors before the bridge fails
-
-
-def _is_device_gone(exc: UsbError) -> bool:
-    """True if ``exc`` indicates the USB device was physically disconnected."""
-    return isinstance(exc, UsbNoDevice)
 
 
 @dataclass
@@ -77,8 +72,10 @@ class BridgeStats:
     tx_timeouts: int = 0  # same as tx_stalls here (no pool to be full); mirrors AsyncBridgeStats
 
 
-class Bridge:
+class Bridge(BridgeCommon):
     """Bridges RNDIS Ethernet frames to/from a utun interface."""
+
+    _log = _log  # BridgeCommon logs under this module's logger
 
     def __init__(
         self,
@@ -112,20 +109,6 @@ class Bridge:
         self._tx_stalled = False
         self._tx_stall_warn_last = 0.0
         self._tx_stall_warn_count_since = 0
-
-    @property
-    def our_ip(self) -> bytes:
-        """The IP address the ARP responder answers for (thread-safe)."""
-        with self._our_ip_lock:
-            return self._our_ip
-
-    def set_our_ip(self, ip: str) -> None:
-        """Update the IP the ARP responder answers for (thread-safe).
-
-        Called by the reconnect supervisor after the modem assigns a new IP.
-        """
-        with self._our_ip_lock:
-            self._our_ip = socket.inet_aton(ip)
 
     def start(self) -> None:
         """Start the rx, tx and control threads."""
@@ -271,15 +254,12 @@ class Bridge:
 
     def _handle_arp(self, payload: bytes) -> None:
         try:
-            arp = ethernet.parse_arp(payload)
+            frame = self._arp_reply_frame(payload)
         except ValueError:
             self.stats.drops += 1
             return
-        if arp.oper != ethernet.ARP_REQUEST or arp.tpa != self.our_ip:
-            return
-        reply_payload = ethernet.build_arp_reply(arp, self.our_mac, self.our_ip)
-        frame = ethernet.wrap(reply_payload, ethernet.ETH_P_ARP, dst=arp.sha, src=self.our_mac)
-        self._send_frame(frame)
+        if frame is not None:
+            self._send_frame(frame)
 
     # --- tx: utun -> RNDIS bulk OUT ------------------------------------------
 
@@ -353,17 +333,6 @@ class Bridge:
         if ip_len is not None:
             self.stats.tx_packets += 1
             self.stats.tx_bytes += ip_len
-
-    def _warn_tx_stall_rate_limited(self) -> None:
-        self._tx_stall_warn_count_since += 1
-        now = time.monotonic()
-        if now - self._tx_stall_warn_last >= _TX_STALL_WARN_INTERVAL_S:
-            _log.warning(
-                "tx stalled (no active data session?): %d timeouts since last warning (total tx_stalls=%d)",
-                self._tx_stall_warn_count_since, self.stats.tx_stalls,
-            )
-            self._tx_stall_warn_last = now
-            self._tx_stall_warn_count_since = 0
 
     # --- control: device keepalive reply + our own keepalive tick -----------
 

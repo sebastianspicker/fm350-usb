@@ -218,7 +218,7 @@ class HelperNetConfig:
         """
         return self._client.open_utun()
 
-    def configure_interface(self, ifname: str, ip: str, mtu: int = 1500) -> None:
+    def configure_interface(self, ifname: str, ip: str) -> None:
         self._client.request("set_address", ip=ip)
 
     def reconfigure_address(self, ifname: str, old_ip: str, new_ip: str) -> None:

@@ -228,6 +228,19 @@ if [ -z "$wan_zone" ]; then
 	exit 1
 fi
 
+# `uci commit <config>` saves every staged change, so pending edits of yours
+# (e.g. LuCI changes not yet applied) would be committed together with ours.
+for config in network firewall mwan3; do
+	if [ -n "$(uci -q changes "$config" 2>/dev/null || true)" ]; then
+		if [ "$dry_run" -eq 1 ]; then
+			log "WARNING: /etc/config/$config has uncommitted changes; a real run would refuse until they are applied or reverted"
+		else
+			echo "install.sh: /etc/config/$config has uncommitted changes (e.g. unapplied LuCI edits). Apply or revert them first (uci changes $config; uci revert $config). Nothing was changed." >&2
+			exit 1
+		fi
+	fi
+done
+
 # --- base packages -----------------------------------------------------------
 base_pkgs="kmod-usb-net-rndis kmod-usb-serial-option comgt"
 [ "$no_mwan3" -eq 1 ] || base_pkgs="$base_pkgs mwan3 luci-app-mwan3"
@@ -284,7 +297,9 @@ fi
 # fm350_find_at_device (files/usr/lib/fm350/at-port.sh): USB interface :1.6
 # (0e8d:7127, mode 41, default) or :1.4 (0e8d:7126, mode 40), only on a USB
 # device with idVendor 0e8d.
+at_detected=0
 if device=$(fm350_find_at_device); then
+	at_detected=1
 	log "AT command device detected: $device"
 else
 	device=$(uci -q get network.wwan.device 2>/dev/null) || device=""
@@ -495,11 +510,12 @@ mwan3_set_mmx_mask_if_unset() {
 
 # mwan3's stock config ships a "https" and a "default_rule_v4" rule (both
 # using policy "balanced") ahead of any appended rule. Since mwan3 is
-# first-match, those would shadow our "default" rule for all IPv4 traffic
-# even after it's reordered to the front of the rule list, unless they are
-# pointed at "failover" too. Idempotent: the original use_policy is saved in
-# fm350_orig_policy only once, so a second run doesn't overwrite the saved
-# original with the now-current "failover" value.
+# first-match, those would shadow our "default" rule for all IPv4 traffic;
+# place_mwan3_default_rule moves ours ahead of them, and they are pointed at
+# "failover" too so they agree with it even if the order changes.
+# Idempotent: the original use_policy is saved in fm350_orig_policy only
+# once, so a second run doesn't overwrite the saved original with the
+# now-current "failover" value.
 neutralize_mwan3_rule() {
 	section=$1
 	policy=${2:-failover}
@@ -516,6 +532,27 @@ neutralize_mwan3_rule() {
 		log "[dry-run] would set mwan3.$section.use_policy='$policy'"
 	else
 		uci set "mwan3.$section.use_policy=$policy"
+	fi
+}
+
+# Moves our catch-all "default" rule right before the first stock rule
+# (https, default_rule_v4, default_rule_v6): it must beat the sticky stock
+# "https" rule (mwan3 is first-match), but not your own rules above them.
+# With no stock rule left, "default" stays appended after your rules.
+place_mwan3_default_rule() {
+	# 0-based index among the other sections, which is what `uci reorder` takes.
+	idx=$(uci show mwan3 2>/dev/null | sed -n 's/^mwan3\.\([^.=]*\)=.*/\1/p' | awk '
+		$0 == "default" { next }
+		$0 == "https" || $0 == "default_rule_v4" || $0 == "default_rule_v6" { print n + 0; exit }
+		{ n++ }')
+	if [ -z "$idx" ]; then
+		log "no stock mwan3 rule found: our default rule stays after your own rules"
+		return 0
+	fi
+	if [ "$dry_run" -eq 1 ]; then
+		log "[dry-run] would reorder mwan3.default=$idx (right before the first stock rule)"
+	else
+		uci reorder "mwan3.default=$idx"
 	fi
 }
 
@@ -648,6 +685,7 @@ else
 	else
 		disable_mwan3_v6_default_rule
 	fi
+	place_mwan3_default_rule
 	verify_uci mwan3.failover.last_resort unreachable
 	verify_uci mwan3.default.use_policy failover
 	[ "$dry_run" -eq 1 ] || uci commit mwan3
@@ -675,6 +713,10 @@ if kernel_lt_6_6; then
 		cp "$FILES_DIR/etc/hotplug.d/usb/50-fm350_driver" /etc/hotplug.d/usb/50-fm350_driver
 		chmod 0755 /etc/hotplug.d/usb/50-fm350_driver
 	fi
+	# The hotplug file only runs on a USB plug event, so a modem that was
+	# already plugged in gets no ttyUSB (and the AT port guess above is
+	# unverified) until it is replugged.
+	[ "$at_detected" -eq 1 ] || log "NOTE: unplug and replug the modem (or reboot) now, so the option driver binds it and its AT port appears; then check network.wwan.device"
 else
 	log "kernel $(uname -r) >= 6.6: no hotplug driver needed (option driver already knows the FM350)"
 fi
@@ -734,6 +776,6 @@ if [ "$dry_run" -eq 1 ]; then
 else
 	log "done. Reload with: /etc/init.d/network reload && /etc/init.d/firewall reload"
 	[ "$no_mwan3" -eq 1 ] || log "and: /etc/init.d/mwan3 restart"
-	[ "$no_watchdog" -eq 1 ] || log "and: /etc/init.d/fm350-watchdog start"
+	[ "$no_watchdog" -eq 1 ] || log "and: /etc/init.d/fm350-watchdog restart"
 	log "check status with: fm350-status"
 fi

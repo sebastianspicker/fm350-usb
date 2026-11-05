@@ -96,7 +96,7 @@ picocom -b 115200 --echo /dev/ttyUSB4
 
 ```sh
 brew install libusb
-uv run --with pyusb tools/fm350_at.py 'ATI' 'AT+GTPKGVER?' 'AT+GTDIPCMODE?'
+uv run tools/fm350_at.py 'ATI' 'AT+GTPKGVER?' 'AT+GTDIPCMODE?'
 ```
 
 Read the current state:

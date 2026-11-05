@@ -116,10 +116,10 @@ fm350mac at 'AT+GTPKGVER?'      # raw AT commands (no root)
 
 It's pure Python with a small ctypes binding to libusb, and has no kext or system extension. The part that needs root (creating the `utun` interface and routes) runs in a separate helper installed as a LaunchDaemon, so the driver itself runs as your user. This is alpha software with a [stated trust model](fm350mac/README.md#privilege-separation-and-the-trust-model); read it before installing the helper. The `v0.1.0a1` tag is created at release; until then use `@alpha-0.1` instead. See [fm350mac/README.md](fm350mac/README.md), the [changelog](CHANGELOG.md) and the design notes in [docs/macos-driver.md](docs/macos-driver.md).
 
-If you only want an AT prompt, [`tools/fm350_at.py`](tools/fm350_at.py) works on its own:
+If you only want an AT prompt, [`tools/fm350_at.py`](tools/fm350_at.py) works from a checkout without installing anything (it needs only `brew install libusb`):
 
 ```sh
-uv run --with pyusb tools/fm350_at.py 'ATI' 'AT+CPIN?'
+uv run tools/fm350_at.py 'ATI' 'AT+CPIN?'
 ```
 
 ### Dell DW5931e guide ([`docs/dell-dw5931e-usb.md`](docs/dell-dw5931e-usb.md))

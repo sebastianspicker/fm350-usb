@@ -20,8 +20,9 @@
 # The stock "https" / "default_rule_v4" rules that ship with mwan3 (policy
 # "balanced", matched before an appended "default" rule) would otherwise
 # shadow our failover rule for all IPv4 traffic. install.sh additionally:
-#   - reorders "default" to right after "globals" so it is the first rule
-#     evaluated for any section named "rule" (mwan3 is first-match);
+#   - moves "default" right before the first stock rule (mwan3 is
+#     first-match), so it beats the sticky stock "https" rule but your own
+#     rules above the stock ones still match first;
 #   - points the stock "https"/"default_rule_v4" rules (if present) at our
 #     "failover" policy too, saving their original use_policy in a
 #     "fm350_orig_policy" option so uninstall.sh can restore it.
@@ -85,6 +86,5 @@ set mwan3.default.fm350_owned='1'
 set mwan3.default.dest_ip='0.0.0.0/0'
 set mwan3.default.family='ipv4'
 set mwan3.default.use_policy='failover'
-reorder mwan3.default=1
 
 commit mwan3

@@ -1163,7 +1163,7 @@ def cmd_up(
                 _log.info("utun interface: %s", utun_name)
 
                 if restart_count == 0 or previous_ip is None:
-                    net.configure_interface(utun_name, ip, mtu=1500)
+                    net.configure_interface(utun_name, ip)
                 elif ip != previous_ip:
                     # A restart (device_lost -> re-enumerated) that came back
                     # with a different IP: replace the address in place
@@ -1512,7 +1512,7 @@ def _cmd_up_loopback(
             utun_name = utun.name
         _log.info("utun interface: %s (loopback)", utun_name)
 
-        net.configure_interface(utun_name, loopback.OUR_IP, mtu=1500)
+        net.configure_interface(utun_name, loopback.OUR_IP)
         net.add_host_route(utun_name, loopback.PEER_IP)
 
         if not args.dry_run and utun is not None:

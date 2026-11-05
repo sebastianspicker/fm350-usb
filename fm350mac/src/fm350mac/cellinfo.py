@@ -332,6 +332,8 @@ _LTE_BAND_RANGES: tuple[tuple[int, int, int], ...] = (
 # n41 (499200-537999) overlaps n38 (514000-524000) and n7 (524000-538000):
 # n41 comes after both, so a channel in those ranges is reported as n38/n7
 # and only 499200-513999 as n41; same heuristic caveat applies.
+# n20 (158200-164200) and n28 (151600-160600) overlap in 158200-160600:
+# n20 comes first, so that range is reported as n20 (label only).
 _NR_BAND_RANGES: tuple[tuple[str, int, int], ...] = (
     ("n1", 422000, 434000),
     ("n3", 361000, 376000),

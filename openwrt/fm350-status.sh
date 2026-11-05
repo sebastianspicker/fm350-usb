@@ -141,7 +141,9 @@ EOF
 # Reads a "@@Q <AT command>" tagged transcript (one query's full raw
 # response follows each tag line, up to the next tag) from stdin, prints the
 # decoded summary to stdout. $1 (passed as awk -v redact=) is "1"/"0".
-run_decode() {
+run_decode() (
+	# Subshell body: its own traps remove the temp file on Ctrl-C too,
+	# without touching the caller's traps.
 	# busybox mktemp requires the template to *end* in XXXXXX (no suffix
 	# after it) - a suffixed template like "...XXXXXX.awk" errors out with
 	# "Invalid argument" on real OpenWrt/busybox, verified in the same
@@ -150,6 +152,9 @@ run_decode() {
 		echo "fm350-status.sh: mktemp failed" >&2
 		return 1
 	}
+	trap 'rm -f "$awk_script"' EXIT
+	trap 'rm -f "$awk_script"; exit 130' INT
+	trap 'rm -f "$awk_script"; exit 143' TERM
 	cat >"$awk_script" <<'AWK'
 function reg_stat_name(s) {
 	# 3GPP TS 27.007 10.1.20 (+CEREG) <stat>; reused for +C5GREG (not in the
@@ -394,6 +399,13 @@ AWK
 	awk -v redact="$1" -f "$awk_script" || rc=$?
 	rm -f "$awk_script"
 	return "$rc"
+)
+
+# Drops control bytes (keeps tab, LF, CR) from modem output before it reaches
+# the terminal: text like the +COPS operator name comes from the cell network,
+# and escape sequences in it must not run in the admin's terminal.
+strip_controls() {
+	tr -d '\000-\010\013\014\016-\037\177'
 }
 
 # Masks the TAC and cell ID (fields 5 and 6) of +GTCCINFO cell rows, for -r -x.
@@ -481,9 +493,9 @@ AT+GTFCCEFFSTATUS?"
 				continue
 			}
 			if [ "$redact" -eq 1 ]; then
-				printf '%s\n' "$out" | redact_raw
+				printf '%s\n' "$out" | strip_controls | redact_raw
 			else
-				printf '%s\n' "$out"
+				printf '%s\n' "$out" | strip_controls
 			fi
 			echo
 		done
@@ -500,7 +512,7 @@ AT+GTFCCEFFSTATUS?"
 @@Q $q
 $out"
 	done
-	printf '%s\n' "$dump" | run_decode "$redact"
+	printf '%s\n' "$dump" | strip_controls | run_decode "$redact"
 }
 
 [ -n "$FM350_STATUS_TEST" ] || main "$@"

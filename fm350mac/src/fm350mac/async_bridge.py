@@ -17,7 +17,8 @@ import time
 from dataclasses import dataclass
 
 from . import ethernet, rndis
-from .usb_async import AsyncEndpoint, EventLoop, UsbError, UsbNoDevice
+from .bridge_common import BridgeCommon, _is_device_gone
+from .usb_async import AsyncEndpoint, EventLoop, UsbError
 from .usb_transport import RateLimiter, RndisUsb, is_response_available, mark_usb_unsafe
 from .utun import Utun
 
@@ -32,7 +33,6 @@ _UTUN_TIMEOUT_S = 0.5
 _KEEPALIVE_INTERVAL_S = 5.0
 _CONTROL_NOTIFY_TIMEOUT_S = 1.0
 _JOIN_TIMEOUT_S = 2.0
-_TX_STALL_WARN_INTERVAL_S = 10.0
 _LOG_INTERVAL_S = 10.0  # rate limit for per-packet error logs
 _UTUN_ERROR_BACKOFF_S = 0.05  # first backoff after a utun.read() OSError; grows linearly
 _UTUN_ERROR_BACKOFF_MAX_S = 1.0
@@ -91,10 +91,6 @@ def clamp_max_transfer_size(reported: int) -> int:
     return reported
 
 
-def _is_device_gone(exc: UsbError) -> bool:
-    return isinstance(exc, UsbNoDevice)
-
-
 @dataclass
 class AsyncBridgeStats:
     """Running counters for the async data pump (same shape as bridge.BridgeStats)."""
@@ -115,10 +111,12 @@ class AsyncBridgeStats:
     rx_urb_frames_max: int = 0  # most frames seen in one RX URB (event thread)
 
 
-class AsyncBridge:
+class AsyncBridge(BridgeCommon):
     """Bridges RNDIS Ethernet frames to/from a utun interface, keeping
     ``rx_urbs``/``tx_urbs`` bulk transfers in flight per direction.
     """
+
+    _log = _log  # BridgeCommon logs under this module's logger
 
     def __init__(
         self,
@@ -201,17 +199,6 @@ class AsyncBridge:
         self._event_loop.register(self._rx_pool)
         self._event_loop.register(self._tx_pool)
         self._event_loop.register(self._control_pool)
-
-    @property
-    def our_ip(self) -> bytes:
-        """The IP address the ARP responder answers for (thread-safe)."""
-        with self._our_ip_lock:
-            return self._our_ip
-
-    def set_our_ip(self, ip: str) -> None:
-        """Update the IP the ARP responder answers for (thread-safe)."""
-        with self._our_ip_lock:
-            self._our_ip = socket.inet_aton(ip)
 
     def start(self) -> None:
         """Start the event loop, submit the RX/control pools, and start the tx/control threads."""
@@ -362,14 +349,12 @@ class AsyncBridge:
 
     def _handle_arp(self, payload: bytes) -> None:
         try:
-            arp = ethernet.parse_arp(payload)
+            frame = self._arp_reply_frame(payload)
         except ValueError:
             self._incr_stat("drops")
             return
-        if arp.oper != ethernet.ARP_REQUEST or arp.tpa != self.our_ip:
+        if frame is None:
             return
-        reply_payload = ethernet.build_arp_reply(arp, self.our_mac, self.our_ip)
-        frame = ethernet.wrap(reply_payload, ethernet.ETH_P_ARP, dst=arp.sha, src=self.our_mac)
         msg = self._out_msg(frame)
         if msg is None or self._tx_pool.submit_out(msg):
             return
@@ -390,7 +375,8 @@ class AsyncBridge:
 
     def _drain_control_tx(self) -> None:
         """Send queued ARP replies (tx thread only, see _handle_arp)."""
-        while not self._stop.is_set():
+        # Fast path: almost always empty; skip raising queue.Empty per packet.
+        while not self._control_tx.empty() and not self._stop.is_set():
             try:
                 msg = self._control_tx.get_nowait()
             except queue.Empty:
@@ -558,17 +544,6 @@ class AsyncBridge:
             self._incr_stat("tx_timeouts")
             self._incr_stat("drops")
             self._warn_tx_stall_rate_limited()
-
-    def _warn_tx_stall_rate_limited(self) -> None:
-        self._tx_stall_warn_count_since += 1
-        now = time.monotonic()
-        if now - self._tx_stall_warn_last >= _TX_STALL_WARN_INTERVAL_S:
-            _log.warning(
-                "tx stalled (no active data session?): %d timeouts since last warning (total tx_stalls=%d)",
-                self._tx_stall_warn_count_since, self.stats.tx_stalls,
-            )
-            self._tx_stall_warn_last = now
-            self._tx_stall_warn_count_since = 0
 
     # --- control: a 1-deep async interrupt-IN transfer signals this thread,
     # which does a single GET_ENCAPSULATED_RESPONSE (never polls without a

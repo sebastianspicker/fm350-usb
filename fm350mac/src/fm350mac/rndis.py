@@ -289,7 +289,7 @@ def parse_indicate_status(msg: bytes) -> IndicateStatus:
         return IndicateStatus(status=status, buffer=b"")
     start = 8 + buf_offset
     end = start + buf_len
-    if start < 8 or end > len(msg):
+    if start < 20 or end > len(msg):  # the buffer can't overlap the 20-byte header
         raise RndisError(STATUS_INVALID_DATA, "INDICATE_STATUS: buffer offset/length out of range")
     return IndicateStatus(status=status, buffer=bytes(msg[start:end]))
 

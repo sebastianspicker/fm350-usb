@@ -191,7 +191,7 @@ On our module, mode 3 has survived every restart since, and USB, AT, ADB and the
 | `LIBUSB_ERROR_ACCESS` on macOS | Another program has the port open, for example `fm350mac up`. Close it. |
 | AT commands time out | Another program is using the port, or the module is still booting. Wait 60 s. |
 | ADB shows `offline` | `volatile --usb-reset`, or unplug and replug the adapter. `adb kill-server` alone doesn't fix it. |
-| `RESTORE FAILED` | Run the commands in `restore.txt` with `uv run --with pyusb tools/fm350_at.py '<command>'`. Every change is listed in `journal.jsonl`. |
+| `RESTORE FAILED` | Run the commands in `restore.txt` with `uv run tools/fm350_at.py '<command>'`. Every change is listed in `journal.jsonl`. |
 | A Linux `ttyUSB` number changed after a restart | Use the stable name under `/dev/serial/by-id/` for `--tty`. |
 
 ## Reporting results
