@@ -7,6 +7,8 @@
 
 This repository holds tools and notes for running a **Fibocom FM350-GL** 5G modem over USB as a backup internet connection for a home router. That includes the **Dell DW5931e**, the Dell-branded version of the same module that comes out of Latitude laptops and turns up cheaply as a used part. You fit the module into a USB-to-M.2 adapter, plug it into a router (or a Mac, for bench testing), and it can take over the internet connection when your main line goes down.
 
+> _Claude was used to polish and proof-read the code and documentation of this repository._
+
 <details>
 <summary>Status and limitations</summary>
 
@@ -40,6 +42,8 @@ flowchart LR
   A -->|USB| D[Mac running fm350mac]
   D --> E[Local utun interface]
 ```
+
+How the pieces work together, with diagrams and a code map: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 **Interactive demo:** https://sebastianspicker.github.io/fm350-usb/
 
@@ -182,6 +186,7 @@ Specs, power budget and band support are in [docs/hardware.md](docs/hardware.md)
 
 | Document | What's in it |
 |---|---|
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | How the parts fit together: what runs where, what `fm350mac up` and a failover do, code map |
 | [docs/setup-guide.md](docs/setup-guide.md) | Step-by-step bring-up on OpenWrt, from `lsusb` to a working failover |
 | [docs/dell-dw5931e-usb.md](docs/dell-dw5931e-usb.md) | Dell DW5931e over USB: DIPC mode, ADB, backup, troubleshooting |
 | [docs/diagnostics.md](docs/diagnostics.md) | `tools/fm350_diag.py`: automatic diagnostics in stages, from read-only to the changes we tested, with safety notes |
