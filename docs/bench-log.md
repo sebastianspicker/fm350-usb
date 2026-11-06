@@ -42,8 +42,8 @@ unit, that was the answer.
 
 ## How to read this log
 
-Entries are in the order we actually ran them, on 2026-09-25 (with one
-later entry from 2026-10-05 at the end), not reorganised by topic. That matters here: several early conclusions in this
+Entries are in the order we actually ran them, on 2026-09-25 (with
+later entries from 2026-10-05 and 2026-11-05/06 at the end), not reorganised by topic. That matters here: several early conclusions in this
 log were provisional, and later entries either confirm, refine or correct
 them. Two are worth knowing before you read on:
 
@@ -473,6 +473,47 @@ Cell: LTE B8, EARFCN 3749, RSRP -94 dBm, RSRQ -12 dB. `up --route-host` for the 
 `perf:` line of the 50 MB session: 42,243 OUT transfers, latency mean 184 µs, max 2.3 ms (92% under 500 µs); all 8 OUT transfers in flight at the peak; 1,736 slot waits totalling 0.2 s; RX up to 17 frames per bulk-IN transfer (mean 3.9). With N=8 and L=184 µs the TX ceiling is about 43k packets/s, so 8 OUT transfers stay the default. About 220 MB of SIM data in total.
 
 Not covered: `--default-route`, `--dns`, sessions longer than 10 minutes, the watchdog/stall detection/rebuild retry actually firing, the RNDIS-level rebuild, Intel Macs. See [macos-driver.md](macos-driver.md#whats-not-proven-yet).
+
+## Sustained-upload resets on the 5G DONGLE (2026-11-05/06)
+
+*What this entry showed: on the Waveshare USB 3.2 Gen1 5G DONGLE powered by*
+*USB-C alone, sustained uploads made the module's supply sag and the whole*
+*module reset. With the dongle's DC jack also fed, the supply stayed flat and*
+*every run passed.*
+
+Setup: FM350-GL (Dell DW5931e, firmware 29.20.22, OEM image 5025) in the 5G DONGLE, USB 3 at 5 Gbps to a Mac, Telekom DE SIM. `tools/bench-throughput.sh` against an iperf3 server, routed with `--route-host` only. `tools/module-telemetry.sh` recorded the module's syslog, temperatures and supply over ADB; from crash 5 on with `--fast-vbat` (about 430 supply reads a second, kept as the minimum and maximum per 0.1 s).
+
+**USB-C only (2026-11-05):**
+
+| Time | Test | Result | Upload Mbit/s | Lowest supply |
+|---|---|---|---|---|
+| 18:06 | 500 MB down, then up | reset after 28 MB up | – | – |
+| 18:37 | 500 MB up | reset after 195 MB | – | – |
+| 18:48 | 500 MB up | reset after 62 MB | 27 | 3.906 V (1 s samples) |
+| 21:23 | 300 MB up, fresh replug | passed | 51 | 4.010 V (1 s) |
+| 21:25 | 300 MB up, same boot | reset after 192 MB | 32 | 3.935 V (1 s) |
+| 21:43 | 300 MB up | passed | 61 | 4.008 V (1 s) |
+| 21:45 | 300 MB up, same boot | passed | 59 | 4.052 V (1 s) |
+| 21:51 | 500 MB down, then up | reset after 249 MB up | – | **3.495 V** (0.1 s windows) |
+
+- Crash 5 (21:51) caught the supply collapsing: 0.1 s window minimums of about 3.92-3.95 V during the upload, then 3.86, 3.83, 3.78 and 3.495 V in the last window, about 150 ms before USB dropped. It was the only reading below 3.78 V among 32,370 samples. The lowest reading during the 500 MB download before it was 3.91 V.
+- Runs that crashed had lower upload throughput (27-32 vs 51-61 Mbit/s) on the same cell (LTE B3, PCI 391, about −98 dBm): probably worse uplink conditions, so higher transmit power and more current.
+- Ruled out: overheating (PA ≤ 48.6 °C; passing runs ran hotter), a watchdog hang (data flowed until about 0.1 s before), a host-side USB stall (the driver's OUT path completed normally up to 132-142 ms before the loss, max OUT latency 2-5 ms).
+- Fresh boot versus accumulated traffic didn't matter: crash 4 came on the second upload of a boot, and another boot carried 622 MB of upload without a reset.
+
+**USB-C plus the DC jack (2026-11-06).** The jack was fed through the dongle's included USB-A to DC cable from a second USB port of the same Mac:
+
+| Time | Test | Cell | Result | Mbit/s | Supply (0.1 s windows) min / 1st percentile / median |
+|---|---|---|---|---|---|
+| 11:52 | 500 MB up | LTE B8, −91 dBm | passed | up 33.7 | 4.102 / 4.103 / 4.104 V |
+| 11:56 | 500 MB down, then 500 MB up | LTE B7, **−106 dBm** | passed | down 98.5, up 43.3 | 4.099 / 4.101 / 4.103 V |
+| (crash 5, USB-C only, for comparison) | 500 MB down, then up | LTE B3, −98 dBm | reset after 249 MB up | down 139 | 3.495 / 3.883 / 4.000 V |
+
+The 11:56 run had a weaker signal than any crash run, and it was the hottest run so far (modem RF 54 °C). The supply still stayed within about 15 mV of idle (4.115 V).
+
+**Reset-cause registers don't tell crash from healthy.** `tools/module-readout.sh` on a healthy boot after these runs read exactly the same as after crashes 4 and 5: the MT6330 PMIC boot status (power-on/off reason, thermal, power-good, overcurrent), its first 48 registers, the SPM watchdog latch, the reset controller (TOPRGU, including WDT_STATUS 0), ramoops/pstore (empty, no "found existing") and mrdump ("no control block"). An earlier note that ramoops came up "invalid" after crashes 1-3 was not reproduced. On this module, the fast supply reading is the only measurement that tells the two apart.
+
+**Conclusion:** a single USB-C feed can't keep the module's supply up under sustained upload load on this dongle. A second feed into the DC jack fixes it. Both feeds came from the same Mac, so the limit sits in the single USB-C path (the port's current limit, the cable, or the dongle's USB-C input), not in the Mac's total supply. Not tested: other USB-C cables, a separate charger on the jack, the Flint 2's USB port.
 
 ## Glossary
 

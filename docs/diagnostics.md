@@ -186,7 +186,7 @@ On our module, mode 3 has survived every restart since, and USB, AT, ADB and the
 
 ## Recording the module during a test: `tools/module-telemetry.sh`
 
-When the module crashes and reboots, its own logs are gone: the kernel's crash-log area (ramoops) comes up invalid at the next boot, and the syslog only lives in RAM. To keep what the module logged and measured just before a reset, stream it off the module while the test runs:
+When the module crashes and reboots, its own logs are gone: on our module the kernel's crash-log area (ramoops/pstore) comes up empty after a crash just as after a normal boot, and the syslog only lives in RAM. To keep what the module logged and measured just before a reset, stream it off the module while the test runs:
 
 ```sh
 tools/module-telemetry.sh -- tools/bench-throughput.sh --apn <apn> --server <iperf3-host> \
@@ -199,10 +199,21 @@ It runs any command you give it after `--`. Meanwhile it records over ADB, with 
 |---|---|
 | `module-log.txt` | The module's syslog, kernel lines included (`logread -f`) |
 | `module-sensors.txt` | About 10 samples a second (one a second if the module's shell can't sleep for fractions of a second; the file's first line says which): the supply voltage the module's PMIC measures (`BATADC`, mV) and the LTE PA, NR PA, RF, modem-RF and PMIC temperatures (milli-degrees C) |
+| `module-vbat-fast.txt` | Only with `--fast-vbat`: the supply read in a tight loop on the module (about 430 reads a second on ours), one line per 0.1 s of module uptime with that window's minimum, maximum and sample count. This is what caught the supply sag before the upload resets on the 5G DONGLE |
 
 At the end it prints the last samples, the lowest voltage and the highest temperatures. It only reads from the module. It needs ADB in the `device` state; ADB shows `offline` if the module boots while the Mac's ADB server runs, so run `adb kill-server` first and start ADB once the module is up. If it's already `offline`, `volatile --usb-reset` clears it (see [Stage 1](#stage-1-volatile)), but replug before measurements. The files can contain your operator, cell and IP details, so don't publish them unredacted.
 
-Limits: 10 samples a second can miss a voltage dip shorter than about 100 ms, and the last log lines before a crash can be lost when USB drops.
+Limits: without `--fast-vbat`, 10 samples a second (or 1) can miss a voltage dip shorter than about 100 ms, and the last log lines before a crash can be lost when USB drops.
+
+## Snapshot of the module's reset state: `tools/module-readout.sh`
+
+To compare a boot after a crash with a healthy boot, take a read-only snapshot over ADB:
+
+```sh
+tools/module-readout.sh after-crash   # writes tools/telemetry-results/readout-<date>-<time>-after-crash.txt
+```
+
+It collects the uptime, kernel command line, the ramoops, pstore, watchdog and modem-exception lines from `dmesg`, the MT6330 PMIC's boot-status dump and first registers, the SPM watchdog latch, the reset controller's (TOPRGU) registers, temperatures and the end of `dmesg`. After a crash, don't replug: a replug power-cycles the module and clears what it latched. Clear an `offline` ADB with `volatile --usb-reset` instead. On our module, the PMIC and watchdog fields read the same after a crash as after a normal boot, so a difference is the interesting result. The file can contain cell and IP details.
 
 ## Troubleshooting the tool
 

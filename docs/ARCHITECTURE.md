@@ -352,4 +352,5 @@ In the order a newcomer would read it:
 | [tools/fm350_at.py](../tools/fm350_at.py) | Send raw AT commands from a Mac |
 | [tools/bench-throughput.sh](../tools/bench-throughput.sh), [bench_summarize.py](../tools/bench_summarize.py) | Capped iperf3 benchmarks of `fm350mac` and their summary |
 | [tools/module-telemetry.sh](../tools/module-telemetry.sh) | Streams the module's syslog, supply voltage and temperatures over ADB while another command runs ([diagnostics.md](diagnostics.md#recording-the-module-during-a-test-toolsmodule-telemetrysh)) |
+| [tools/module-readout.sh](../tools/module-readout.sh) | One-shot read-only snapshot of the module's reset state (PMIC, watchdog, ramoops) over ADB ([diagnostics.md](diagnostics.md#snapshot-of-the-modules-reset-state-toolsmodule-readoutsh)) |
 | [docs/index.html](index.html) | Static interactive demo published to GitHub Pages |

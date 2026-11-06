@@ -6,7 +6,7 @@ Specs for the three parts of this setup, drawn from vendor datasheets and our ow
 
 - Three parts make up this setup: the router (GL.iNet Flint 2), the USB-to-M.2 adapter (Waveshare; since 2026-11-05 the USB 3.2 Gen1 5G DONGLE, earlier the USB TO M.2 B KEY), and the modem (Fibocom FM350-GL, including the Dell DW5931e OEM variant).
 - The FM350-GL isn't on Waveshare's list of tested modules for this adapter, but it worked in our tests [Bench log].
-- Power the adapter well: the earlier adapter has an auxiliary power plug, the 5G DONGLE has an optional 5-12 V DC jack. 5G modules can draw short current spikes that a router's single USB port may not cover on its own.
+- Power the adapter from two sources. On the 5G DONGLE, feed the DC jack as well as USB-C: with USB-C alone, sustained uploads made the module's supply sag and the whole module reset; with the DC jack also fed, the supply stayed flat and 1.5 GB of load passed [Bench log, 2026-11-05/06]. The earlier adapter has an auxiliary power plug for the same purpose.
 - Connect all 4 antennas: 5G NR uses 4×4 MIMO for download, and missing antennas lower both the reported signal quality and the throughput.
 - Buy decent antenna pigtails. A defective pair cost us most of a day chasing "no cells" as if it were a firmware or configuration problem [Bench log, Cable swap].
 
@@ -35,11 +35,11 @@ The adapter on the bench since 2026-11-05. It's a different product from the USB
 | Item | Value |
 |---|---|
 | Host interface | USB 3.2 Gen1 (USB-C). The FM350 enumerated at USB 3 (5 Gbps) |
-| Power | From USB-C, plus an optional 5-12 V DC jack. There is no dual-plug cable |
+| Power | From USB-C, plus a 5-12 V DC jack (3.5×1.35 mm; a USB-A to DC cable is included, no power supply). There is no dual-plug cable. **Feed the DC jack for sustained traffic**: USB-C alone is not enough (see below) |
 | SIM | SIM1 is a nano-SIM slot. SIM2 is wired to an onboard eSIM chip |
 | Result | SIM1, all RF paths and registration worked; data ran at up to 132 Mbit/s down |
 
-Sustained uploads reset the whole module on this adapter (see [macos-driver.md](macos-driver.md)). We haven't yet decided whether the module or the supply is at fault.
+**USB-C alone can't hold the module's supply under sustained uploads.** On USB-C only, 5 of 8 uploads of 300-500 MB reset the whole module, 28-249 MB in. The module's own supply reading (the PMIC's `BATADC`, read about 430 times a second) dropped from about 3.92 V to 3.495 V in the last 0.1 s before the reset, while it never went below 3.91 V during a 500 MB download. With the DC jack also fed (from a second port of the same Mac, through the included USB-A to DC cable), a 500 MB upload and a 500 MB download plus 500 MB upload both passed, and the supply never went below 4.099 V, on a weaker cell (−106 dBm) than the crash runs. Because both feeds came from the same Mac, the limit is the single USB-C path (port, cable or the dongle's USB-C input), not the Mac's total supply. Details: [bench-log.md](bench-log.md#sustained-upload-resets-on-the-5g-dongle-2026-11-0506).
 
 ## Waveshare USB TO M.2 B KEY (SKU 23252), earlier adapter
 
@@ -103,7 +103,8 @@ We assumed the router runs in Germany. Deutsche Telekom, Vodafone and O2/Telefó
 
 - Flint 2 USB port: 5 V / 2 A = 10 W.
 - The FM350-GL datasheet does not give a figure we could verify. 5G modules draw short current spikes when attaching to the network and during uplink bursts. Waveshare recommends 5 V / 3 A for its 5G boards.
-- Our plan: plug the data+power plug into the Flint 2 and the power-only plug into a separate 5 V ≥ 2 A USB charger. The port is powered even when the router has no working uplink, which is exactly when failover is needed, so keep the charger on the same UPS or circuit as the router.
+- Measured on the 5G DONGLE (2026-11-05/06): USB-C alone is not enough for sustained uploads, USB-C plus the DC jack is. See [the dongle section](#waveshare-usb-32-gen1-5g-dongle).
+- Our plan: plug the dongle's USB-C (or the earlier adapter's data+power plug) into the Flint 2, and feed the DC jack (or the earlier adapter's power-only plug) from a separate 5 V ≥ 2 A USB charger. The port is powered even when the router has no working uplink, which is exactly when failover is needed, so keep the charger on the same UPS or circuit as the router.
 
 ## Thermal
 

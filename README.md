@@ -176,7 +176,7 @@ Every image is real output from our bench, rendered to SVG by [`tools/screenshot
 | Part | Notes |
 |---|---|
 | Fibocom FM350-GL (Dell DW5931e) | MediaTek T700, M.2 3052, firmware 29.20.22. USB ID `0e8d:7127` |
-| Waveshare USB 3.2 Gen1 5G DONGLE | Current bench adapter (since 2026-11-05): USB-C power, optional 5-12 V DC jack, SIM1 slot plus SIM2 wired to an onboard eSIM |
+| Waveshare USB 3.2 Gen1 5G DONGLE | Current bench adapter (since 2026-11-05): USB-C plus a 5-12 V DC jack (feed both: on USB-C alone, sustained uploads reset the module), SIM1 slot plus SIM2 wired to an onboard eSIM |
 | Waveshare USB TO M.2 B KEY (SKU 23252) | Earlier adapter: USB 3 to M.2 B-key with a nano-SIM slot and 4 SMA connectors. Waveshare doesn't list the FM350 as supported, but it worked |
 | 4 antennas + MHF4-to-SMA pigtails | Buy decent pigtails. Ours were the problem |
 | GL.iNet Flint 2 (GL-MT6000) | Router; USB 3 port, 5 V / 2 A |

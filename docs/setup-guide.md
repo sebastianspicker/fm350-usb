@@ -24,7 +24,7 @@ Track your own results as you go through the steps below.
 - [ ] Check that the SIM works in a phone (data, PIN known or disabled).
 - [ ] Note the carrier APN (e.g. Telekom `internet.telekom`, Vodafone `web.vodafone.de`, O2 `internet`).
 - [ ] Back up the Flint 2 config (GL admin panel: System, then Backup/Restore) before you change firmware.
-- [ ] Have a separate 5 V ≥ 2 A charger for the auxiliary power (the DC jack, or the power-only plug of the earlier adapter).
+- [ ] Have a separate 5 V ≥ 2 A charger for the auxiliary power (the DC jack, or the power-only plug of the earlier adapter). It's required, not optional: on USB-C alone, sustained uploads reset the module.
 
 See [Hardware](hardware.md#power-budget) for why the auxiliary power plug matters.
 
@@ -34,7 +34,7 @@ See [Hardware](hardware.md#power-budget) for why the auxiliary power plug matter
 2. Put the included thermal pad between the module and the aluminium lid.
 3. Connect the 4 IPEX-4 pigtails to the module's antenna pads (MAIN/AUX/MIMO; all four are needed for 4×4). Press straight down until they click.
 4. Insert the nano-SIM (SIM1). Close the case and attach the 4 antennas.
-5. Power it. The Waveshare USB 3.2 Gen1 5G DONGLE has no dual-plug cable: plug its USB-C into the Flint 2 USB 3.0 port, and optionally feed the 5-12 V DC jack from a charger. With the earlier USB TO M.2 B KEY adapter, the data+power plug goes into the Flint 2 and the power-only plug into the 5 V charger.
+5. Power it. The Waveshare USB 3.2 Gen1 5G DONGLE has no dual-plug cable: plug its USB-C into the Flint 2 USB 3.0 port, and feed the 5-12 V DC jack from a charger through the included USB-A to DC cable. Don't skip the DC jack: on USB-C alone, sustained uploads made the module reset in our tests. With the earlier USB TO M.2 B KEY adapter, the data+power plug goes into the Flint 2 and the power-only plug into the 5 V charger.
 
 Expected: the power LED is on. The network LED starts blinking once the modem registers (it can't register while FCC-locked).
 

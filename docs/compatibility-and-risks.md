@@ -61,6 +61,7 @@ GL.iNet staff: *"we can't guarantee compatibility with every third-party model"*
 
 - Flint 2 USB supplies 5 V / 2 A. The reporter in #3421 ran without auxiliary power on a Raspberry Pi, but use the auxiliary plug anyway to avoid brown-out resets during attach and uplink bursts.
 - Typical symptom of too little power: the modem disappears from `lsusb` or re-enumerates in a loop, often logged as a "crash".
+- Measured on the Waveshare 5G DONGLE (2026-11-05/06): on USB-C alone, sustained uploads made the module's supply sag and the whole module reset; with the DC jack also fed, the same tests passed. Feed the DC jack. See [hardware.md](hardware.md#waveshare-usb-32-gen1-5g-dongle).
 
 ## 6. Firmware on the module
 
@@ -80,7 +81,7 @@ Found against a fake modem (atc-fib-fm350_gl 2025.08.24-r3):
 1. Does the module enumerate on the Flint 2 (`lsusb` shows `0e8d:7127`)? On a Mac: yes, 5 Gbps.
 2. FCC lock: not locked (`0,1`), confirmed on the bench.
 3. Does `AT+CFUN=1` and then `AT+COPS?` register on the carrier with the SIM in the Waveshare slot? Yes, confirmed on the bench: registered on Vodafone DE (`+COPS: 0,2,"26202",13`, LTE band 1), once a defective pair of antenna pigtails was replaced (see [bench-log.md](bench-log.md)). Still open: whether the module registers identically once it's plugged into the Flint 2 itself rather than a Mac.
-4. Does the modem stay up under a sustained speed test with and without auxiliary power? Still open; needs a data SIM.
+4. Does the modem stay up under a sustained speed test with and without auxiliary power? Answered on a Mac with the 5G DONGLE: without the DC jack, sustained uploads reset the module (5 of 8 runs of 300-500 MB); with it, 500 MB uploads and a 500 MB down plus 500 MB up run passed. Still open on the Flint 2 itself.
 5. On GL firmware: does multi-WAN failover accept the interface? On vanilla OpenWrt: `mwan3` correctly fails traffic over to `wwan` and back in our QEMU test (see [openwrt/README.md](../openwrt/README.md)), but that test uses a DHCP stand-in for the modem interface, not the real FM350. GL firmware's multi-WAN behaviour with a custom-protocol interface is still untested.
 
 One user in the OpenWrt thread reports (post [#429](https://forum.openwrt.org/t/fibocom-fm350-gl-support/142682), checked 2026-09-25) that `AT+CGCONTRDP` crashes the FM350. mrhaav's `atc.sh` sends `AT+CGCONTRDP=1` after every connect. Others have run it without problems, so on the router check for USB re-enumerations right after connecting.
