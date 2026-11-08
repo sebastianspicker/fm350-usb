@@ -1,0 +1,5 @@
+---
+# Generated files: tools/screenshots.py renders the SVGs, uv writes the lock file.
+exclude_paths:
+  - "docs/assets/screenshots/**"
+  - "fm350mac/uv.lock"
