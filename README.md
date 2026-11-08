@@ -196,6 +196,7 @@ Specs, power budget and band support are in [docs/hardware.md](docs/hardware.md)
 | [docs/hardware.md](docs/hardware.md) | The three parts, power, antennas, bands |
 | [docs/macos-driver.md](docs/macos-driver.md) | How `fm350mac` works and why it's built that way |
 | [docs/firmware-reflash.md](docs/firmware-reflash.md) | Untested reflash procedure for OEM units that won't register |
+| [docs/fibocom-l830-eb-investigation-2026-11-08.md](docs/fibocom-l830-eb-investigation-2026-11-08.md) | Lenovo Fibocom L830-EB (LTE) in the older Waveshare adapter on macOS: USB-mode fix, NCM data path, load and TCP analysis; tools in [`tools/l830/`](tools/l830/) |
 | [docs/bench-log.md](docs/bench-log.md) | Dated lab notes with every measurement |
 | [docs/sources.md](docs/sources.md) | References |
 | [docs/glossary.md](docs/glossary.md) | Plain-language definitions of every technical term used in these docs |

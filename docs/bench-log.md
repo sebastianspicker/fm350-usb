@@ -515,6 +515,48 @@ The 11:56 run had a weaker signal than any crash run, and it was the hottest run
 
 **Conclusion:** a single USB-C feed can't keep the module's supply up under sustained upload load on this dongle. A second feed into the DC jack fixes it. Both feeds came from the same Mac, so the limit sits in the single USB-C path (the port's current limit, the cable, or the dongle's USB-C input), not in the Mac's total supply. Not tested: other USB-C cables, a separate charger on the jack, the Flint 2's USB port.
 
+## Fibocom L830-EB in the USB TO M.2 B KEY (2026-11-08)
+
+*What this entry showed: a Lenovo L830-EB as it came out of a ThinkPad is in USB mode 1 (MBIM).*
+*On macOS it re-enumerates every 15.36 s. `AT+GTUSBMODE=0` + `AT+CFUN=15` switch it to 3 ACM + 4 NCM.*
+*macOS binds both with its own drivers, and the cycle is gone.*
+
+Setup: L830-EB (`2cb7:0210`, FW 18300.1002.00.01.01.25, XMM7260) in the Waveshare USB TO M.2 B KEY, behind a Genesys USB 3 hub on a Mac. Telekom DE SIM until 17:05, then removed. Full report with sources: [fibocom-l830-eb-investigation-2026-11-08.md](fibocom-l830-eb-investigation-2026-11-08.md).
+
+| Time | Test | Result |
+|---|---|---|
+| 16:03 | AT over `/dev/cu.usbmodem11303` (macOS ACM driver) | OK; `CFUN 1`, without SIM `COPS 2` |
+| 16:19 | with SIM | `READY`, `Telekom.de` LTE, `CEREG 0,1` |
+| 16:20–16:34 | passive USB recording, port closed | re-enumeration every **15.36 s** (absent 0.03 s), not a restart |
+| 16:27–16:35 | full read-only readout (782 queries) | 9 firmware exceptions from `XLCSLSTR?`, `XLCSAETTA?`, `XIPCONFIG?` |
+| 17:11 | passive, **without SIM** | cycle unchanged, 15.34–15.37 s |
+| 17:22 | `AT+GTUSBMODE=0`, `AT+CFUN=15` | boot stage `2cb7:0203` 4.7 s, then `0210` with 3 ACM + 4 NCM (`en7`–`en10`) |
+| 17:22–17:26 | passive | **no re-enumeration** |
+| 17:27–17:37 | passive, 10 min | still the same USB session as at 17:22:37: **14 min 45 s without re-enumeration** |
+| 17:31 | read-only probe in mode 0 | `11301` AT, `11303` trace (about 22 KB/s), `11305` AT; `GTUSBMODE 0`, `CFUN 1`; `USBAROUND 2,15` unchanged |
+| 17:38 | unplug (hub disappears with it) and replug | `0203` 4.7 s, then again 3 ACM + 4 NCM: **mode 0 is persistent** |
+| 17:45 | SIM back in; `AT+CGACT=1,2`, `AT+XDATACHANNEL…NCM/0…`, `AT+CGDATA="M-RAW_IP",2` | `CONNECT`, IP 10.25.136.192, gateway .193 |
+| 17:46–17:47 | `en7` + host route; module does not answer ARP → static ARP `.193 → 00:00:11:12:13:15` | ping server 5/5, 33–48 ms |
+| 17:49 | TCP down, 1 stream | 15–19 Mbit/s for 2 s, then 1–4 Mbit/s; server ended after 13 MB (14.2 MB SIM) |
+| 17:51–17:52 | UDP 10/30 Mbit/s down, TCP 4 streams | 0 % / 0.2 % loss; **40.8 Mbit/s** with 4 streams (43.8 MB SIM) |
+| 17:54 | TCP down, 4 streams, 500 MB target | **345.9 MB, 49.4 Mbit/s**, server ended after 56 s (363.4 MB SIM) |
+| 17:56 | TCP up, 4 streams, 500 MB target | **258.9 MB, 8.7 Mbit/s**, 8,903 retransmits, server ended after 237 s (290.3 MB SIM) |
+
+| 18:48–18:50 | header capture: TCP 1 stream down / up | down **2.27 Mbit/s** with **1.96 % loss** (189 holes, no reordering, no ECN CE, no RTO; Mathis predicts 2.24 Mbit/s), up 7.8 Mbit/s (42 MB SIM) |
+| 18:55 | UDP 10 Mbit/s down: evenly spaced / bursty / + upstream ping | 0.83 % / 0.56 % / 0.83 % loss: neither bursts nor upstream traffic matter; at 17:51 the same test had 0 % (19.4 MB SIM) |
+| 19:01 | **A/B: FM350** (5G DONGLE, `fm350mac up`, `utun8`), same UDP test | **0.44 % loss** (19/4,361), so the FM350 loses packets too. The loss sits in the network or server path, not in the L830. 2nd run failed on the server side (6.3 MB SIM) |
+| 19:02 | FM350: TCP 1 stream down, 25 MB | 23.6 Mbit/s in the first 2 s, then 4–6 Mbit/s; **5.5 Mbit/s average**, 153 retransmissions (≈ 0.85 %). **The FM350 collapses the same way, so the cause is the path, not the L830** (25.6 MB SIM) |
+| 19:03 | FM350 tunnel stopped | driver: `rx=34,728,899 B tx=264,849 B` **drops=0**, so no loss between the module and the Mac on the FM350 either. The loss sits before the module. Ledger corrected to the driver count (+3.1 MB) |
+
+- In all load runs: 0 USB events, exception counter unchanged at 9. The module stays stable under sustained load in both directions, unlike the FM350 in the 5G DONGLE on USB-C alone.
+- 18:00–18:02 teardown: `l830_net.sh down` (ARP entry, host route and `en7` address removed; default route unchanged via `en0`), then `AT+CGACT=0,2` → `OK`, `NO CARRIER`. The L850 commands `AT+XDATACHANNEL=0`/`AT+CGDATA=0` are not supported on the L830.
+- SIM: about 712 MB used for the L830 tests; the campaign total is about 5,095 of 6,000 MB (the user approved 1 GB more on 2026-11-08).
+
+- Cause, per the documents:
+  - L8 AT manual V1.1.3: `GTUSBMODE` 1 = "MBIM only", 0 = "3ACM … and 3NCM".
+  - Lenovo HW manual 3.7.2: pin 44 floating = MBIM; on the adapter it is not connected.
+- Data session over NCM not yet tested (needs SIM).
+
 ## Glossary
 
 Terms used on this page, defined in the [shared glossary](glossary.md): [AT command](glossary.md#at-command), [AT port](glossary.md#at-port), [ADB](glossary.md#adb), [AGC](glossary.md#agc), [AP / MD](glossary.md#ap--md), [APN](glossary.md#apn), [Band / EARFCN / PCI](glossary.md#band--earfcn--pci), [Cell ID / TAC](glossary.md#cell-id--tac), [DIPC mode](glossary.md#dipc-mode), [EN-DC / 5G NSA](glossary.md#en-dc--5g-nsa), [FCC lock](glossary.md#fcc-lock), [GNSS](glossary.md#gnss), [IMEI / IMSI / ICCID](glossary.md#imei--imsi--iccid), [libusb](glossary.md#libusb), [LTE / NR](glossary.md#lte--nr), [MIMO](glossary.md#mimo), [NV partitions / calibration](glossary.md#nv-partitions--calibration), [OEM image](glossary.md#oem-image), [OpenWrt](glossary.md#openwrt), [PDP context / data session](glossary.md#pdp-context--data-session), [Pigtail](glossary.md#pigtail), [RAT](glossary.md#rat), [RNDIS](glossary.md#rndis), [RSRP / RSRQ / SINR](glossary.md#rsrp--rsrq--sinr), [SP Flash Tool](glossary.md#sp-flash-tool), [URC](glossary.md#urc), [USB mode 40 / 41](glossary.md#usb-mode-40--41), [utun](glossary.md#utun), [W_DISABLE#](glossary.md#w_disable).

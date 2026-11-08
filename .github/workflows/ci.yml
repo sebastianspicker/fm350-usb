@@ -78,4 +78,4 @@ jobs:
 
       - name: shellcheck
         run: |
-          shellcheck openwrt/*.sh openwrt/files/etc/hotplug.d/usb/* openwrt/files/usr/sbin/fm350-watchdog openwrt/files/etc/init.d/fm350-watchdog tools/bench-throughput.sh tools/module-telemetry.sh tools/module-readout.sh openwrt/files/usr/lib/fm350/at-port.sh
+          shellcheck openwrt/*.sh openwrt/files/etc/hotplug.d/usb/* openwrt/files/usr/sbin/fm350-watchdog openwrt/files/etc/init.d/fm350-watchdog tools/bench-throughput.sh tools/module-telemetry.sh tools/module-readout.sh tools/l830/l830_net.sh tools/l830/usb_transitions.sh openwrt/files/usr/lib/fm350/at-port.sh

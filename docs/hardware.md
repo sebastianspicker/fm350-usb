@@ -63,6 +63,13 @@ Notes from the wiki:
 - Connect all 4 antennas. 5G NR uses 4×4 MIMO for download, and missing antennas lower the signal quality readings the modem reports and the throughput.
 - Before debugging the router side, check that the SIM works in a phone.
 
+Measured from the schematic V1.02 (2026-11-08):
+- The module rail ("+3.3V") is the buck output VBAT_VPH, 3.93 V by its divider; the schematic labels it 4.2 V.
+- RESET#, W_DISABLE1#/2# and CONFIG_0..3 are not driven.
+- M.2 pin 44 is unconnected (R26 not fitted).
+
+Second module tested in this adapter: a Lenovo **Fibocom L830-EB** (LTE). See [fibocom-l830-eb-investigation-2026-11-08.md](fibocom-l830-eb-investigation-2026-11-08.md).
+
 ## Fibocom FM350-GL
 
 Sources: Fibocom AT manual V2.10, Linux `option` driver patch (June 2024), 4gltemall spec sheet, OpenWrt forum.

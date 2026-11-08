@@ -41,6 +41,8 @@ __pycache__/
 
 # Benchmark run output (tools/bench-throughput.sh)
 /tools/bench-results/
+# L830-EB tool state: session file (IP), logs, pf token
+/tools/l830/state/
 # tools/module-telemetry.sh output (module syslog and sensors: operator, cell and IP data)
 /tools/telemetry-results/
 
