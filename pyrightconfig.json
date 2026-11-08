@@ -1,0 +1,7 @@
+{
+  "include": ["fm350mac/src", "tools"],
+  "extraPaths": ["fm350mac/src", "tools", "tools/l830"],
+  "venvPath": "fm350mac",
+  "venv": ".venv",
+  "typeCheckingMode": "off"
+}
