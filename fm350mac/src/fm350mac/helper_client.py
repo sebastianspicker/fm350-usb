@@ -129,11 +129,13 @@ class HelperClient:
         try:
             self._sock.sendall((json.dumps(payload) + "\n").encode())
             line = self._reader.read_line()
+            if line is None:
+                raise HelperConnectionLost("the helper closed the connection")
+            resp = json.loads(line.decode())
         except socket.timeout:
             raise self._timed_out(op) from None
-        if line is None:
-            raise HelperConnectionLost("the helper closed the connection")
-        resp = json.loads(line.decode())
+        except (OSError, ValueError) as exc:
+            raise self._lost(op, exc) from exc
         if not resp.get("ok"):
             raise HelperError(resp.get("error", f"{op} failed"))
         return resp
@@ -144,6 +146,12 @@ class HelperClient:
         # connection's routes, DNS and address, so it fails safe.
         self.close()
         return HelperTimeout(f"the helper did not answer {op!r} in time; connection closed")
+
+    def _lost(self, op: str, exc: Exception) -> HelperConnectionLost:
+        # A reset, broken pipe (helper restarted) or garbled reply: the
+        # framing can't be trusted any more, so close like a timeout does.
+        self.close()
+        return HelperConnectionLost(f"lost the helper connection during {op!r}: {exc}")
 
     def hello(self) -> dict:
         """Send `hello`, check the protocol version, and record the helper's pid."""
@@ -170,11 +178,13 @@ class HelperClient:
         try:
             self._sock.sendall((json.dumps(payload) + "\n").encode())
             data, ancdata, _flags, _addr = self._sock.recvmsg(_MAX_MESSAGE_BYTES, _FD_CMSG_SPACE)
+            if not data:
+                raise HelperConnectionLost("the helper closed the connection during open_utun")
+            resp = json.loads(data.split(b"\n", 1)[0].decode())
         except socket.timeout:
             raise self._timed_out("open_utun") from None
-        if not data:
-            raise HelperConnectionLost("the helper closed the connection during open_utun")
-        resp = json.loads(data.split(b"\n", 1)[0].decode())
+        except (OSError, ValueError) as exc:
+            raise self._lost("open_utun", exc) from exc
         if not resp.get("ok"):
             raise HelperError(resp.get("error", "open_utun failed"))
         fd = None

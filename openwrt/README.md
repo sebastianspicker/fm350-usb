@@ -131,7 +131,7 @@ of the setup guide.
 | `uci/firewall.uci` | Adds `wwan` to the `wan` firewall zone. |
 | `uci/mwan3.uci` | wan/wwan mwan3 tracking, members, `failover` policy and `default` rule. |
 | `files/etc/hotplug.d/usb/50-fm350_driver` | Binds the `option` serial driver via `new_id` on kernel < 6.6 only. Copied by `install.sh` when needed. |
-| `files/etc/hotplug.d/usb/60-fm350_reenum` | After the modem re-enumerates (e.g. a crash): waits for the AT port, re-resolves `network.wwan.device`, restarts `wwan` once. Honours the watchdog's pause file, `disabled`/`auto` and a PIN block. Installed with the watchdog, on every kernel. |
+| `files/etc/hotplug.d/usb/60-fm350_reenum` | After the modem re-enumerates (e.g. a crash): waits for the AT port, re-resolves `network.wwan.device`, restarts `wwan` once. Honours the watchdog's pause file, `disabled`/`auto`, a PIN block and `boot_grace` (during boot it only re-resolves the device). Installed with the watchdog, on every kernel. |
 
 All `uci/*.uci` files are `uci batch` snippets: they `delete` a section (or
 `del_list`/`add_list` a single value) before (re-)creating it, so running

@@ -783,19 +783,21 @@ class _Usage:
     def __init__(self) -> None:
         self.rx = self.tx = 0
         self.bridge: Bridge | AsyncBridge | None = None
+        self._lock = threading.Lock()  # log() runs on the periodic usage thread
 
     def retire(self, bridge: Bridge | AsyncBridge) -> None:
-        self.rx += bridge.stats.rx_bytes
-        self.tx += bridge.stats.tx_bytes
-        self.bridge = None
+        with self._lock:
+            self.rx += bridge.stats.rx_bytes
+            self.tx += bridge.stats.tx_bytes
+            self.bridge = None
 
     def log(self) -> None:
-        live = self.bridge.stats if self.bridge is not None else None
+        with self._lock:
+            live = self.bridge.stats if self.bridge is not None else None
+            rx = self.rx + (live.rx_bytes if live else 0)
+            tx = self.tx + (live.tx_bytes if live else 0)
         # Not "stats:": tools/bench-throughput.sh sums those lines.
-        _log.info(
-            "usage: total rx=%dB tx=%dB",
-            self.rx + (live.rx_bytes if live else 0), self.tx + (live.tx_bytes if live else 0),
-        )
+        _log.info("usage: total rx=%dB tx=%dB", rx, tx)
 
 
 _SHUTDOWN_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)

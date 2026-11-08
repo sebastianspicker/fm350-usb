@@ -1258,7 +1258,8 @@ class AsyncEndpoint:
 
     def _clear_halt(self) -> None:
         try:
-            self._libusb.clear_halt(self._dev_handle, self.endpoint)
+            # libusb reports failure by return code, not by raising.
+            _raise_for_code(self._libusb, self._libusb.clear_halt(self._dev_handle, self.endpoint), "clear_halt")
         except Exception:
             _log.exception("clear_halt failed for endpoint %#04x", self.endpoint)
 

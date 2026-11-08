@@ -164,7 +164,34 @@ stop_recorders() {
     # shellcheck disable=SC2086
     wait "$LOG_PID" "$SENS_PID" $FAST_PID 2>/dev/null || true
 }
-trap stop_recorders EXIT
+
+# Killing the Mac-side adb client doesn't always stop the module-side `logread -f`
+# and sampler, so remove leftovers while the module is still up. The patterns
+# are split ("thermal""_zone") so this script's own command line doesn't match.
+# shellcheck disable=SC2016 # expanded on the module, not here
+CLEANUP=': fm350-telemetry-cleanup
+n=0
+for p in /proc/[0-9]*; do
+    pid=${p#/proc/}; [ "$pid" = "$$" ] && continue
+    c=$(tr "\000" " " < "$p/cmdline" 2>/dev/null) || continue
+    case "$c" in *"logread -f -l"" 5"* | *"thermal""_zone"* | *"BATADC""_input"*) kill "$pid" 2>/dev/null && n=$((n + 1)) ;; esac
+done
+echo "$n"'
+module_cleanup() {
+    local left
+    if left="$(adb ${ADB_SERIAL:+-s "$ADB_SERIAL"} shell "$CLEANUP" 2>/dev/null)"; then
+        echo "module: stopped ${left//[!0-9]/} leftover recorder process(es)"
+    else
+        echo "module: could not check for leftover recorder processes (adb shell failed)"
+    fi
+}
+CLEANUP_PENDING=1  # until the normal path below has cleaned up: Ctrl-C, TERM and failed starts too
+# shellcheck disable=SC2329 # invoked by the EXIT trap
+on_exit() {
+    stop_recorders
+    if [[ "$CLEANUP_PENDING" -eq 1 ]]; then module_cleanup; fi
+}
+trap on_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
@@ -187,25 +214,8 @@ fast_alive=0
 if [[ -n "$FAST_PID" ]] && alive "$FAST_PID"; then fast_alive=1; fi
 stop_recorders
 
-# Killing the Mac-side adb client doesn't always stop the module-side `logread -f`
-# and sampler, so remove leftovers while the module is still up. The patterns
-# are split ("thermal""_zone") so this script's own command line doesn't match.
-# shellcheck disable=SC2016 # expanded on the module, not here
-CLEANUP=': fm350-telemetry-cleanup
-n=0
-for p in /proc/[0-9]*; do
-    pid=${p#/proc/}; [ "$pid" = "$$" ] && continue
-    c=$(tr "\000" " " < "$p/cmdline" 2>/dev/null) || continue
-    case "$c" in *"logread -f -l"" 5"* | *"thermal""_zone"* | *"BATADC""_input"*) kill "$pid" 2>/dev/null && n=$((n + 1)) ;; esac
-done
-echo "$n"'
-if [[ "$log_alive" -eq 1 || "$sens_alive" -eq 1 ]]; then
-    if left="$(adb ${ADB_SERIAL:+-s "$ADB_SERIAL"} shell "$CLEANUP" 2>/dev/null)"; then
-        echo "module: stopped ${left//[!0-9]/} leftover recorder process(es)"
-    else
-        echo "module: could not check for leftover recorder processes (adb shell failed)"
-    fi
-fi
+if [[ "$log_alive" -eq 1 || "$sens_alive" -eq 1 ]]; then module_cleanup; fi
+CLEANUP_PENDING=0
 
 echo "--- module telemetry in $OUT"
 # The last line's timestamp is the signal when the module crashed: the streams end with it.

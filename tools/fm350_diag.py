@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import errno
 import fcntl
 import glob
 import hashlib
@@ -162,7 +163,10 @@ class TtyTransport:
             ready, _, _ = select.select([self.fd], [], [], timeout_s)
             if not ready:
                 return out.decode(errors="replace")
-            out += os.read(self.fd, 4096)
+            chunk = os.read(self.fd, 4096)
+            if not chunk:  # hung-up tty (modem reset): readable forever, never more data
+                raise OSError(errno.EIO, f"{self.path}: end of file (modem gone?)")
+            out += chunk
         return out.decode(errors="replace")
 
     def command(self, cmd: str, timeout: float = 240.0) -> str:
@@ -2244,6 +2248,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_plan(args)
 
     out_dir = Path(args.out) if args.out else _default_out_dir()
+    # The journal is appended to: a reused directory would mix two runs.
+    if out_dir.is_dir() and any(out_dir.iterdir()):
+        print(f"--out {out_dir} is not empty; pick a new directory", file=sys.stderr)
+        return 2
     out_dir.mkdir(parents=True, exist_ok=True)
 
     def transport_factory() -> Transport:

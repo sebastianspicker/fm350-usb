@@ -10,13 +10,11 @@ launched by a LaunchDaemon. It must therefore:
   * run correctly on Python 3.9 (no ``match``, no ``X | Y`` unions evaluated
     at runtime -- only inside ``from __future__ import annotations``, which
     just stringifies them);
-  * never import anything from the ``fm350mac`` package. Two small pieces
-    (utun creation, IPv4 validation) are therefore deliberately duplicated
-    here rather than shared -- see ``fm350mac.utun`` and
-    ``fm350mac.at.valid_assigned_ipv4`` for the originals. The other
-    direction is fine: ``fm350mac.netconfig.NetConfig`` (``up --no-helper``)
-    imports ``NetState`` from this file, so the route/DNS capture/restore
-    logic exists only here.
+  * never import anything from the ``fm350mac`` package. utun creation is
+    therefore deliberately duplicated here (original: ``fm350mac.utun``).
+    The other direction is fine: ``fm350mac.at`` and ``fm350mac.netconfig``
+    import ``valid_assigned_ipv4`` and ``NetState`` from this file, so the
+    IPv4 rule and the route/DNS capture/restore logic exist only here.
 
 Protocol: one JSON object per line over a Unix socket, request -> response,
 at most ``MAX_MESSAGE_BYTES`` per message. See ``_OP_SCHEMAS`` for the exact
@@ -115,7 +113,7 @@ class HelperProtocolError(Exception):
     """A malformed, disallowed, or otherwise rejected request."""
 
 
-# --- IPv4 validation (copy of fm350mac.at.valid_assigned_ipv4) --------------
+# --- IPv4 validation (the only copy; fm350mac.at imports it) ---------------
 
 _BROADCAST = ipaddress.IPv4Address("255.255.255.255")
 _THIS_NETWORK = ipaddress.ip_network("0.0.0.0/8")
@@ -470,11 +468,12 @@ class NetState:
     def clear_dns(self) -> None:
         if not self._dns_set:
             return
-        self._dns_set = False
         try:
             self._run_scutil(f"remove {_DNS_KEY}\n")
         except Exception:
-            _log.exception("failed to remove DNS key")
+            _log.exception("failed to remove DNS key")  # stays pending for teardown
+        else:
+            self._dns_set = False
 
     def remove_host_routes(self) -> None:
         """Delete every host route this connection added, newest first."""

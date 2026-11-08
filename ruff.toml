@@ -1,0 +1,3 @@
+# Lets tools that run from the repo root (Codacy, editors) use the pinned rule set.
+extend = "fm350mac/pyproject.toml"
+src = ["fm350mac/src", "tools"]

@@ -110,11 +110,9 @@ class Utun:
         self._poll_timeout_ms = 0
 
     @classmethod
-    def open(cls, unit: int | None = None) -> "Utun":
-        """Create (or attach to) a utun interface.
-
-        ``unit`` is the utunN suffix; 0 (the default) means "let the kernel
-        auto-assign the next free unit". Requires root.
+    def open(cls) -> "Utun":
+        """Create a utun interface; the kernel picks the next free unit.
+        Requires root.
         """
         if os.geteuid() != 0:
             raise PermissionError("creating a utun interface requires root")
@@ -122,7 +120,7 @@ class Utun:
         sock = socket.socket(socket.PF_SYSTEM, socket.SOCK_DGRAM, socket.SYSPROTO_CONTROL)
         try:
             ctl_id = _resolve_ctl_id(sock, UTUN_CONTROL_NAME)
-            sock.connect((ctl_id, 0 if unit is None else unit))
+            sock.connect((ctl_id, 0))  # unit 0: auto-assign
             name = sock.getsockopt(socket.SYSPROTO_CONTROL, UTUN_OPT_IFNAME, 16)
             name = name.split(b"\x00", 1)[0].decode()
         except Exception:

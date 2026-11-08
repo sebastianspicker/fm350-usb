@@ -57,6 +57,13 @@ reenum() {
 		exit 0
 	fi
 
+	if [ "$(uptime_s)" -lt "$boot_grace" ]; then
+		# Boot coldplug, not a crash: netifd brings $interface up itself, and
+		# an ifdown/ifup now would cut its registration short (watchdog rule).
+		sync_device
+		exit 0
+	fi
+
 	log "modem re-enumerated (PRODUCT $PRODUCT), restarting $interface"
 	restart_interface
 }

@@ -205,6 +205,9 @@ for spec in "--max-seconds:$MAX_SECONDS" "--budget:$BUDGET_MB"; do
         exit 2
     fi
 done
+# Plain $((...)) would read a leading zero as octal (--budget 010 = 8 MB).
+[[ -z "$MAX_SECONDS" ]] || MAX_SECONDS=$((10#$MAX_SECONDS))
+[[ -z "$BUDGET_MB" ]] || BUDGET_MB=$((10#$BUDGET_MB))
 
 if [[ "$LOOPBACK" -eq 1 && "$MODES_GIVEN" -eq 1 ]]; then
     echo "WARNING: --modes is ignored with --loopback (\`up --loopback\` always uses the sync bridge)" >&2
@@ -837,6 +840,9 @@ run_real_mode() {
 
         if ! start_up_real "$mode"; then
             BENCH_FAILED=1
+            # A bring-up that got as far as the bridge used data too; the next mode overwrites CURRENT_MODE.
+            record_sim_usage "$RESULTS_DIR/up-$mode.log" "$RESULTS_DIR/sim-$mode.txt"
+            CURRENT_MODE=""
             if ! verify_teardown "$UP_IFACE" "$DEFAULT_ROUTE_BEFORE" "$UTUNS_BEFORE"; then
                 log "ERROR: failed startup also failed teardown verification; stopping before another mode"
                 break
