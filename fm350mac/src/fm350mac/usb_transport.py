@@ -17,11 +17,6 @@ from .usb_async import PIDS, VID, UsbDevice, UsbTimeout, open_device
 CONTROL_IFACE = 0
 DATA_IFACE = 1
 
-# Expected endpoint addresses, discovered from descriptors (see docs/macos-driver.md).
-INTERRUPT_IN_DEFAULT = 0x82
-BULK_IN_DEFAULT = 0x81
-BULK_OUT_DEFAULT = 0x01
-
 _SEND_ENCAPSULATED_COMMAND = 0x00
 _GET_ENCAPSULATED_RESPONSE = 0x01
 _REQTYPE_HOST_TO_DEVICE = 0x21  # class, interface, host->device

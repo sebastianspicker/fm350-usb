@@ -695,6 +695,8 @@ keep_on_sysupgrade() {
 	if [ "$dry_run" -eq 1 ]; then
 		log "[dry-run] would add $1 to $SYSUPGRADE_CONF"
 	elif ! grep -qxF "$1" "$SYSUPGRADE_CONF" 2>/dev/null; then
+		# A last line without a newline would get this path glued onto it.
+		[ -z "$(tail -c1 "$SYSUPGRADE_CONF" 2>/dev/null)" ] || echo >>"$SYSUPGRADE_CONF"
 		echo "$1" >>"$SYSUPGRADE_CONF"
 	fi
 }
@@ -785,7 +787,8 @@ else
 		# still needs /var/lock (for its own lock file, via
 		# /lib/functions/procd.sh); a bare rootfs container doesn't have it.
 		mkdir -p /var/lock
-		[ -x /etc/init.d/fm350-watchdog ] && /etc/init.d/fm350-watchdog enable
+		# Not fatal: the keep-list entries and the closing message below must still happen.
+		/etc/init.d/fm350-watchdog enable || log "WARNING: /etc/init.d/fm350-watchdog enable failed: the watchdog will not start at boot"
 	fi
 	for f in /usr/sbin/fm350-watchdog /etc/init.d/fm350-watchdog /etc/hotplug.d/usb/60-fm350_reenum \
 		/etc/rc.d/S95fm350-watchdog /etc/rc.d/K10fm350-watchdog; do

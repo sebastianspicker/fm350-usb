@@ -106,6 +106,7 @@ class Bridge(BridgeCommon):
         self._threads: list[threading.Thread] = []
         self._keepalive_request_id = 0
         self._consecutive_errors = 0
+        self._tx_errors = 0  # consecutive non-timeout bulk_write errors
         self._tx_stalled = False
         self._tx_stall_warn_last = 0.0
         self._tx_stall_warn_count_since = 0
@@ -117,6 +118,7 @@ class Bridge(BridgeCommon):
         self.failure_reason = None
         self.device_lost = False
         self._consecutive_errors = 0
+        self._tx_errors = 0
         self.utun.settimeout(_UTUN_TIMEOUT_S)
         loops = (
             ("fm350mac-rx", self._rx_loop),
@@ -328,8 +330,14 @@ class Bridge(BridgeCommon):
             self.stats.drops += 1
             if self._bulk_write_log.allow():
                 _log.warning("bulk_write failed: %s (further failures counted as drops)", exc)
+            # Not _note_usb_error: every good read resets its counter, and a
+            # halted OUT endpoint fails every write while reads still work.
+            self._tx_errors += 1
+            if self._tx_errors >= _MAX_CONSECUTIVE_ERRORS:
+                self._mark_failed(f"tx: bulk_write: {self._tx_errors} consecutive USB errors ({exc})")
             return
         self._tx_stalled = False
+        self._tx_errors = 0
         if ip_len is not None:
             self.stats.tx_packets += 1
             self.stats.tx_bytes += ip_len

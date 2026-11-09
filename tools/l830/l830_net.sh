@@ -3,7 +3,8 @@
 # written by `l830_ncm.py up`. Touches only the L830's NCM interface and host routes, never the default route.
 #
 #   sudo l830_net.sh up   SERVER_IP [SERVER_IP ...]   bring en7 up for these hosts only, then verify
-#   sudo l830_net.sh down SERVER_IP [SERVER_IP ...]   undo everything `up` did
+#   sudo l830_net.sh down SERVER_IP [SERVER_IP ...]   undo everything `up` did (the pf part also works
+#                                                     when the session file or the interface is gone)
 #
 # up, in this order:
 #   1. pf anchor com.apple/l830-ncm (evaluated through `anchor "com.apple/*"` in /etc/pf.conf): on en7, pass
@@ -32,14 +33,37 @@ for s in "${SERVERS[@]}"; do
 done
 [[ "$GW_MAC" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]] || { echo "GW_MAC must look like 00:00:11:12:13:15" >&2; exit 2; }
 [[ $EUID -eq 0 ]] || { echo "run with sudo" >&2; exit 2; }
-[[ -f "$SESSION" ]] || { echo "no $SESSION; run l830_ncm.py up first" >&2; exit 2; }
+
+pf_release() {
+    pfctl -a "$ANCHOR" -F rules 2>/dev/null || true
+    [[ -s "$STATE/pf.token" ]] && pfctl -X "$(cat "$STATE/pf.token")" 2>/dev/null || true
+    rm -f "$STATE/pf.token"
+}
+# The session file or the interface can be gone (module reset, `l830_ncm.py down` run first). `down` then
+# still releases the firewall state, which needs neither; with a full teardown it stays the last step.
+refuse() {
+    if [[ "$ACTION" == down ]]; then
+        pf_release
+        echo "$1; pf anchor flushed and token released, but address, ARP, host routes and the DHCP setting" \
+             "of the network service were NOT restored" >&2
+    else
+        echo "$1" >&2
+    fi
+    exit 2
+}
+# a second `up` would overwrite the token, and `down` could then never release the first one
+[[ "$ACTION" == down || ! -s "$STATE/pf.token" ]] \
+    || { echo "$STATE/pf.token exists: an earlier 'up' is still active; run 'down' first" >&2; exit 2; }
+[[ -f "$SESSION" ]] || refuse "no $SESSION; run l830_ncm.py up first"
 
 read -r IFACE IP PREFIX GW < <(python3 -I -c '
-import json, sys; s = json.load(open(sys.argv[1])); print(s["iface"], s["ip"], s["prefix"], s["gateway"])' "$SESSION")
+import json, sys; s = json.load(open(sys.argv[1])); print(s["iface"], s["ip"], s["prefix"], s["gateway"])' "$SESSION") \
+    || refuse "cannot read $SESSION"
 # Trust boundary: only ever touch the L830's NCM interface (device-supplied MAC 00:00:11:12:13:xx).
-[[ "$IFACE" =~ ^en[0-9]+$ ]] || { echo "bad iface $IFACE" >&2; exit 2; }
-ifconfig "$IFACE" | grep -q 'ether 00:00:11:12:13:' || { echo "$IFACE is not the L830 NCM interface; refusing" >&2; exit 2; }
-for v in "$IP" "$GW"; do [[ "$v" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || { echo "bad address $v" >&2; exit 2; }; done
+[[ "$IFACE" =~ ^en[0-9]+$ ]] || refuse "bad iface $IFACE"
+ifconfig "$IFACE" 2>/dev/null | grep -q 'ether 00:00:11:12:13:' \
+    || refuse "$IFACE is not the L830 NCM interface (or is gone); refusing"
+for v in "$IP" "$GW"; do [[ "$v" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || refuse "bad address $v"; done
 MASK=$(python3 -I -c 'import ipaddress, sys; print(ipaddress.IPv4Network("0.0.0.0/" + sys.argv[1]).netmask)' "$PREFIX")
 MYMAC=$(ifconfig "$IFACE" | awk '/ether/{print $2; exit}')
 SERVICE=$(networksetup -listnetworkserviceorder | awk -v dev="$IFACE" '
@@ -86,8 +110,6 @@ else
     for s in "${SERVERS[@]}"; do route -n delete -host "$s" >/dev/null 2>&1 || true; done
     ifconfig "$IFACE" inet "$IP" delete 2>/dev/null || true
     if [[ -n "$SERVICE" ]]; then networksetup -setdhcp "$SERVICE"; networksetup -setv6automatic "$SERVICE"; fi
-    pfctl -a "$ANCHOR" -F rules 2>/dev/null || true
-    [[ -s "$STATE/pf.token" ]] && pfctl -X "$(cat "$STATE/pf.token")" 2>/dev/null || true
-    rm -f "$STATE/pf.token"
+    pf_release
     echo "== $IFACE cleaned (service '${SERVICE:-none}' back to DHCP/automatic, pf anchor flushed, token released)"
 fi

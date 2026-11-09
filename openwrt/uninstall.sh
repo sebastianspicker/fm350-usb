@@ -194,6 +194,9 @@ restore_mwan3_rule https
 uci -q delete mwan3.fm350_install_state || true
 uci -q commit mwan3 || true
 
+# A hotplug file that is not ours stays, and so does its keep-list line below.
+foreign_driver=0
+foreign_reenum=0
 if [ -f /etc/hotplug.d/usb/50-fm350_driver ]; then
 	# Ours: the marker, or (older copies without it) our logger tag.
 	if grep -q -e 'fm350-usb: installed by' -e 'logger -t fm350-driver' /etc/hotplug.d/usb/50-fm350_driver; then
@@ -201,6 +204,7 @@ if [ -f /etc/hotplug.d/usb/50-fm350_driver ]; then
 		rm -f /etc/hotplug.d/usb/50-fm350_driver
 	else
 		log "keeping /etc/hotplug.d/usb/50-fm350_driver (not installed by fm350-usb)"
+		foreign_driver=1
 	fi
 fi
 
@@ -210,16 +214,20 @@ if [ -f /etc/hotplug.d/usb/60-fm350_reenum ]; then
 		rm -f /etc/hotplug.d/usb/60-fm350_reenum
 	else
 		log "keeping /etc/hotplug.d/usb/60-fm350_reenum (not installed by fm350-usb)"
+		foreign_reenum=1
 	fi
 fi
 
 # The lines install.sh added to the sysupgrade keep-list (same paths as there).
 if [ -f "$SYSUPGRADE_CONF" ]; then
 	log "removing our paths from $SYSUPGRADE_CONF"
-	printf '%s\n' /usr/lib/fm350/at-port.sh /usr/bin/fm350-status "$STATE_DIR" \
-		/usr/sbin/fm350-watchdog /etc/init.d/fm350-watchdog /etc/hotplug.d/usb/50-fm350_driver \
-		/etc/hotplug.d/usb/60-fm350_reenum /etc/rc.d/S95fm350-watchdog /etc/rc.d/K10fm350-watchdog \
-		>"$SYSUPGRADE_CONF.paths"
+	{
+		printf '%s\n' /usr/lib/fm350/at-port.sh /usr/bin/fm350-status "$STATE_DIR" \
+			/usr/sbin/fm350-watchdog /etc/init.d/fm350-watchdog \
+			/etc/rc.d/S95fm350-watchdog /etc/rc.d/K10fm350-watchdog
+		[ "$foreign_driver" -eq 1 ] || echo /etc/hotplug.d/usb/50-fm350_driver
+		[ "$foreign_reenum" -eq 1 ] || echo /etc/hotplug.d/usb/60-fm350_reenum
+	} >"$SYSUPGRADE_CONF.paths"
 	grep -vxFf "$SYSUPGRADE_CONF.paths" "$SYSUPGRADE_CONF" >"$SYSUPGRADE_CONF.new" || true
 	mv "$SYSUPGRADE_CONF.new" "$SYSUPGRADE_CONF"
 	rm -f "$SYSUPGRADE_CONF.paths"

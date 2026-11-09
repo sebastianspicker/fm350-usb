@@ -912,7 +912,7 @@ def _git_commit() -> str | None:
             text=True,
             timeout=5,
         )
-    except OSError:
+    except (OSError, subprocess.SubprocessError):  # incl. TimeoutExpired: never lose the report over it
         return None
     return result.stdout.strip() if result.returncode == 0 else None
 
@@ -1180,13 +1180,13 @@ def _wait_for_reenumeration(
     return None
 
 
-def _cereg_mode(response: str) -> int:
-    """The ``<n>`` of an ``AT+CEREG?`` response (0 if unreadable). Not
+def _cereg_mode(response: str) -> int | None:
+    """The ``<n>`` of an ``AT+CEREG?`` response (None if unreadable). Not
     ``_parse_int_tuple``: it returns None as soon as the quoted tac/ci fields
-    of a ``<n>=2/3`` response appear, which would "restore" 2 or 3 as 0.
+    of a ``<n>=2/3`` response appear.
     """
     match = re.search(r"^\+CEREG:\s*([0-5])\s*,\s*\d", response, re.MULTILINE)
-    return int(match.group(1)) if match else 0
+    return int(match.group(1)) if match else None
 
 
 def _usb_reset(
@@ -1273,11 +1273,13 @@ def cmd_volatile(
             session.send("AT+CMEE=2")
 
         orig_cereg_n = _cereg_mode(snapshot["cereg"])
-        try:
-            session.send("AT+CEREG=3")
-            reject_samples = _collect_samples(session, args.duration, args.interval, sleep, monotonic)
-        finally:
-            session.send(f"AT+CEREG={orig_cereg_n}")
+        reject_samples: list[Sample] = []
+        if orig_cereg_n is not None:  # unreadable: like CMEE above, never restore a guessed value
+            try:
+                session.send("AT+CEREG=3")
+                reject_samples = _collect_samples(session, args.duration, args.interval, sleep, monotonic)
+            finally:
+                session.send(f"AT+CEREG={orig_cereg_n}")
 
         checks = [
             check_cells(before_samples, sim_state=_sim_state(snapshot["cpin"])),
@@ -1285,7 +1287,10 @@ def cmd_volatile(
         ]
         if cmee_note is not None:
             checks.append(cmee_note)
-        checks.append(Check("INFO", f"CEREG=3 reject-cause sampling: {len(reject_samples)} sample(s) collected"))
+        if orig_cereg_n is None:
+            checks.append(Check("WARN", "AT+CEREG? unreadable; skipped the CEREG=3 reject-cause sampling (can't restore it)"))
+        else:
+            checks.append(Check("INFO", f"CEREG=3 reject-cause sampling: {len(reject_samples)} sample(s) collected"))
 
         if not args.skip_scan:
             try:
@@ -1395,7 +1400,7 @@ def run_experiment(
     *,
     name: str,
     read_cmd: str,
-    parse_orig: Callable[[str], object],
+    parse: Callable[[str], object],
     apply_cmds: Callable[[object], list[str]],
     restore_cmds: Callable[[object], list[str]],
     reenumerate_after_apply: bool,
@@ -1403,7 +1408,6 @@ def run_experiment(
     measure: Callable[[], list[Sample]],
     reenumerate: Callable[[], None],
     verify_cmd: str,
-    parse_verify: Callable[[str], object],
 ) -> tuple[object, list[Sample], list[Sample]]:
     """Read the original value, write restore.txt, apply, measure, then
     ALWAYS restore (even on KeyboardInterrupt/an apply failure) and verify.
@@ -1413,7 +1417,7 @@ def run_experiment(
     whatever exception interrupted apply/measure, after the restore.
     """
     orig_response = session.send(read_cmd)
-    orig = parse_orig(orig_response)
+    orig = parse(orig_response)
     if orig is None:
         # Nothing changed yet; restoring a guessed default could itself be the damage.
         raise DiagError(f"{name}: could not parse the original value from {orig_response.strip()!r}; nothing changed")
@@ -1449,7 +1453,7 @@ def run_experiment(
                 session.send(cmd)
             if reenumerate_after_restore:
                 reenumerate()
-            verify_value = parse_verify(session.send(verify_cmd))
+            verify_value = parse(session.send(verify_cmd))
             if verify_value != orig:
                 raise RestoreFailed(f"{name}: expected {orig!r} after restore, read back {verify_value!r}")
         except BaseException as restore_exc:  # incl. a second Ctrl-C mid-restore: never claim "restored"
@@ -1462,11 +1466,7 @@ def run_experiment(
 
 
 def _run_fmode(session: Session, out_dir: Path, measure, reenumerate):
-    def parse_orig(resp: str):
-        t = _parse_int_tuple(resp, "GTFMODE")
-        return (t[0], t[1]) if t and len(t) >= 2 else None
-
-    def parse_verify(resp: str):
+    def parse(resp: str):
         t = _parse_int_tuple(resp, "GTFMODE")
         return (t[0], t[1]) if t and len(t) >= 2 else None
 
@@ -1475,7 +1475,7 @@ def _run_fmode(session: Session, out_dir: Path, measure, reenumerate):
         out_dir,
         name="fmode",
         read_cmd="AT+GTFMODE?",
-        parse_orig=parse_orig,
+        parse=parse,
         apply_cmds=lambda orig: ["AT+GTFMODE=0,0"],
         restore_cmds=lambda orig: [f"AT+GTFMODE={orig[0]},{orig[1]}"],
         reenumerate_after_apply=True,
@@ -1483,16 +1483,11 @@ def _run_fmode(session: Session, out_dir: Path, measure, reenumerate):
         measure=measure,
         reenumerate=reenumerate,
         verify_cmd="AT+GTFMODE?",
-        parse_verify=parse_verify,
     )
 
 
 def _run_anttuner(session: Session, out_dir: Path, measure, reenumerate):
-    def parse_orig(resp: str):
-        t = _parse_int_tuple(resp, "GTANTTUNINGEN")
-        return t[0] if t else None
-
-    def parse_verify(resp: str):
+    def parse(resp: str):
         t = _parse_int_tuple(resp, "GTANTTUNINGEN")
         return t[0] if t else None
 
@@ -1501,7 +1496,7 @@ def _run_anttuner(session: Session, out_dir: Path, measure, reenumerate):
         out_dir,
         name="anttuner",
         read_cmd="AT+GTANTTUNINGEN?",
-        parse_orig=parse_orig,
+        parse=parse,
         apply_cmds=lambda orig: ["AT+GTANTTUNINGEN=0"],
         restore_cmds=lambda orig: [f"AT+GTANTTUNINGEN={orig}"],
         reenumerate_after_apply=True,
@@ -1509,16 +1504,11 @@ def _run_anttuner(session: Session, out_dir: Path, measure, reenumerate):
         measure=measure,
         reenumerate=reenumerate,
         verify_cmd="AT+GTANTTUNINGEN?",
-        parse_verify=parse_verify,
     )
 
 
 def _run_rat_lte(session: Session, out_dir: Path, measure):
-    def parse_orig(resp: str):
-        erat = cellinfo.parse_erat(resp)
-        return erat.rat_mode if erat else None
-
-    def parse_verify(resp: str):
+    def parse(resp: str):
         erat = cellinfo.parse_erat(resp)
         return erat.rat_mode if erat else None
 
@@ -1527,7 +1517,7 @@ def _run_rat_lte(session: Session, out_dir: Path, measure):
         out_dir,
         name="rat-lte",
         read_cmd="AT+ERAT?",
-        parse_orig=parse_orig,
+        parse=parse,
         apply_cmds=lambda orig: ["AT+ERAT=3"],
         restore_cmds=lambda orig: [f"AT+ERAT={orig}"],
         reenumerate_after_apply=False,
@@ -1535,7 +1525,6 @@ def _run_rat_lte(session: Session, out_dir: Path, measure):
         measure=measure,
         reenumerate=lambda: None,
         verify_cmd="AT+ERAT?",
-        parse_verify=parse_verify,
     )
 
 
@@ -1764,6 +1753,10 @@ def cmd_backup(args: argparse.Namespace, *, adb_factory: Callable[[], Adb] | Non
         for n in _parse_mtd_partitions(proc_mtd):
             adb.run(f"cat /dev/mtdblock{n}", level=0, to_file=dest / f"mtdblock{n}.img", timeout=_ADB_BACKUP_TIMEOUT_S)
     _write_sha256sums(dest)
+    # A dropped ADB link leaves a cut-off tar, and adb.run() accepts any run that wrote bytes.
+    if error := _verify_backup(dest):
+        print(f"backup failed, do not rely on {dest}: {error}", file=sys.stderr)
+        return 1
     print(f"backup written to {dest}")
     return 0
 

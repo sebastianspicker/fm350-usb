@@ -561,16 +561,14 @@ class DoctorCheck:
     message: str
 
 
-def _parse_int_tuple(response: str, prefix: str | None = None) -> tuple[int, ...] | None:
+def _parse_int_tuple(response: str, prefix: str) -> tuple[int, ...] | None:
     """Pull the comma-separated integers out of a ``+FOO: 1,2,3`` response.
 
-    With ``prefix`` (e.g. ``"GTFMODE"``) only a ``+GTFMODE:`` line counts, so
-    a URC kept ahead of the reply isn't read as data. Without it the first
-    numeric ``+X:`` line is used. Error results (``+CME ERROR: 3``,
-    ``+CMS ERROR: ...``) return None rather than being read as data.
+    Only a ``+<prefix>:`` line counts (e.g. ``"GTFMODE"``), so a URC kept
+    ahead of the reply, or an error result (``+CME ERROR: 3``), isn't read
+    as data.
     """
-    name = re.escape(prefix) if prefix else r"(?!CME ERROR|CMS ERROR)[A-Z0-9]+"
-    match = re.search(rf"^\+{name}:\s*(-?\d+(?:\s*,\s*-?\d+)*)", response, re.MULTILINE)
+    match = re.search(rf"^\+{re.escape(prefix)}:\s*(-?\d+(?:\s*,\s*-?\d+)*)", response, re.MULTILINE)
     if not match:
         return None
     return tuple(int(v) for v in match.group(1).split(","))
@@ -1155,7 +1153,7 @@ def _cleanup_attempt(
 def _decide_rebuild(
     state: _RebuildState, args: argparse.Namespace, shutdown: _ShutdownGuard, *,
     device_lost: bool, rndis_rebuild: bool, bridge_stopped_cleanly: bool, failure_reason: str | None,
-    rebuild_error: Exception | None, usb_ctx, find_device_factory, reenum_sleep, reenum_time_source,
+    rebuild_error: Exception | None, find_device_factory, reenum_sleep, reenum_time_source,
 ) -> int | None:
     """After a cleaned-up attempt that is to be rebuilt (--supervise): a
     device loss, an RNDIS-level rebuild, or a failed rebuild attempt. Waits
@@ -1219,8 +1217,14 @@ def _decide_rebuild(
         _log.warning(
             "%d RNDIS-level failures in a row; resetting the USB device before the next rebuild", state.rndis_rebuilds
         )
+        # _cleanup_attempt closed this attempt's handle (at_port.close() closes
+        # the shared UsbDevice): reset on a fresh one.
         try:
-            usb_ctx.usb_device.reset()
+            dev = find_device_factory()
+            try:
+                dev.reset()
+            finally:
+                dev.close()
         except Exception as exc:
             _log.warning("USB reset failed: %s", exc)
         rndis_rebuild = False  # continue as after a device loss: wait for the re-enumeration
@@ -1381,7 +1385,9 @@ def cmd_up(
                     pinned_imei = current_imei
                     if pinned_imei is None:
                         _log.warning("could not read the modem's IMEI (AT+CGSN); identity pinning across re-enumeration is disabled")
-                elif pinned_imei is not None and current_imei is not None and current_imei != pinned_imei:
+                elif pinned_imei is not None and current_imei is None:
+                    raise _RebuildError("could not read the modem's IMEI (AT+CGSN) to check its pinned identity")
+                elif pinned_imei is not None and current_imei != pinned_imei:
                     print(
                         f"modem identity changed: expected IMEI {_maybe_redact(args, pinned_imei)}, "
                         f"now AT+CGSN reports {_maybe_redact(args, current_imei)!r} "
@@ -1611,7 +1617,7 @@ def cmd_up(
             code = _decide_rebuild(
                 rb, args, shutdown, device_lost=device_lost, rndis_rebuild=rndis_rebuild,
                 bridge_stopped_cleanly=bridge_stopped_cleanly, failure_reason=failure_reason,
-                rebuild_error=rebuild_error, usb_ctx=usb_ctx, find_device_factory=find_device_factory,
+                rebuild_error=rebuild_error, find_device_factory=find_device_factory,
                 reenum_sleep=reenum_sleep, reenum_time_source=reenum_time_source,
             )
             if code is not None:

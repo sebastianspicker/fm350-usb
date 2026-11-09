@@ -17,7 +17,8 @@ REDACTED = "REDACTED"
 # the 5th/6th comma-separated values on any cell row.
 _GTCCINFO_ROW_RE = re.compile(r"(?m)^([ \t]*\d+[ \t]*,[ \t]*\d+[ \t]*,[^,\r\n]*,[^,\r\n]*,)[^,\r\n]*(,)[^,\r\n]*(,)")
 
-_CNUM_RE = re.compile(r'(\+CNUM:\s*"[^"]*"\s*,\s*")[^"]*(")')
+# The alpha field may be empty and unquoted (27.007): +CNUM: ,"+4917...",145
+_CNUM_RE = re.compile(r'(\+CNUM:\s*(?:"[^"]*")?\s*,\s*")[^"]*(")')
 _ID_PREFIX_RE = re.compile(r"(\+(?:CIMI|CGSN|GSN|ICCID|CCID):[ \t]*)\S+")
 # ICCID: "89" + 17-20 more digits (19-22 total, covering the common 20 and
 # 22 digit variants), optional trailing F/hex pad nibble.
@@ -41,7 +42,7 @@ _CPIN_SET_RE = re.compile(r'(?i)((?:AT)?\+(?:CPIN2?|CLCK|CPWD)[ \t]*=[ \t]*)(?:"
 # A PIN echoed back as a +CPIN: value (the state names like READY/SIM PIN
 # are words, never digits).
 _CPIN_ECHO_RE = re.compile(r'(\+CPIN:[ \t]*)"?\d{4,8}"?(?![\w"])')
-_IPV6_RE = re.compile(r"(?<![0-9A-Fa-f:.])(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}(?![0-9A-Fa-f:.])")
+_IPV6_RE = re.compile(r"(?<![0-9A-Fa-f:.])(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}(?!\.?[0-9A-Fa-f:])")
 
 
 def redact_pin(text: str) -> str:

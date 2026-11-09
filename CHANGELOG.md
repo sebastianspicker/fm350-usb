@@ -8,6 +8,13 @@ versioned separately.
 
 ## [0.1.0a1] - unreleased
 
+- The USB reset that `up --supervise` falls back to after repeated RNDIS-level
+  failures now runs on a freshly opened handle; before, it ran on the handle
+  the cleanup had just closed. After a re-enumeration, an IMEI that cannot be
+  read no longer passes the identity check: the rebuild is retried.
+  `--redact` also masks `+CNUM` lines without a name field and IPv6 addresses
+  followed by a full stop. With `--io sync`, 50 failed bulk writes in a row
+  fail the bridge, so the supervisor rebuilds the session.
 - Diagnostics now recognizes running `fm350mac up` sessions with a linear token
   scan instead of an ambiguous repeated regular expression. The existing session
   refusal behavior and safety-level gates remain unchanged.

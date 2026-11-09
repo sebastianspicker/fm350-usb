@@ -80,11 +80,8 @@ class Supervisor:
         *,
         initial_ip: str,
         poll_interval: float = POLL_INTERVAL_S,
-        backoff_initial: float = BACKOFF_INITIAL_S,
-        backoff_max: float = BACKOFF_MAX_S,
         stable_reset: float = STABLE_RESET_S,
         tick: float = TICK_S,
-        min_early_poll_spacing: float = MIN_EARLY_POLL_SPACING_S,
         at_timeout: float = AT_TIMEOUT_S,
         stall_window: float = STALL_WINDOW_S,
         stall_min_tx_timeouts: int = STALL_MIN_TX_TIMEOUTS,
@@ -98,11 +95,11 @@ class Supervisor:
         self.ifname = ifname
         self.cid = cid
         self.poll_interval = poll_interval
-        self.backoff_initial = backoff_initial
-        self.backoff_max = backoff_max
+        self.backoff_initial = BACKOFF_INITIAL_S
+        self.backoff_max = BACKOFF_MAX_S
         self.stable_reset = stable_reset
         self.tick = tick
-        self.min_early_poll_spacing = min_early_poll_spacing
+        self.min_early_poll_spacing = MIN_EARLY_POLL_SPACING_S
         self.at_timeout = at_timeout
         self.stall_window = stall_window
         self.stall_min_tx_timeouts = stall_min_tx_timeouts
@@ -121,7 +118,7 @@ class Supervisor:
         # stall (see _check_stall): ``up`` rebuilds without counting that
         # toward its cap on RNDIS-level rebuilds.
         self.stall_failure = False
-        self._backoff = backoff_initial
+        self._backoff = BACKOFF_INITIAL_S
         self._connected_since: float | None = self._time()
         self._last_tx_timeouts = bridge.stats.tx_timeouts
         self._last_poll_time = self._time()
@@ -419,10 +416,7 @@ class Supervisor:
             self.stats.at_errors += 1
             _log.exception("CGACT during reconnect failed")
             return False
-        # The final non-empty line must be the result code: a bare "OK"
-        # substring would also match e.g. "+CME ERROR: BOOK" or echoed text.
-        lines = [line.strip() for line in resp.splitlines() if line.strip()]
-        if not lines or lines[-1] != "OK":
+        if not at_mod.is_ok(resp):
             self.stats.at_errors += 1
             return False
         return True

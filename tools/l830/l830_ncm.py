@@ -39,6 +39,8 @@ def subnet_calc(ip: str) -> tuple[int, str]:
     x, y = 1, 4
     while d % y in (0, y - 1):
         x, y = x + 1, y * 2
+        if y > 256:  # .0 and .255: the last octet alone gives no such subnet (.0 would loop forever)
+            raise ValueError(f"no subnet for {ip} by the last-octet rule")
     gw = (d // y) * y + (2 if d % y == 1 else 1)
     return 31 - x, ".".join(ip.split(".")[:3] + [str(gw)])
 
@@ -61,6 +63,13 @@ def selftest() -> None:
     assert subnet_calc("10.0.0.4") == (29, "10.0.0.1")  # .4 is a /30 network address -> /29
     assert subnet_calc("10.0.0.7") == (28, "10.0.0.1")  # .7 is a broadcast in /30 and /29 -> /28
     assert subnet_calc("100.64.12.250") == (30, "100.64.12.249")
+    assert subnet_calc("10.0.0.128") == (24, "10.0.0.1")  # the largest subnet the rule can give
+    for edge in ("10.25.136.0", "10.25.137.255"):
+        try:
+            subnet_calc(edge)
+        except ValueError:
+            continue
+        raise AssertionError(f"{edge} must be refused")
     real = ('+CGCONTRDP: 2,6,"internet.telekom.mnc001.mcc262.gprs","10.25.136.192.255.0.0.0","10.25.136.193",'
             '"10.74.210.210","10.74.210.211","0.0.0.0","0.0.0.0",0')  # 2026-11-08 17:45
     assert parse_contrdp(real) == ("10.25.136.192", "10.25.136.193", ["10.74.210.210", "10.74.210.211"])
@@ -114,7 +123,10 @@ def cmd_up(port, apn: str) -> None:
     if not parsed:
         sys.exit("no IPv4 address in AT+CGCONTRDP; stopping (run 'down' to clean up)")
     ip, reported_gw, dns = parsed
-    prefix, gw = subnet_calc(ip)
+    try:
+        prefix, gw = subnet_calc(ip)
+    except ValueError as exc:
+        sys.exit(f"{exc}; run 'down', then 'up' again for another address")
     # the L830 reports its gateway (mrhaav's L850 script ignores the field); prefer it when inside the subnet
     if reported_gw and ipaddress.IPv4Address(reported_gw) in ipaddress.IPv4Network(f"{ip}/{prefix}", strict=False):
         gw = reported_gw

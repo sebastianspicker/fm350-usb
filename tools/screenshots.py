@@ -153,68 +153,6 @@ def redact(text: str) -> str:
     return text
 
 
-# ---------------------------------------------------------------------------
-# Trimming (keep long, honest output readable in a screenshot)
-# ---------------------------------------------------------------------------
-
-
-def _trim_gtccinfo(lines: list[str], keep_neighbours: int = 3) -> list[str]:
-    """+GTCCINFO?: keep the serving-cell row and the first few neighbour
-    rows, eliding the rest with a count (real modems report a dozen-plus
-    neighbours; all of them isn't useful in a screenshot).
-    """
-    out: list[str] = []
-    seen = 0
-    total_neighbours = sum(1 for line in lines if line.startswith("2,"))
-    for line in lines:
-        if line.startswith("2,"):
-            seen += 1
-            if seen <= keep_neighbours:
-                out.append(line)
-            elif seen == keep_neighbours + 1:
-                out.append(f"… ({total_neighbours - keep_neighbours} more neighbour cells elided)")
-        else:
-            out.append(line)
-    return out
-
-
-def _trim_gtsenrdtemp(lines: list[str], keep_head: int = 4, keep_tail: int = 1) -> list[str]:
-    """+GTSENRDTEMP=0: dozens of sensor readings; keep a few from each end."""
-    if len(lines) <= keep_head + keep_tail + 1:
-        return lines
-    elided = len(lines) - keep_head - keep_tail
-    return lines[:keep_head] + [f"… ({elided} more sensor readings elided)"] + lines[-keep_tail:]
-
-
-def trim_status(text: str) -> str:
-    """Trim the two long, repetitive blocks in `fm350mac status` output."""
-    lines = text.split("\n")
-    out: list[str] = []
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        out.append(line)
-        if line.startswith("+GTCCINFO:"):
-            i += 1
-            block = []
-            while i < len(lines) and lines[i].strip() and not lines[i].startswith((">>>", "OK")):
-                block.append(lines[i])
-                i += 1
-            out.extend(_trim_gtccinfo(block))
-            continue
-        if line.startswith("+GTSENRDTEMP:"):
-            block = [line]
-            out.pop()  # re-added via the block below
-            i += 1
-            while i < len(lines) and lines[i].startswith("+GTSENRDTEMP:"):
-                block.append(lines[i])
-                i += 1
-            out.extend(_trim_gtsenrdtemp(block))
-            continue
-        i += 1
-    return "\n".join(out)
-
-
 def trim_uci_batch(text: str, keep_head: int = 6, keep_tail: int = 2) -> str:
     """install.sh --dry-run prints a full `uci batch` per config file; the
     mwan3 one is long. Trim any run of boring uci-command lines
@@ -277,8 +215,8 @@ def shot_identity():
 
 def shot_status():
     # fm350mac status has its own --redact (masks TAC/cell_id, and IMSI/
-    # ICCID/IMEI if it ever prints them); redact()/trim_status() still run
-    # on top as a second, independent layer in case that ever regresses or
+    # ICCID/IMEI if it ever prints them); redact() still runs on top as a
+    # second, independent layer in case that ever regresses or
     # a future status format adds something this script doesn't know about.
     display = "fm350mac status --redact"
     if not modem_present():
@@ -286,7 +224,7 @@ def shot_status():
     rc, out = run([FM350MAC_BIN, "status", "--redact"], timeout=30)
     if rc != 0:
         raise Skip("fm350mac status --redact exited non-zero")
-    text = trim_status(redact(out.rstrip("\n")))
+    text = redact(out.rstrip("\n"))
     return display, "$ %s\n%s" % (display, text)
 
 

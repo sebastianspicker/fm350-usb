@@ -228,6 +228,11 @@ for t in "${TESTS[@]}"; do
     esac
 done
 
+if [[ -n "$(printf '%s\n' "${TESTS[@]}" | sort | uniq -d)" ]]; then
+    echo "--tests lists a test twice: the second run would overwrite the first one's results" >&2
+    exit 2
+fi
+
 if ! MAX_BYTES="$(parse_size "$MAX_BYTES_ARG")"; then
     echo "invalid --max-bytes: $MAX_BYTES_ARG (expected an integer with optional K/M suffix)" >&2
     exit 2

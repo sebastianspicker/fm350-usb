@@ -17,8 +17,11 @@ from l830_common import AtTimeoutError, TtyTransport, at_ports, log
 LOGNAME = "l830_usbmode.log"
 
 
-def ask(cmd: str, timeout: float = 10.0) -> str:
-    """Send cmd on a freshly found AT port; retry once if the port drops (mode 1 re-enumerates)."""
+def ask(cmd: str, timeout: float = 10.0, retry: bool = True) -> str:
+    """Send cmd on a freshly found AT port; retry once if the port drops (mode 1 re-enumerates).
+
+    retry=False is for the reset: a port that drops after it is the expected outcome, and
+    sending it again would reset the module a second time."""
     for attempt in (1, 2):
         deadline = time.monotonic() + 60
         while not (ports := at_ports()) and time.monotonic() < deadline:
@@ -35,6 +38,8 @@ def ask(cmd: str, timeout: float = 10.0) -> str:
             return ""
         except OSError as exc:
             log(LOGNAME, f">>> {cmd}: port lost (attempt {attempt}): {exc}")
+            if not retry:
+                return ""
         finally:
             port.close()
     sys.exit(f"{cmd} failed twice")
@@ -53,7 +58,7 @@ def main() -> None:
     if f"+GTUSBMODE: {target}" not in ask("AT+GTUSBMODE?"):
         sys.exit("read-back does not show the target mode; NOT resetting")
     log(LOGNAME, "read-back OK -> AT+CFUN=15 (hardware reset)")
-    ask("AT+CFUN=15", timeout=5)  # the module may drop off USB before answering
+    ask("AT+CFUN=15", timeout=5, retry=False)  # the module may drop off USB before answering
     time.sleep(5)
     deadline = time.monotonic() + 120
     while not (ports := at_ports()) and time.monotonic() < deadline:

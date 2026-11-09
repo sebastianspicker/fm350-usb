@@ -26,7 +26,7 @@ import threading
 import time
 from pathlib import Path
 
-from l830_common import REPO, STATE, TtyTransport, at_ports
+from l830_common import REPO, STATE, AtTimeoutError, TtyTransport, at_ports
 
 HERE = Path(__file__).resolve().parent
 RESULTS = REPO / "tools" / "bench-results"
@@ -72,6 +72,25 @@ def selftest() -> None:
                                       "error": None}
     cut_upload = {"end": {"sum_received": {}, "sum_sent": {"bytes": 258_867_200, "seconds": 237.0, "retransmits": 8903}}}
     assert iperf_summary(cut_upload, False)["mbit_s"] == 8.7  # 2026-11-08 17:56
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "ledger"
+        assert record_usage("en7", 100, 50, p, lambda iface: (400, 150)) == 400 and ledger_used(p) == 400
+        # counters restarted after a USB drop: a lower bound, never a negative line
+        assert record_usage("en7", 1000, 1000, p, lambda iface: (30, 20)) == 50 and ledger_used(p) == 450
+
+        def no_counters(iface):
+            sys.exit("no byte counters")
+        assert record_usage("en7", 0, 0, p, no_counters) == 0 and ledger_used(p) == 450
+
+        def interrupted(*args, **kwargs):
+            raise KeyboardInterrupt
+        readings = iter([(0, 0), (7_000_000, 1_000)])
+        a = argparse.Namespace(bytes=5_000_000, server="192.0.2.1", port=5201, parallel=1)
+        try:
+            run_iperf(a, "down", "en7", Path(d), run=interrupted, counters=lambda iface: next(readings), ledger=p)
+        except KeyboardInterrupt:
+            pass
+        assert ledger_used(p) == 450 + 7_001_000  # Ctrl-C mid-run: the use is still in the ledger
     print("selftest ok")
 
 
@@ -98,17 +117,21 @@ class Telemetry(threading.Thread):
             except OSError as exc:
                 f.write(f"{time.time():.1f} open failed: {exc}\n")
                 return
-            while not self.stop.is_set():
-                try:
-                    for cmd in ("AT+XCESQ?", "AT+CGACT?"):
-                        ans = " | ".join(x for x in port.command(cmd, timeout=5).splitlines() if x.startswith("+"))
-                        f.write(f"{time.time():.1f} {cmd} {ans}\n")
+            try:
+                while not self.stop.is_set():
+                    try:
+                        for cmd in ("AT+XCESQ?", "AT+CGACT?"):
+                            ans = " | ".join(x for x in port.command(cmd, timeout=5).splitlines() if x.startswith("+"))
+                            f.write(f"{time.time():.1f} {cmd} {ans}\n")
+                    except AtTimeoutError as exc:  # an OSError too, but a slow answer is not a lost port
+                        f.write(f"{time.time():.1f} AT timeout: {exc}\n")
+                    except OSError as exc:
+                        f.write(f"{time.time():.1f} AT PORT LOST: {exc}\n")
+                        return
                     f.flush()
-                except OSError as exc:
-                    f.write(f"{time.time():.1f} AT PORT LOST: {exc}\n")
-                    return
-                self.stop.wait(2)
-            port.close()
+                    self.stop.wait(2)
+            finally:
+                port.close()
 
 
 def xlog(path: str) -> str:
@@ -122,8 +145,29 @@ def xlog(path: str) -> str:
         return f"unavailable: {exc}"
 
 
-def run_iperf(a, direction: str, iface: str, out: Path) -> dict:
-    rx0, tx0 = en_counters(iface)
+def record_usage(iface: str, rx0: int, tx0: int, ledger: Path = LEDGER, counters=en_counters) -> int:
+    """Append this run's SIM use (iface byte-counter delta) to the ledger; returns the bytes.
+
+    Called from a finally, so an interrupted run is counted too."""
+    try:
+        rx1, tx1 = counters(iface)
+    except (SystemExit, subprocess.CalledProcessError) as exc:
+        print(f"WARNING: no byte counters for {iface} after the run ({exc}): its SIM use is NOT in the ledger",
+              file=sys.stderr)
+        return 0
+    if rx1 < rx0 or tx1 < tx0:
+        print(f"WARNING: the {iface} counters restarted (module dropped off USB?): the ledger gets a lower bound",
+              file=sys.stderr)
+    # a re-attached interface counts from 0 again: what it shows now is the least that was used
+    rx, tx = (rx1 - rx0 if rx1 >= rx0 else rx1), (tx1 - tx0 if tx1 >= tx0 else tx1)
+    with ledger.open("a") as f:
+        f.write(f"{int(time.time())} {rx} {tx}\n")
+    return rx + tx
+
+
+def run_iperf(a, direction: str, iface: str, out: Path, run=subprocess.run, counters=en_counters,
+              ledger: Path = LEDGER) -> dict:
+    rx0, tx0 = counters(iface)
     limit = a.bytes * 8 / 1e6 + 120  # seconds: 1 Mbit/s floor plus slack
     cmd = ["iperf3", "-c", a.server, "-p", str(a.port), "-n", str(a.bytes), "-J", "--connect-timeout", "5000"]
     if direction == "down":
@@ -132,19 +176,20 @@ def run_iperf(a, direction: str, iface: str, out: Path) -> dict:
         cmd += ["-P", str(a.parallel)]  # -n stays the total across all streams
     t0 = time.time()
     p = None
+    used = 0
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=limit)
-        j = json.loads(p.stdout or "{}")
-    except subprocess.TimeoutExpired:
-        j = {"error": f"wall-clock limit {limit:.0f} s"}
-    except json.JSONDecodeError:
-        j = {"error": f"no JSON from iperf3: {(p.stderr if p else '')[-300:]}"}
-    (out / f"iperf3_{direction}.json").write_text(json.dumps(j, indent=1))
-    rx1, tx1 = en_counters(iface)
-    with LEDGER.open("a") as f:
-        f.write(f"{int(time.time())} {rx1 - rx0} {tx1 - tx0}\n")
+        try:
+            p = run(cmd, capture_output=True, text=True, timeout=limit)
+            j = json.loads(p.stdout or "{}")
+        except subprocess.TimeoutExpired:
+            j = {"error": f"wall-clock limit {limit:.0f} s"}
+        except json.JSONDecodeError:
+            j = {"error": f"no JSON from iperf3: {(p.stderr if p else '')[-300:]}"}
+        (out / f"iperf3_{direction}.json").write_text(json.dumps(j, indent=1))
+    finally:  # also on Ctrl-C: the data is spent either way
+        used = record_usage(iface, rx0, tx0, ledger, counters)
     return {"direction": direction, "start": time.strftime("%H:%M:%S", time.localtime(t0)),
-            "sim_mb": round((rx1 - rx0 + tx1 - tx0) / 1e6, 1), **iperf_summary(j, direction == "down")}
+            "sim_mb": round(used / 1e6, 1), **iperf_summary(j, direction == "down")}
 
 
 def main() -> None:
